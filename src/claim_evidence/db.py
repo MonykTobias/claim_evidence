@@ -23,6 +23,7 @@ from .models import EvidenceUnit, Fact, VersionStatus
 
 SQL_DIR = Path(__file__).parent / "sql"
 EMBED_DIM_TOKEN = "EMBED_DIM"
+SCHEMA_VERSION = 2
 
 
 def connect(database_url: str) -> psycopg.Connection:
@@ -78,8 +79,14 @@ def upsert_document(
 def find_version(
     conn: psycopg.Connection, document_id: int, fingerprint: str
 ) -> dict[str, Any] | None:
+    """The newest attempt at this fingerprint, ready ones first."""
     return conn.execute(
-        "SELECT * FROM document_version WHERE document_id = %s AND fingerprint = %s",
+        """
+        SELECT * FROM document_version
+        WHERE document_id = %s AND fingerprint = %s
+        ORDER BY (status = 'ready') DESC, attempt DESC
+        LIMIT 1
+        """,
         (document_id, fingerprint),
     ).fetchone()
 
@@ -93,17 +100,44 @@ def start_version(
     embed_dim: int,
     output_root: str,
     source_pdf: str | None,
+    force: bool = False,
 ) -> int:
+    """Open a building version.
+
+    Normally this resumes the existing attempt for the fingerprint. A forced
+    rebuild opens the next attempt instead, so the version currently serving
+    queries stays untouched until the replacement passes its checks.
+    """
+    attempt = 1
+    if force:
+        row = conn.execute(
+            "SELECT max(attempt) AS a FROM document_version"
+            " WHERE document_id = %s AND fingerprint = %s",
+            (document_id, fingerprint),
+        ).fetchone()
+        attempt = int(row["a"] or 0) + 1
+    else:
+        row = conn.execute(
+            "SELECT attempt FROM document_version"
+            " WHERE document_id = %s AND fingerprint = %s AND status = 'building'"
+            " ORDER BY attempt DESC LIMIT 1",
+            (document_id, fingerprint),
+        ).fetchone()
+        if row:
+            attempt = int(row["attempt"])
+
     row = conn.execute(
         """
         INSERT INTO document_version
-            (document_id, fingerprint, embed_model, embed_dim, output_root, source_pdf)
-        VALUES (%s, %s, %s, %s, %s, %s)
-        ON CONFLICT (document_id, fingerprint) DO UPDATE
+            (document_id, fingerprint, embed_model, embed_dim, output_root,
+             source_pdf, attempt)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (document_id, fingerprint, attempt) DO UPDATE
             SET status = 'building', ready_at = NULL
         RETURNING id
         """,
-        (document_id, fingerprint, embed_model, embed_dim, output_root, source_pdf),
+        (document_id, fingerprint, embed_model, embed_dim, output_root,
+         source_pdf, attempt),
     ).fetchone()
     conn.commit()
     return int(row["id"])
@@ -332,16 +366,21 @@ def upsert_fact(
 
 # --- retrieval --------------------------------------------------------------
 
-_EVIDENCE_SELECT = """
-    SELECT e.id, e.unit_key, e.kind, e.quality, e.citable, e.source_text,
-           e.heading_path, e.table_context, e.artifact_path, e.geometry_precision,
-           p.pdf_page, p.printed_page_label, p.page_dir,
-           d.id AS document_id, d.name AS document_name, d.sha256, d.source_uri
+_EVIDENCE_COLUMNS = """
+    e.id, e.unit_key, e.kind, e.quality, e.citable, e.source_text,
+    e.heading_path, e.table_context, e.artifact_path, e.geometry_precision,
+    p.pdf_page, p.printed_page_label, p.page_dir,
+    d.id AS document_id, d.name AS document_name, d.sha256, d.source_uri
+"""
+
+_EVIDENCE_FROM = """
     FROM evidence_unit e
     JOIN page p ON p.id = e.page_id
     JOIN document_version v ON v.id = e.version_id
     JOIN document d ON d.id = v.document_id
 """
+
+_EVIDENCE_SELECT = f"SELECT {_EVIDENCE_COLUMNS} {_EVIDENCE_FROM}"
 
 _READY = "v.status = 'ready'"
 
@@ -361,12 +400,15 @@ def lexical_search(
     clause, params = _document_filter(document_ids)
     return conn.execute(
         f"""
-        {_EVIDENCE_SELECT}
+        SELECT {_EVIDENCE_COLUMNS},
+               ts_rank_cd(e.text_search, websearch_to_tsquery('english', %s))
+                   AS lexical_score
+        {_EVIDENCE_FROM}
         WHERE {_READY} AND e.text_search @@ websearch_to_tsquery('english', %s){clause}
-        ORDER BY ts_rank_cd(e.text_search, websearch_to_tsquery('english', %s)) DESC, e.id
+        ORDER BY lexical_score DESC, e.id
         LIMIT %s
         """,
-        [query, *params, query, limit],
+        [query, query, *params, limit],
     ).fetchall()
 
 
@@ -380,12 +422,13 @@ def vector_search(
     vector = normalize_embedding(embedding)
     return conn.execute(
         f"""
-        {_EVIDENCE_SELECT}
+        SELECT {_EVIDENCE_COLUMNS}, (e.embedding <#> %s) * -1 AS vector_score
+        {_EVIDENCE_FROM}
         WHERE {_READY} AND e.embedding IS NOT NULL{clause}
         ORDER BY e.embedding <#> %s
         LIMIT %s
         """,
-        [*params, vector, limit],
+        [vector, *params, vector, limit],
     ).fetchall()
 
 
@@ -422,7 +465,10 @@ def graph_search(
     pattern = " | ".join(t for t in metric_terms if t) or None
     return conn.execute(
         f"""
-        {_EVIDENCE_SELECT}
+        SELECT {_EVIDENCE_COLUMNS},
+               max(ts_rank(to_tsvector('english', f.normalized_metric),
+                           to_tsquery('english', COALESCE(%s, 'x')))) AS graph_score
+        {_EVIDENCE_FROM}
         JOIN fact_evidence fe ON fe.evidence_id = e.id
         JOIN fact f ON f.id = fe.fact_id
         WHERE {_READY}{clause}
@@ -433,13 +479,11 @@ def graph_search(
           AND (%s::text IS NULL OR f.baseline_period IS NULL OR f.baseline_period = %s)
         GROUP BY e.id, p.pdf_page, p.printed_page_label, p.page_dir,
                  d.id, d.name, d.sha256, d.source_uri
-        ORDER BY max(
-            ts_rank(to_tsvector('english', f.normalized_metric),
-                    to_tsquery('english', COALESCE(%s, 'x')))
-        ) DESC, e.id
+        ORDER BY graph_score DESC, e.id
         LIMIT %s
         """,
         [
+            pattern,
             *params,
             pattern,
             pattern,
@@ -447,7 +491,6 @@ def graph_search(
             reporting_period,
             baseline_period,
             baseline_period,
-            pattern,
             limit,
         ],
     ).fetchall()
@@ -630,3 +673,137 @@ __all__ = [
     "vector_search",
     "version_status",
 ]
+
+
+# --- frontend support -------------------------------------------------------
+
+
+def schema_state(conn: psycopg.Connection) -> tuple[int | None, str | None]:
+    """Applied schema version and the installed pgvector version."""
+    try:
+        row = conn.execute("SELECT version FROM schema_meta WHERE id = 1").fetchone()
+        version = int(row["version"]) if row else None
+    except psycopg.errors.UndefinedTable:
+        conn.rollback()
+        version = None
+    extension = conn.execute(
+        "SELECT extversion FROM pg_extension WHERE extname = 'vector'"
+    ).fetchone()
+    return version, (extension["extversion"] if extension else None)
+
+
+def index_counts(conn: psycopg.Connection) -> dict[str, int]:
+    row = conn.execute(
+        """
+        SELECT
+            (SELECT count(*) FROM document_version WHERE status = 'ready')    AS ready,
+            (SELECT count(*) FROM document_version WHERE status = 'building') AS building,
+            (SELECT count(*) FROM document_version WHERE status = 'inactive') AS inactive,
+            (SELECT count(*) FROM evidence_unit)                              AS evidence,
+            (SELECT count(*) FROM evidence_unit WHERE embedding IS NOT NULL)  AS embeddings,
+            (SELECT count(*) FROM fact)                                       AS facts
+        """
+    ).fetchone()
+    return {k: int(v) for k, v in row.items()}
+
+
+_DOCUMENT_SUMMARY = """
+    SELECT d.id AS document_id, v.id AS version_id, d.name, d.source_uri,
+           d.sha256, v.status, v.embed_model, v.embed_dim, v.ready_at,
+           v.output_root, v.source_pdf,
+           (SELECT count(*) FROM page WHERE version_id = v.id) AS page_count,
+           (SELECT count(*) FROM evidence_unit WHERE version_id = v.id) AS evidence_count,
+           (SELECT count(*) FROM fact WHERE version_id = v.id) AS fact_count,
+           (SELECT count(*) FROM evidence_unit
+             WHERE version_id = v.id AND kind = 'visual') AS visual_count
+    FROM document d
+    JOIN document_version v ON v.document_id = d.id
+"""
+
+
+def document_summaries(
+    conn: psycopg.Connection, document_id: int | None = None
+) -> list[dict[str, Any]]:
+    """One row per document: its ready version, else its newest attempt."""
+    clause = " WHERE d.id = %s" if document_id is not None else ""
+    params = [document_id] if document_id is not None else []
+    return conn.execute(
+        f"""
+        SELECT DISTINCT ON (document_id) * FROM ({_DOCUMENT_SUMMARY}{clause}) s
+        ORDER BY document_id, (status = 'ready') DESC, version_id DESC
+        """,
+        params,
+    ).fetchall()
+
+
+def delete_document(conn: psycopg.Connection, document_id: int) -> dict[str, int]:
+    """Delete one document's index rows, returning per-table counts.
+
+    Counted before the delete, because the foreign keys cascade and a cascaded
+    row reports nothing back. Source PDFs, output directories, and page images
+    are never touched -- re-ingestion is the whole recovery path.
+    """
+    with conn.transaction():
+        counts = conn.execute(
+            """
+            SELECT
+              (SELECT count(*) FROM document_version WHERE document_id = %(d)s)
+                  AS document_versions,
+              (SELECT count(*) FROM page p
+                JOIN document_version v ON v.id = p.version_id
+                WHERE v.document_id = %(d)s) AS pages,
+              (SELECT count(*) FROM evidence_unit e
+                JOIN document_version v ON v.id = e.version_id
+                WHERE v.document_id = %(d)s) AS evidence_units,
+              (SELECT count(*) FROM evidence_region r
+                JOIN evidence_unit e ON e.id = r.evidence_id
+                JOIN document_version v ON v.id = e.version_id
+                WHERE v.document_id = %(d)s) AS evidence_regions,
+              (SELECT count(*) FROM fact f
+                JOIN document_version v ON v.id = f.version_id
+                WHERE v.document_id = %(d)s) AS facts,
+              (SELECT count(*) FROM fact_evidence fe
+                JOIN fact f ON f.id = fe.fact_id
+                JOIN document_version v ON v.id = f.version_id
+                WHERE v.document_id = %(d)s) AS fact_evidence,
+              (SELECT count(*) FROM audit_candidate ac
+                JOIN evidence_unit e ON e.id = ac.evidence_id
+                JOIN document_version v ON v.id = e.version_id
+                WHERE v.document_id = %(d)s) AS audit_candidates
+            """,
+            {"d": document_id},
+        ).fetchone()
+        conn.execute("DELETE FROM document WHERE id = %s", (document_id,))
+    return {"documents": 1, **{k: int(v) for k, v in counts.items()}}
+
+
+def audit_run(conn: psycopg.Connection, audit_id: int) -> dict[str, Any] | None:
+    return conn.execute("SELECT * FROM audit_run WHERE id = %s", (audit_id,)).fetchone()
+
+
+def audit_candidates(conn: psycopg.Connection, audit_id: int) -> list[dict[str, Any]]:
+    return conn.execute(
+        """
+        SELECT ac.*, e.kind, e.source_text, p.pdf_page
+        FROM audit_candidate ac
+        JOIN evidence_unit e ON e.id = ac.evidence_id
+        JOIN page p ON p.id = e.page_id
+        WHERE ac.audit_id = %s
+        ORDER BY ac.combined_score DESC, ac.evidence_id
+        """,
+        (audit_id,),
+    ).fetchall()
+
+
+def evidence_row(conn: psycopg.Connection, evidence_id: int) -> dict[str, Any] | None:
+    """One evidence unit with everything needed to render it, at any status."""
+    return conn.execute(
+        f"""
+        SELECT {_EVIDENCE_COLUMNS}, e.version_id, e.truncated_source,
+               p.width AS page_width, p.height AS page_height,
+               v.output_root, v.status AS version_status
+        {_EVIDENCE_FROM}
+        WHERE e.id = %s
+        """,
+        (evidence_id,),
+    ).fetchone()

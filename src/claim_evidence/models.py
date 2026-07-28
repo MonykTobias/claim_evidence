@@ -8,6 +8,7 @@ validation error instead of a verdict.
 
 from __future__ import annotations
 
+from datetime import datetime
 from decimal import Decimal
 from enum import StrEnum
 from typing import Any, Literal, Self
@@ -178,6 +179,148 @@ class IngestReport(BaseModel):
     rejected_facts: list[str] = Field(default_factory=list)
 
 
+# --- Frontend-support types -------------------------------------------------
+
+
+class ModelHealth(BaseModel):
+    role: Literal["embed", "chat", "vision"]
+    name: str
+    available: bool
+
+
+class HealthReport(BaseModel):
+    """System diagnostics. Carries no credentials, connection strings, raw
+    driver exceptions, or prompts -- only categories and safe sentences."""
+
+    database_reachable: bool = False
+    schema_version: int | None = None
+    schema_current: bool = False
+    pgvector_version: str | None = None
+    ollama_reachable: bool = False
+    models: list[ModelHealth] = Field(default_factory=list)
+    documents_ready: int = 0
+    # A build that failed or was interrupted stays 'building'; there is no
+    # separate failed state, because nothing is alive to write one.
+    documents_building: int = 0
+    documents_inactive: int = 0
+    evidence_units: int = 0
+    embeddings: int = 0
+    facts: int = 0
+    problems: list[str] = Field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return self.database_reachable and self.schema_current and not self.problems
+
+
+class DocumentSummary(BaseModel):
+    document_id: int
+    document_version_id: int
+    name: str
+    source_uri: str | None = None
+    source_sha256: str | None = None
+    status: VersionStatus
+    page_count: int = 0
+    evidence_count: int = 0
+    fact_count: int = 0
+    visual_evidence_count: int = 0
+    embedding_model: str
+    embedding_dimensions: int
+    indexed_at: datetime | None = None
+    # Server-side path metadata. A frontend backend may use these after its own
+    # allowed-root validation; they are not for an untrusted browser.
+    output_root: str
+    source_pdf: str | None = None
+
+
+class RemovalReport(BaseModel):
+    document_id: int
+    name: str
+    deleted: dict[str, int] = Field(default_factory=dict)
+
+
+class TraceCandidate(BaseModel):
+    evidence_id: int
+    pdf_page: int
+    source_kind: EvidenceKind
+    text: str
+    lexical_rank: int | None = None
+    lexical_score: float | None = None
+    vector_rank: int | None = None
+    vector_score: float | None = None
+    graph_rank: int | None = None
+    graph_score: float | None = None
+    combined_rank: int | None = None
+    combined_score: float = 0.0
+    expanded_from: int | None = None
+    visual_status: Literal[
+        "not_applicable", "verified", "rejected", "unavailable"
+    ] = "not_applicable"
+    selected: bool = False
+    reason: str | None = None
+
+
+class AuditTrace(BaseModel):
+    """Operational retrieval metadata for one audit.
+
+    How candidates were found and ranked -- not model reasoning. Only the
+    structured output and the concise rationale the product already shows are
+    stored, so a trace can be handed to a UI without leaking a prompt.
+    """
+
+    audit_id: int
+    claim: str
+    document_ids: list[int] = Field(default_factory=list)
+    created_at: datetime | None = None
+    parsed_claim: dict[str, Any] = Field(default_factory=dict)
+    verdict: Verdict | None = None
+    rationale: str | None = None
+    evidence_quality: EvidenceQuality | None = None
+    missing_qualifiers: list[str] = Field(default_factory=list)
+    citation_ids: list[int] = Field(default_factory=list)
+    candidates: list[TraceCandidate] = Field(default_factory=list)
+    error: str | None = None
+
+    @property
+    def graph_candidates(self) -> list[TraceCandidate]:
+        return [c for c in self.candidates if c.graph_rank is not None]
+
+    @property
+    def lexical_candidates(self) -> list[TraceCandidate]:
+        return [c for c in self.candidates if c.lexical_rank is not None]
+
+    @property
+    def vector_candidates(self) -> list[TraceCandidate]:
+        return [c for c in self.candidates if c.vector_rank is not None]
+
+
+class EvidenceDetail(BaseModel):
+    """Everything needed to render a cited region over its page image.
+
+    The package renders nothing itself: it publishes one authoritative
+    provenance representation and lets the caller draw.
+    """
+
+    evidence_id: int
+    document_id: int
+    document_version_id: int
+    document_name: str
+    pdf_page: int
+    printed_page_label: str | None = None
+    source_kind: EvidenceKind
+    evidence_quality: EvidenceQuality
+    geometry_precision: GeometryPrecision
+    text: str
+    quote: str | None = None
+    table_context: dict[str, Any] = Field(default_factory=dict)
+    heading_path: list[str] = Field(default_factory=list)
+    page_width: float
+    page_height: float
+    page_image_path: str | None = None
+    regions: list[Region] = Field(default_factory=list)
+    artifact_paths: list[str] = Field(default_factory=list)
+
+
 # --- Internal records -------------------------------------------------------
 
 
@@ -300,8 +443,11 @@ class Adjudication(BaseModel):
 
 __all__ = [
     "Adjudication",
+    "AuditTrace",
     "Citation",
     "ClaimResult",
+    "DocumentSummary",
+    "EvidenceDetail",
     "EvidenceKind",
     "EvidenceMatch",
     "EvidenceQuality",
@@ -309,9 +455,14 @@ __all__ = [
     "Fact",
     "FactExtraction",
     "GeometryPrecision",
+    "HealthReport",
     "IngestReport",
+    "ModelHealth",
     "ParsedClaim",
     "Region",
+    "RegionRole",
+    "RemovalReport",
+    "TraceCandidate",
     "Verdict",
     "VersionStatus",
     "VisualVerification",
