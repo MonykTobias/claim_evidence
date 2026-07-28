@@ -46,7 +46,9 @@ from .models import (
     IngestReport,
     VersionStatus,
 )
+from .progress import ProgressCallback, ProgressReporter
 from .normalize import normalize_for_match
+from .errors import ClaimEvidenceError
 from .ollama import OllamaClient, OllamaError
 from .source import OutputReader, page_units
 
@@ -63,8 +65,13 @@ EMBEDDED_KINDS = (
 )
 
 
-class IngestionError(RuntimeError):
+class IngestionError(ClaimEvidenceError):
     """Ingestion could not complete; the version stays invisible to queries."""
+
+
+# The integrity gate runs a fixed set of checks, which is what makes
+# `building_indexes` a measurable phase rather than a spinner.
+VERIFY_STEPS = ("evidence count", "page links", "citation paths", "embedding dimension")
 
 
 def index_fingerprint(source_fingerprint: str, settings: Settings) -> str:
@@ -85,9 +92,49 @@ def ingest_document(
     source_uri: str | None = None,
     force: bool = False,
     extract_narrative_facts: bool = True,
+    progress: ProgressCallback | None = None,
+) -> IngestReport:
+    reporter = ProgressReporter(progress, "ingest")
+    try:
+        return _ingest(
+            conn,
+            client,
+            settings,
+            output_root,
+            source_pdf=source_pdf,
+            source_uri=source_uri,
+            force=force,
+            extract_narrative_facts=extract_narrative_facts,
+            reporter=reporter,
+        )
+    except BaseException as exc:
+        # One safe terminal event, then the original error reaches the caller
+        # unchanged. A failed version is never activated.
+        reporter.fail(exc)
+        raise
+
+
+def _ingest(
+    conn: psycopg.Connection,
+    client: OllamaClient,
+    settings: Settings,
+    output_root: str | Path,
+    *,
+    source_pdf: str | Path | None,
+    source_uri: str | None,
+    force: bool,
+    extract_narrative_facts: bool,
+    reporter: ProgressReporter,
 ) -> IngestReport:
     reader = OutputReader(output_root)
+    reporter.start("validating_input", "Validating the extraction output")
     pages = reader.validate()
+    reporter.done(
+        "validating_input",
+        f"Validated {len(pages)} pages",
+        completed=len(pages),
+        total=len(pages),
+    )
 
     source_pdf_path = Path(source_pdf) if source_pdf else None
     document_name = (source_pdf_path or reader.root).name
@@ -95,11 +142,12 @@ def ingest_document(
     fingerprint = index_fingerprint(reader.fingerprint(source_pdf_path), settings)
 
     document_id = upsert_document(conn, document_name, sha256, source_uri)
+    reporter.document_id = document_id
     existing = find_version(conn, document_id, fingerprint)
     if existing and existing["status"] == VersionStatus.READY and not force:
         # Same source, same embedding model: nothing to rebuild. Report the
         # stored counts anyway, so a no-op run does not read as an empty one.
-        return IngestReport(
+        report = IngestReport(
             document_id=document_id,
             version_id=int(existing["id"]),
             status=VersionStatus.READY,
@@ -109,6 +157,14 @@ def ingest_document(
             warnings=reader.warnings,
             **_stored_counts(conn, int(existing["id"])),
         )
+        reporter.done(
+            "completed",
+            "Document is already indexed",
+            completed=1,
+            total=1,
+            details=_completion_details(report, reporter),
+        )
+        return report
 
     version_id = start_version(
         conn,
@@ -130,8 +186,10 @@ def ingest_document(
     evidence_ids: dict[str, int] = {}
     all_units: list[EvidenceUnit] = []
     unit_count = 0
+    warned = 0
 
-    for page in pages:
+    reporter.start("building_evidence", "Building evidence units", total=len(pages))
+    for index, page in enumerate(pages, start=1):
         units = list(page_units(reader, page, blocks_by_page.get(page.page, [])))
         page_id = upsert_page(
             conn, version_id, page.page, page.width, page.height, page.page_dir.name
@@ -140,8 +198,22 @@ def ingest_document(
         conn.commit()
         all_units.extend(units)
         unit_count += len(units)
+        reporter.step(
+            "building_evidence",
+            f"Indexed page {page.page}",
+            completed=index,
+            total=len(pages),
+            current_item=f"page {page.page}",
+        )
+        warned = _warn_new(reporter, "building_evidence", reader, warned)
+    reporter.done(
+        "building_evidence",
+        f"Built {unit_count} evidence units",
+        completed=len(pages),
+        total=len(pages),
+    )
 
-    embedded = _embed_pending(conn, client, settings, version_id)
+    embedded = _embed_pending(conn, client, settings, version_id, reporter)
     facts, rejected = _build_facts(
         conn,
         client,
@@ -152,27 +224,69 @@ def ingest_document(
         evidence_ids,
         reader,
         extract_narrative_facts,
+        reporter,
     )
+    _warn_new(reporter, "extracting_facts", reader, warned)
 
-    # Only now is the replacement allowed to take over. If _verify raises,
-    # the previous version is still 'ready' and still serving queries.
-    _verify(conn, version_id, unit_count, settings)
+    _verify(conn, version_id, unit_count, settings, reporter)
+
+    reporter.start("activating_version", "Activating the new version")
     activate_version(conn, version_id)
     conn.commit()
+    reporter.done("activating_version", "Version activated", completed=1, total=1)
 
-    return IngestReport(
+    report = IngestReport(
         document_id=document_id,
         version_id=version_id,
         status=VersionStatus.READY,
         fingerprint=fingerprint,
         pages=len(pages),
         evidence_units=unit_count,
+        visual_evidence_units=sum(
+            1 for unit in all_units if unit.kind is EvidenceKind.VISUAL
+        ),
         embedded_units=embedded,
         facts=facts,
         warnings=reader.warnings,
         skipped_artifacts=sorted(set(reader.skipped)),
         rejected_facts=rejected,
     )
+    reporter.done(
+        "completed",
+        f"Indexed {report.pages} pages into {report.evidence_units} evidence units",
+        completed=1,
+        total=1,
+        details=_completion_details(report, reporter),
+    )
+    return report
+
+
+def _completion_details(report: IngestReport, reporter: ProgressReporter) -> dict[str, Any]:
+    """Counts the caller already paid for, echoed onto the terminal event.
+
+    Every value comes off the finished report, so showing completion statistics
+    costs no extra queries.
+    """
+    return {
+        "document_version_id": report.version_id,
+        "page_count": report.pages,
+        "evidence_count": report.evidence_units,
+        "visual_evidence_count": report.visual_evidence_units,
+        "embedding_count": report.embedded_units,
+        "fact_count": report.facts,
+        "warning_count": len(report.warnings),
+        "elapsed_seconds": reporter.elapsed_seconds,
+        "no_op": report.reused_existing,
+    }
+
+
+def _warn_new(
+    reporter: ProgressReporter, phase: str, reader: OutputReader, already: int
+) -> int:
+    """Surface recoverable fallbacks the reader recorded, once each."""
+    for warning in reader.warnings[already:]:
+        reporter.warn(phase, warning)
+    return len(reader.warnings)
 
 
 def _stored_counts(conn: psycopg.Connection, version_id: int) -> dict[str, int]:
@@ -181,6 +295,8 @@ def _stored_counts(conn: psycopg.Connection, version_id: int) -> dict[str, int]:
         SELECT
             (SELECT count(*) FROM evidence_unit WHERE version_id = %(v)s) AS units,
             (SELECT count(*) FROM evidence_unit
+             WHERE version_id = %(v)s AND kind = 'visual') AS visual,
+            (SELECT count(*) FROM evidence_unit
              WHERE version_id = %(v)s AND embedding IS NOT NULL) AS embedded,
             (SELECT count(*) FROM fact WHERE version_id = %(v)s) AS facts
         """,
@@ -188,6 +304,7 @@ def _stored_counts(conn: psycopg.Connection, version_id: int) -> dict[str, int]:
     ).fetchone()
     return {
         "evidence_units": int(row["units"]),
+        "visual_evidence_units": int(row["visual"]),
         "embedded_units": int(row["embedded"]),
         "facts": int(row["facts"]),
     }
@@ -198,6 +315,7 @@ def _embed_pending(
     client: OllamaClient,
     settings: Settings,
     version_id: int,
+    reporter: ProgressReporter,
 ) -> int:
     """Embed everything not yet embedded, one batch per HTTP call.
 
@@ -207,11 +325,26 @@ def _embed_pending(
     pending = units_missing_embeddings(conn, version_id, EMBEDDED_KINDS)
     embedded = 0
     size = max(1, settings.embed_batch_size)
-    for start in range(0, len(pending), size):
+    batches = -(-len(pending) // size)  # ceil, and 0 when nothing is pending
+    reporter.start("embedding_evidence", "Embedding evidence", total=batches)
+    for number, start in enumerate(range(0, len(pending), size), start=1):
         chunk = pending[start : start + size]
         vectors = client.embed([row["normalized_text"] or " " for row in chunk])
         set_embeddings(conn, [(int(r["id"]), v) for r, v in zip(chunk, vectors)])
         embedded += len(chunk)
+        reporter.step(
+            "embedding_evidence",
+            f"Embedded batch {number} of {batches}",
+            completed=number,
+            total=batches,
+            current_item=f"batch {number}",
+        )
+    reporter.done(
+        "embedding_evidence",
+        f"Embedded {embedded} evidence units",
+        completed=batches,
+        total=batches,
+    )
     return embedded
 
 
@@ -225,35 +358,68 @@ def _build_facts(
     evidence_ids: dict[str, int],
     reader: OutputReader,
     extract_narrative_facts: bool,
+    reporter: ProgressReporter,
 ) -> tuple[int, list[str]]:
     stored = 0
     rejected: list[str] = []
+
+    candidates = (
+        [
+            unit
+            for unit in units
+            if unit.kind is EvidenceKind.NARRATIVE and is_claim_like(unit.text)
+        ]
+        if extract_narrative_facts
+        else []
+    )
+    reporter.start("extracting_facts", "Extracting facts", total=len(candidates))
 
     for fact in table_facts(units, subject):
         stored += _store_fact(conn, version_id, fact, subject_entity, evidence_ids)
     conn.commit()
 
     if not extract_narrative_facts:
+        reporter.done(
+            "extracting_facts",
+            f"Derived {stored} table facts",
+            completed=0,
+            total=0,
+        )
         return stored, rejected
 
-    for unit in units:
-        if unit.kind is not EvidenceKind.NARRATIVE or not is_claim_like(unit.text):
-            continue
+    for index, unit in enumerate(candidates, start=1):
         try:
             extraction = client.structured(
                 FactExtraction,
                 FACT_EXTRACTION_SYSTEM,
                 fact_extraction_prompt(unit, subject),
             )
-        except OllamaError as exc:
-            reader.warnings.append(f"fact extraction failed for {unit.unit_key}: {exc}")
+        except OllamaError:
+            # One passage the model could not process is not a failed index.
+            reader.warnings.append(f"fact extraction failed for {unit.unit_key}")
+            reporter.warn(
+                "extracting_facts", "A passage could not be processed by the model"
+            )
             continue
         kept, dropped = accept_llm_facts(extraction.facts, unit, subject)
         rejected.extend(dropped)
         for fact in kept:
             stored += _store_fact(conn, version_id, fact, subject_entity, evidence_ids)
         conn.commit()
+        reporter.step(
+            "extracting_facts",
+            f"Examined {index} of {len(candidates)} passages",
+            completed=index,
+            total=len(candidates),
+            current_item=unit.unit_key,
+        )
 
+    reporter.done(
+        "extracting_facts",
+        f"Stored {stored} facts",
+        completed=len(candidates),
+        total=len(candidates),
+    )
     return stored, rejected
 
 
@@ -283,14 +449,24 @@ def _store_fact(
 
 
 def _verify(
-    conn: psycopg.Connection, version_id: int, expected_units: int, settings: Settings
+    conn: psycopg.Connection,
+    version_id: int,
+    expected_units: int,
+    settings: Settings,
+    reporter: ProgressReporter,
 ) -> None:
     """Count, foreign-key, citation-path, and embedding-dimension checks."""
+    total = len(VERIFY_STEPS)
+    reporter.start("building_indexes", "Checking index integrity", total=total)
     stored = conn.execute(
         "SELECT count(*) AS n FROM evidence_unit WHERE version_id = %s", (version_id,)
     ).fetchone()["n"]
     if stored != expected_units:
         raise IngestionError(f"stored {stored} evidence units, expected {expected_units}")
+    reporter.step(
+        "building_indexes", "Evidence count verified", completed=1, total=total,
+        current_item=VERIFY_STEPS[0],
+    )
 
     orphans = conn.execute(
         """
@@ -302,6 +478,10 @@ def _verify(
     ).fetchone()["n"]
     if orphans:
         raise IngestionError(f"{orphans} evidence units have no page")
+    reporter.step(
+        "building_indexes", "Page links verified", completed=2, total=total,
+        current_item=VERIFY_STEPS[1],
+    )
 
     uncited = conn.execute(
         """
@@ -313,6 +493,10 @@ def _verify(
     ).fetchone()["n"]
     if uncited:
         raise IngestionError(f"{uncited} citable units have no region to highlight")
+    reporter.step(
+        "building_indexes", "Citation paths verified", completed=3, total=total,
+        current_item=VERIFY_STEPS[2],
+    )
 
     dim = conn.execute(
         """
@@ -326,6 +510,9 @@ def _verify(
             f"stored embeddings have dimension {dim['d']}, "
             f"expected {settings.embed_dimensions}"
         )
+    reporter.done(
+        "building_indexes", "Index checks passed", completed=total, total=total
+    )
 
 
 def ensure_schema(conn: psycopg.Connection, settings: Settings) -> None:
@@ -334,6 +521,7 @@ def ensure_schema(conn: psycopg.Connection, settings: Settings) -> None:
 
 __all__ = [
     "EMBEDDED_KINDS",
+    "VERIFY_STEPS",
     "IngestionError",
     "ensure_schema",
     "index_fingerprint",

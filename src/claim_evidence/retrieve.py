@@ -31,6 +31,7 @@ from .models import (
     Region,
 )
 from .normalize import all_years, content_tokens, normalize_for_match, scope_markers
+from .progress import ProgressReporter
 
 RRF_K = 60
 # Scaled to the fusion signal, not to 1.0: a candidate ranked first by all
@@ -132,15 +133,17 @@ def retrieve(
     document_ids: Sequence[int] | None = None,
     limit: int = 20,
     pool: int = 60,
-) -> list[dict[str, Any]]:
-    """Candidates for one claim, best first."""
-    ranked: dict[str, list[dict[str, Any]]] = {
-        "lexical": lexical_search(
-            conn, lexical_query(claim_text, claim.key_terms), document_ids, pool
-        )
-    }
-    if query_embedding is not None:
-        ranked["vector"] = vector_search(conn, query_embedding, document_ids, pool)
+    reporter: ProgressReporter | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, list[dict[str, Any]]]]:
+    """Candidates for one claim, best first, plus the per-channel results.
+
+    The raw channel lists come back with the fused list so a caller can report
+    what each retriever contributed without querying anything again.
+    """
+    report = reporter or ProgressReporter(None, "audit")
+    ranked: dict[str, list[dict[str, Any]]] = {}
+
+    report.start("retrieving_graph", "Searching claim facts", total=pool)
     ranked["graph"] = graph_search(
         conn,
         metric_terms=sorted(content_tokens(claim.metric or claim_text))[:8],
@@ -149,20 +152,64 @@ def retrieve(
         document_ids=document_ids,
         limit=pool,
     )
-    return fuse(ranked, claim=claim, claim_text=claim_text)[:limit]
+    report.done(
+        "retrieving_graph",
+        f"{len(ranked['graph'])} fact candidates",
+        completed=len(ranked["graph"]),
+        total=pool,
+    )
+
+    report.start("retrieving_full_text", "Searching full text", total=pool)
+    ranked["lexical"] = lexical_search(
+        conn, lexical_query(claim_text, claim.key_terms), document_ids, pool
+    )
+    report.done(
+        "retrieving_full_text",
+        f"{len(ranked['lexical'])} full-text candidates",
+        completed=len(ranked["lexical"]),
+        total=pool,
+    )
+
+    if query_embedding is not None:
+        report.start("retrieving_vectors", "Searching embeddings", total=pool)
+        ranked["vector"] = vector_search(conn, query_embedding, document_ids, pool)
+        report.done(
+            "retrieving_vectors",
+            f"{len(ranked['vector'])} vector candidates",
+            completed=len(ranked["vector"]),
+            total=pool,
+        )
+
+    report.start("fusing_candidates", "Merging candidate ranks")
+    fused = fuse(ranked, claim=claim, claim_text=claim_text)
+    # completed == total: every merged candidate was processed. The limit that
+    # follows is a cut, not incomplete work, so it belongs in the message.
+    report.done(
+        "fusing_candidates",
+        f"Merged {len(fused)} candidates, keeping {min(len(fused), limit)}",
+        completed=len(fused),
+        total=len(fused),
+    )
+    return fused[:limit], ranked
 
 
 def expand(
-    conn: psycopg.Connection, candidates: Sequence[dict[str, Any]], top: int = 5
+    conn: psycopg.Connection,
+    candidates: Sequence[dict[str, Any]],
+    top: int = 5,
+    reporter: ProgressReporter | None = None,
 ) -> list[dict[str, Any]]:
     """Pull in each top candidate's page neighbours: table rows, headers, prose.
 
     A value cell alone rarely proves a claim; the row it sits in and the
     paragraph beside it are what make the qualifiers checkable.
     """
+    report = reporter or ProgressReporter(None, "audit")
+    considered = min(top, len(candidates))
+    report.start("expanding_context", "Expanding context", total=considered)
     seen = {int(c["row"]["id"]) for c in candidates}
     extra: list[dict[str, Any]] = []
-    for candidate in candidates[:top]:
+    for position, candidate in enumerate(candidates[:top], start=1):
         for row in neighbours(conn, int(candidate["row"]["id"])):
             evidence_id = int(row["id"])
             if evidence_id in seen:
@@ -179,6 +226,18 @@ def expand(
                     "expanded_from": int(candidate["row"]["id"]),
                 }
             )
+        report.step(
+            "expanding_context",
+            f"Expanded {position} of {considered}",
+            completed=position,
+            total=considered,
+        )
+    report.done(
+        "expanding_context",
+        f"Added {len(extra)} neighbouring units",
+        completed=considered,
+        total=considered,
+    )
     return [*candidates, *extra]
 
 

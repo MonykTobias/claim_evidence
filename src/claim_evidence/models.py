@@ -8,7 +8,7 @@ validation error instead of a verdict.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 from enum import StrEnum
 from typing import Any, Literal, Self
@@ -172,11 +172,57 @@ class IngestReport(BaseModel):
     reused_existing: bool = False
     pages: int = 0
     evidence_units: int = 0
+    visual_evidence_units: int = 0
     embedded_units: int = 0
     facts: int = 0
     warnings: list[str] = Field(default_factory=list)
     skipped_artifacts: list[str] = Field(default_factory=list)
     rejected_facts: list[str] = Field(default_factory=list)
+
+
+def phase_percent(completed: int | None, total: int | None) -> float | None:
+    """Phase-local percentage, or None when the work is not measurable.
+
+    A total of zero is a finished phase with nothing to do, not a division
+    error: "0 of 0 crops verified" is 100% done.
+    """
+    if completed is None or total is None:
+        return None
+    if total <= 0:
+        return 100.0
+    return round(min(100.0, max(0.0, 100.0 * completed / total)), 2)
+
+
+class ProgressEvent(BaseModel):
+    """One phase update from a running ingestion or audit.
+
+    Carries counts and identifiers only. Never a prompt, a model response,
+    source text, a connection string, or a stack trace -- a frontend renders
+    these directly, and an operator may paste one into a bug report.
+    """
+
+    operation: Literal["ingest", "audit"]
+    phase: str
+    status: Literal["start", "progress", "completed", "warning", "failed"]
+    message: str
+    # Null whenever the work is genuinely not measurable; an invented
+    # percentage is worse than an honest spinner.
+    completed: int | None = None
+    total: int | None = None
+    percent: float | None = None
+    document_id: int | None = None
+    audit_id: int | None = None
+    current_item: str | None = None
+    details: dict[str, Any] = Field(default_factory=dict)
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+    @model_validator(mode="after")
+    def _derive_percent(self) -> Self:
+        if self.percent is None:
+            object.__setattr__(
+                self, "percent", phase_percent(self.completed, self.total)
+            )
+        return self
 
 
 # --- Frontend-support types -------------------------------------------------
@@ -459,6 +505,8 @@ __all__ = [
     "IngestReport",
     "ModelHealth",
     "ParsedClaim",
+    "ProgressEvent",
+    "phase_percent",
     "Region",
     "RegionRole",
     "RemovalReport",

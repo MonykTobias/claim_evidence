@@ -9,6 +9,7 @@ from .errors import (
     NotFoundError,
     ValidationError,
 )
+from .progress import ProgressCallback, classify_error
 from .models import (
     AuditTrace,
     Citation,
@@ -22,6 +23,7 @@ from .models import (
     HealthReport,
     IngestReport,
     ModelHealth,
+    ProgressEvent,
     Region,
     RegionRole,
     RemovalReport,
@@ -50,12 +52,15 @@ __all__ = [
     "IngestReport",
     "ModelHealth",
     "NotFoundError",
+    "ProgressCallback",
+    "ProgressEvent",
     "Region",
     "RegionRole",
     "RemovalReport",
     "Settings",
     "TraceCandidate",
     "ValidationError",
+    "classify_error",
     "Verdict",
     "VersionStatus",
     "__version__",

@@ -37,6 +37,7 @@ from .models import (
     RemovalReport,
 )
 from .ollama import OllamaClient, OllamaError
+from .progress import ProgressCallback
 from .retrieve import retrieve, to_matches
 
 
@@ -125,6 +126,7 @@ class ClaimEvidence:
         source_uri: str | None = None,
         force: bool = False,
         extract_narrative_facts: bool = True,
+        progress: ProgressCallback | None = None,
     ) -> IngestReport:
         """Index a completed output root.
 
@@ -140,6 +142,7 @@ class ClaimEvidence:
             source_uri=source_uri,
             force=force,
             extract_narrative_facts=extract_narrative_facts,
+            progress=progress,
         )
 
     # --- query --------------------------------------------------------------
@@ -156,7 +159,7 @@ class ClaimEvidence:
             embedding = self.ollama.embed([query])[0]
         except OllamaError:
             embedding = None
-        candidates = retrieve(
+        candidates, _channels = retrieve(
             self.conn, embedding, parsed, query, document_ids=document_ids, limit=limit
         )
         return to_matches(self.conn, candidates)
@@ -167,6 +170,7 @@ class ClaimEvidence:
         *,
         document_ids: Sequence[int] | None = None,
         limit: int = 20,
+        progress: ProgressCallback | None = None,
     ) -> ClaimResult:
         return _audit_claim(
             self.conn,
@@ -175,6 +179,7 @@ class ClaimEvidence:
             claim,
             document_ids=document_ids,
             limit=limit,
+            progress=progress,
         )
 
 

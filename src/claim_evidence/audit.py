@@ -41,7 +41,9 @@ from .models import (
     ParsedClaim,
     Verdict,
 )
+from .errors import ClaimEvidenceError
 from .ollama import OllamaClient, OllamaError
+from .progress import ProgressCallback, ProgressReporter
 from .retrieve import expand, retrieve, to_citation
 from .vision import verify_visual
 
@@ -78,17 +80,23 @@ _QUALITY_ORDER = [
 ]
 
 
-class AuditError(RuntimeError):
+class AuditError(ClaimEvidenceError):
     """The audit could not reach a verdict; the caller gets an error, not a guess."""
 
 
-def parse_claim(client: OllamaClient, claim: str) -> ParsedClaim:
+def parse_claim(
+    client: OllamaClient, claim: str, reporter: ProgressReporter | None = None
+) -> ParsedClaim:
     """Structured parse with a deterministic fallback and gap-fill."""
+    report = reporter or ProgressReporter(None, "audit")
+    report.start("parsing_claim", "Parsing the claim")
     fallback = heuristic_claim(claim)
     try:
         parsed = client.structured(ParsedClaim, CLAIM_PARSE_SYSTEM, claim)
     except OllamaError:
+        report.done("parsing_claim", "Parsed the claim without the model")
         return fallback
+    report.done("parsing_claim", "Parsed the claim")
     return merge_claim(parsed, fallback)
 
 
@@ -100,24 +108,53 @@ def audit_claim(
     *,
     document_ids: Sequence[int] | None = None,
     limit: int = 20,
+    progress: ProgressCallback | None = None,
 ) -> ClaimResult:
-    parsed = parse_claim(client, claim)
+    reporter = ProgressReporter(progress, "audit")
+    try:
+        return _audit(
+            conn, client, settings, claim,
+            document_ids=document_ids, limit=limit, reporter=reporter,
+        )
+    except BaseException as exc:
+        reporter.fail(exc)
+        raise
+
+
+def _audit(
+    conn: psycopg.Connection,
+    client: OllamaClient,
+    settings: Settings,
+    claim: str,
+    *,
+    document_ids: Sequence[int] | None,
+    limit: int,
+    reporter: ProgressReporter,
+) -> ClaimResult:
+    parsed = parse_claim(client, claim, reporter)
     audit_id = create_audit(
         conn, claim, parsed.model_dump(mode="json"), settings.chat_model, settings.embed_model
     )
+    reporter.audit_id = audit_id
 
     try:
         embedding = client.embed([claim])[0]
     except OllamaError:
+        # The vector channel is simply not available for this audit; the other
+        # two still run, and the completion summary omits its count.
         embedding = None
 
-    candidates = expand(
-        conn, retrieve(conn, embedding, parsed, claim, document_ids=document_ids, limit=limit)
+    fused, channels = retrieve(
+        conn, embedding, parsed, claim,
+        document_ids=document_ids, limit=limit, reporter=reporter,
     )
+    candidates = expand(conn, fused, reporter=reporter)
     if not candidates:
         return _finish(
             conn, audit_id, claim, Verdict.INSUFFICIENT,
             "No evidence matched the claim.", EvidenceQuality.NONE, [], ["evidence"],
+            reporter=reporter, channels=channels, fused=fused, candidates=[],
+            visual_status={},
         )
 
     regions = regions_for(conn, [int(c["row"]["id"]) for c in candidates])
@@ -133,10 +170,18 @@ def audit_claim(
         decided_by = "adjudicator"
         verdict, rationale, citations, missing = _adjudicate(
             conn, client, claim, parsed, citable, regions, visual_status,
-            scope_ambiguous=scope_ambiguous,
+            scope_ambiguous=scope_ambiguous, reporter=reporter,
         )
+    else:
+        # Arithmetic decided, so no crop was ever inspected.
+        reporter.done(
+            "verifying_visuals", "No visual evidence needed", completed=0, total=0
+        )
+        reporter.start("deciding_verdict", "Comparing the claim to the evidence")
+    reporter.done("deciding_verdict", f"Verdict: {verdict}")
 
     selected_ids = {citation.evidence_id for citation in citations}
+    reporter.start("persisting_trace", "Saving the retrieval trace")
     record_candidates(
         conn,
         audit_id,
@@ -161,8 +206,18 @@ def audit_claim(
             for c in candidates
         ],
     )
-    return _finish(conn, audit_id, claim, verdict, rationale, _quality(citations),
-                   citations, missing)
+    reporter.done(
+        "persisting_trace",
+        f"Saved {len(candidates)} candidates",
+        completed=len(candidates),
+        total=len(candidates),
+    )
+    return _finish(
+        conn, audit_id, claim, verdict, rationale, _quality(citations),
+        citations, missing,
+        reporter=reporter, channels=channels, fused=fused, candidates=candidates,
+        visual_status=visual_status,
+    )
 
 
 def _deterministic(
@@ -238,8 +293,15 @@ def _adjudicate(
     regions: dict[int, list[dict[str, Any]]],
     visual_status: dict[int, str],
     scope_ambiguous: bool = False,
+    reporter: ProgressReporter | None = None,
 ) -> tuple[Verdict, str, list[Citation], list[str]]:
-    usable = _verify_visuals(conn, client, claim, candidates, regions, visual_status)
+    usable = _verify_visuals(
+        conn, client, claim, candidates, regions, visual_status,
+        reporter or ProgressReporter(None, "audit"),
+    )
+    (reporter or ProgressReporter(None, "audit")).start(
+        "deciding_verdict", "Judging the evidence"
+    )
     if not usable:
         return (
             Verdict.INSUFFICIENT,
@@ -305,6 +367,7 @@ def _verify_visuals(
     candidates: Sequence[dict[str, Any]],
     regions: dict[int, list[dict[str, Any]]],
     visual_status: dict[int, str],
+    reporter: ProgressReporter,
 ) -> list[tuple[Citation, str, dict[str, Any]]]:
     """Citations the adjudicator may use.
 
@@ -313,6 +376,11 @@ def _verify_visuals(
     recorded per candidate so the trace shows why a chart was not used.
     """
     usable: list[tuple[Citation, str, dict[str, Any]]] = []
+    visuals = sum(
+        1 for c in candidates if EvidenceKind(c["row"]["kind"]) is EvidenceKind.VISUAL
+    )
+    reporter.start("verifying_visuals", "Re-checking visual evidence", total=visuals)
+    checked = 0
     for candidate in candidates:
         row = candidate["row"]
         evidence_id = int(row["id"])
@@ -330,11 +398,22 @@ def _verify_visuals(
             )
             continue
 
+        checked += 1
         page_png = _page_png(conn, evidence_id)
         if page_png is None:
             visual_status[evidence_id] = "unavailable"
+            reporter.step(
+                "verifying_visuals", "Page image unavailable",
+                completed=checked, total=visuals,
+            )
             continue
         result = verify_visual(client, page_png, citation.regions, claim)
+        reporter.step(
+            "verifying_visuals",
+            f"Checked crop {checked} of {visuals}",
+            completed=checked,
+            total=visuals,
+        )
         if not result.supports_claim:
             visual_status[evidence_id] = "rejected"
             continue
@@ -346,6 +425,13 @@ def _verify_visuals(
                 row,
             )
         )
+    reporter.done(
+        "verifying_visuals",
+        f"Verified {sum(1 for v in visual_status.values() if v == 'verified')} of "
+        f"{visuals} visual candidates",
+        completed=visuals,
+        total=visuals,
+    )
     return usable
 
 
@@ -397,6 +483,12 @@ def _finish(
     quality: EvidenceQuality,
     citations: Sequence[Citation],
     missing: Sequence[str],
+    *,
+    reporter: ProgressReporter,
+    channels: dict[str, list[dict[str, Any]]],
+    fused: Sequence[dict[str, Any]],
+    candidates: Sequence[dict[str, Any]],
+    visual_status: dict[int, str],
 ) -> ClaimResult:
     # A supporting verdict without a direct or re-verified citation is a bug;
     # fail closed rather than emit it.
@@ -417,7 +509,7 @@ def _finish(
         missing_qualifiers=list(missing),
         citations=[c.model_dump(mode="json") for c in citations],
     )
-    return ClaimResult(
+    result = ClaimResult(
         claim=claim,
         verdict=verdict,
         rationale=rationale,
@@ -426,6 +518,50 @@ def _finish(
         missing_qualifiers=list(missing),
         audit_id=audit_id,
     )
+    reporter.done(
+        "completed",
+        f"Verdict: {verdict}",
+        completed=1,
+        total=1,
+        details=_audit_details(result, reporter, channels, fused, candidates, visual_status),
+    )
+    return result
+
+
+def _audit_details(
+    result: ClaimResult,
+    reporter: ProgressReporter,
+    channels: dict[str, list[dict[str, Any]]],
+    fused: Sequence[dict[str, Any]],
+    candidates: Sequence[dict[str, Any]],
+    visual_status: dict[int, str],
+) -> dict[str, Any]:
+    """Retrieval counts from the collections the audit already built.
+
+    Nothing is read back from the database, and nothing here is claim text,
+    evidence text, a prompt, or a model response -- only counts and the verdict.
+    """
+    details: dict[str, Any] = {
+        "verdict": str(result.verdict),
+        "citation_count": len(result.citations),
+        "selected_evidence_count": len({c.evidence_id for c in result.citations}),
+        "graph_candidate_count": len(channels.get("graph", ())),
+        "full_text_candidate_count": len(channels.get("lexical", ())),
+        "fused_candidate_count": len(fused),
+        "expanded_candidate_count": sum(
+            1 for c in candidates if c.get("expanded_from")
+        ),
+        "visual_candidate_count": len(visual_status),
+        "visually_verified_count": sum(
+            1 for status in visual_status.values() if status == "verified"
+        ),
+        "elapsed_seconds": reporter.elapsed_seconds,
+    }
+    # The vector channel is omitted, not zeroed, when embeddings were
+    # unavailable: "ran and found nothing" and "never ran" are different facts.
+    if "vector" in channels:
+        details["vector_candidate_count"] = len(channels["vector"])
+    return details
 
 
 def _candidate_reason(
