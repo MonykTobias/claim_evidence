@@ -8,7 +8,9 @@ services:
     ports:
       - "5433:5432"
     volumes:
-      - claim-evidence-pgdata:/var/lib/postgresql/data
+      # PostgreSQL 18 images expect the mount one level up and place the
+      # cluster in a major-version subdirectory; mounting /data refuses to start.
+      - claim-evidence-pgdata:/var/lib/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U claim_evidence -d claim_evidence"]
       interval: 5s

@@ -28,9 +28,9 @@ def connect(database_url: str) -> psycopg.Connection:
     conn = psycopg.connect(database_url, row_factory=dict_row, autocommit=False)
     try:
         register_vector(conn)
-    except psycopg.errors.UndefinedObject:
-        # The extension is created by `db init`; registration succeeds on the
-        # next connection.
+    except psycopg.ProgrammingError:
+        # The extension is created by `db init`; on a fresh database the vector
+        # type does not exist yet and registration succeeds after init_schema.
         conn.rollback()
     return conn
 
