@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import psycopg  # noqa: E402
+from fixtures import block, kpi_table, write_output_root  # noqa: E402
 from test_integration import (  # noqa: E402
     SUPPORTED,
     build_root,
@@ -199,6 +200,31 @@ def check_zero_candidates_do_not_divide_by_zero(tmp: Path) -> None:
     check(bool(facts), "the fact phase still reports")
     check(facts[-1].total == 0, "an empty phase reports a zero total")
     check(facts[-1].percent == 100.0, "an empty phase is 100 percent, not an error")
+
+
+def check_warnings_are_emitted_once(tmp: Path) -> None:
+    root = write_output_root(
+        tmp / "warned",
+        pages=2,
+        blocks=[block(1, 1, "Nature indicators", heading_path=["4.8.2"])],
+        tables={1: [kpi_table()]},
+        stale_page_dir="page_0009",
+    )
+    events: list[ProgressEvent] = []
+    with make_client(default_session()) as client:
+        report = client.ingest_document(
+            root, source_uri="urn:warned", progress=events.append
+        )
+    warnings = [e for e in events if e.status == "warning"]
+    check(bool(warnings), "a recoverable fallback is surfaced as a warning event")
+    check(
+        len(warnings) == len(report.warnings),
+        f"each warning is emitted exactly once ({len(warnings)} vs {len(report.warnings)})",
+    )
+    check(
+        events[-1].details["warning_count"] == len(warnings),
+        "the completion summary agrees with the warning events",
+    )
 
 
 def check_callback_exception_does_not_fail_the_build(tmp: Path) -> None:
@@ -535,6 +561,7 @@ def main() -> int:
         check_ingest_completion_matches_the_report,
         check_idempotent_ingest_reports_no_op,
         check_zero_candidates_do_not_divide_by_zero,
+        check_warnings_are_emitted_once,
         check_callback_exception_does_not_fail_the_build,
         check_audit_phases_and_counts,
         check_visual_counts,

@@ -214,6 +214,9 @@ def _ingest(
     )
 
     embedded = _embed_pending(conn, client, settings, version_id, reporter)
+    # Drain the reader's warnings here, before fact extraction: _build_facts
+    # emits its own, and draining afterwards would send each of those twice.
+    _warn_new(reporter, "embedding_evidence", reader, warned)
     facts, rejected = _build_facts(
         conn,
         client,
@@ -226,7 +229,6 @@ def _ingest(
         extract_narrative_facts,
         reporter,
     )
-    _warn_new(reporter, "extracting_facts", reader, warned)
 
     _verify(conn, version_id, unit_count, settings, reporter)
 
