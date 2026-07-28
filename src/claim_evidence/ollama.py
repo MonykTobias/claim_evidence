@@ -24,6 +24,25 @@ class OllamaError(RuntimeError):
     """The model was unreachable, or twice failed to produce valid output."""
 
 
+# Ollama compiles the response schema into a GBNF grammar, which supports only
+# a subset of JSON Schema. Pydantic's Decimal schema carries a regex with a
+# lookahead that the converter rejects outright ("failed to parse grammar"), so
+# constraint keywords are dropped before the schema is sent. Nothing is lost:
+# the schema only steers generation, and Pydantic still validates the reply.
+_UNSUPPORTED_KEYWORDS = frozenset({"pattern", "format", "contentEncoding"})
+
+
+def gbnf_safe_schema(schema: type[BaseModel]) -> dict[str, Any]:
+    def prune(node: Any) -> Any:
+        if isinstance(node, dict):
+            return {k: prune(v) for k, v in node.items() if k not in _UNSUPPORTED_KEYWORDS}
+        if isinstance(node, list):
+            return [prune(v) for v in node]
+        return node
+
+    return prune(schema.model_json_schema())
+
+
 class OllamaClient:
     def __init__(self, settings: Settings, session: requests.Session | None = None) -> None:
         self.settings = settings
@@ -40,7 +59,10 @@ class OllamaClient:
             response.raise_for_status()
             return response.json()
         except requests.RequestException as exc:
-            raise OllamaError(f"{url} failed: {exc}") from exc
+            # Ollama explains a rejected request in the body; without it a 400
+            # is indistinguishable from a network failure.
+            detail = getattr(getattr(exc, "response", None), "text", "") or ""
+            raise OllamaError(f"{url} failed: {exc}{f' -- {detail[:400]}' if detail else ''}") from exc
         except json.JSONDecodeError as exc:
             raise OllamaError(f"{url} returned non-JSON: {exc}") from exc
 
@@ -107,7 +129,7 @@ class OllamaClient:
         payload = {
             "model": model or self.settings.chat_model,
             "messages": [{"role": "system", "content": system}, message],
-            "format": schema.model_json_schema(),
+            "format": gbnf_safe_schema(schema),
             "stream": False,
             "options": {"temperature": 0},
         }
@@ -145,4 +167,4 @@ class OllamaClient:
         )
 
 
-__all__ = ["OllamaClient", "OllamaError"]
+__all__ = ["OllamaClient", "OllamaError", "gbnf_safe_schema"]

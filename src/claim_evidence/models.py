@@ -12,7 +12,23 @@ from decimal import Decimal
 from enum import StrEnum
 from typing import Any, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+
+def _coerce_displayed_value(value: Any) -> Any:
+    """Read a displayed value string into a Decimal.
+
+    Models answer with the figure as the page prints it -- "-40.2%",
+    "(40.2) %", "1,044" -- none of which is valid JSON number syntax. Parsing
+    it exactly the way a table cell is parsed is faithful to the source; it is
+    the quote check, not the number format, that guards against invention.
+    """
+    if isinstance(value, str):
+        from .normalize import parse_value  # local: `normalize` imports this module
+
+        parsed, _ = parse_value(value)
+        return parsed
+    return value
 
 
 class EvidenceKind(StrEnum):
@@ -167,8 +183,18 @@ class Fact(BaseModel):
     geography: str | None = None
     qualifiers: dict[str, Any] = Field(default_factory=dict)
     extraction_method: Literal["table", "llm"] = "table"
-    quote: str = ""
+    # Required, not defaulted: an optional field is omitted from the schema's
+    # `required` list, and a model told a field is optional simply leaves it
+    # out -- which made every extracted fact fail the quote check.
+    quote: str = Field(
+        description=(
+            "Text copied verbatim from the passage, character for character, "
+            "that states this fact."
+        )
+    )
     evidence_keys: list[str] = Field(default_factory=list)
+
+    _parse_value = field_validator("value_decimal", mode="before")(_coerce_displayed_value)
 
     @property
     def fact_key(self) -> str:
@@ -203,6 +229,8 @@ class ParsedClaim(BaseModel):
     geography: str | None = None
     approximate: bool = False
     key_terms: list[str] = Field(default_factory=list)
+
+    _parse_value = field_validator("value_decimal", mode="before")(_coerce_displayed_value)
 
     @model_validator(mode="after")
     def _approximate_implies_tolerance(self) -> Self:

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import sys
+from decimal import Decimal
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -11,8 +13,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from fake_ollama import FakeSession, reply  # noqa: E402
 
 from claim_evidence.config import Settings  # noqa: E402
-from claim_evidence.models import Adjudication, VisualVerification  # noqa: E402
-from claim_evidence.ollama import OllamaClient, OllamaError  # noqa: E402
+from claim_evidence.models import (  # noqa: E402
+    Adjudication,
+    Fact,
+    FactExtraction,
+    VisualVerification,
+)
+from claim_evidence.ollama import OllamaClient, OllamaError, gbnf_safe_schema  # noqa: E402
 
 SETTINGS = Settings(embed_dimensions=8, embed_batch_size=2)
 
@@ -94,6 +101,32 @@ def test_second_failure_raises_instead_of_guessing() -> None:
         check(len(session.requests) == 2, "no third attempt")
         return
     raise AssertionError("invalid model output became a result")
+
+
+def test_schema_is_stripped_of_grammar_hostile_keywords() -> None:
+    # Ollama compiles the schema to a GBNF grammar. Pydantic's Decimal schema
+    # carries a lookahead regex that the converter rejects with HTTP 400
+    # "failed to parse grammar", which took out the whole fact extractor.
+    schema = gbnf_safe_schema(FactExtraction)
+    text = json.dumps(schema)
+    check("pattern" not in text, "pattern constraints removed")
+    check('"$defs"' in text, "nested model definitions retained")
+    check(
+        "quote" in schema["$defs"]["Fact"]["required"],
+        "quote stays required so the model cannot omit it",
+    )
+
+
+def test_displayed_values_coerce_to_decimal() -> None:
+    # Models answer with the figure as printed, which is not JSON number syntax.
+    for raw, expected in (
+        ("-40.2%", Decimal("-40.2")),
+        ("(40.2) %", Decimal("-40.2")),
+        ("1,044", Decimal("1044")),
+        ("not a number", None),
+    ):
+        fact = Fact(subject="Danone", metric="m", value_decimal=raw, quote="q")
+        check(fact.value_decimal == expected, f"{raw!r} parsed as {expected}")
 
 
 def test_vision_sends_the_image_and_vision_model() -> None:
