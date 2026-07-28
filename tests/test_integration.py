@@ -165,6 +165,10 @@ def check_ingestion_is_idempotent(tmp: Path) -> None:
         second = client.ingest_document(root, source_pdf=None, source_uri="urn:test")
         check(second.reused_existing, "re-ingesting the same fingerprint is a no-op")
         check(second.version_id == first.version_id, "the same version is reused")
+        check(
+            second.evidence_units == first.evidence_units and second.facts == first.facts,
+            "a no-op run reports the stored counts, not zeros",
+        )
 
         units = client.conn.execute(
             "SELECT count(*) AS n FROM evidence_unit WHERE version_id = %s",

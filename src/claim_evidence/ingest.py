@@ -96,7 +96,8 @@ def ingest_document(
     document_id = upsert_document(conn, document_name, sha256, source_uri)
     existing = find_version(conn, document_id, fingerprint)
     if existing and existing["status"] == VersionStatus.READY:
-        # Same source, same embedding model: nothing to rebuild.
+        # Same source, same embedding model: nothing to rebuild. Report the
+        # stored counts anyway, so a no-op run does not read as an empty one.
         return IngestReport(
             document_id=document_id,
             version_id=int(existing["id"]),
@@ -105,6 +106,7 @@ def ingest_document(
             reused_existing=True,
             pages=len(pages),
             warnings=reader.warnings,
+            **_stored_counts(conn, int(existing["id"])),
         )
 
     version_id = start_version(
@@ -167,6 +169,24 @@ def ingest_document(
         skipped_artifacts=sorted(set(reader.skipped)),
         rejected_facts=rejected,
     )
+
+
+def _stored_counts(conn: psycopg.Connection, version_id: int) -> dict[str, int]:
+    row = conn.execute(
+        """
+        SELECT
+            (SELECT count(*) FROM evidence_unit WHERE version_id = %(v)s) AS units,
+            (SELECT count(*) FROM evidence_unit
+             WHERE version_id = %(v)s AND embedding IS NOT NULL) AS embedded,
+            (SELECT count(*) FROM fact WHERE version_id = %(v)s) AS facts
+        """,
+        {"v": version_id},
+    ).fetchone()
+    return {
+        "evidence_units": int(row["units"]),
+        "embedded_units": int(row["embedded"]),
+        "facts": int(row["facts"]),
+    }
 
 
 def _embed_pending(
