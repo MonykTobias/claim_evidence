@@ -154,6 +154,28 @@ confident contradiction against the nearest number that happens to exist.
 Invalid model JSON gets one retry, then a hard error. A supported verdict
 without a direct or re-verified citation is downgraded to `insufficient`.
 
+Facts come from two places. Table facts are arithmetic and need no model: the
+column header gives the reporting period, `vs. 2020` in the row descriptor
+gives the baseline, and accounting parentheses give the sign. Narrative facts go
+through the LLM, but each one must echo a quote that really appears in its own
+evidence unit or it is discarded.
+
+## Measured on the Danone URD
+
+The completed 494-page run indexes to 21,988 evidence units (5,901 narrative,
+3,457 table rows, 11,535 table values, 602 visual, 493 page-Markdown) and
+11,168 deterministic table facts, in roughly seven minutes end to end.
+
+Geometry precision across those units: 14,323 cell, 5,901 block, 602 crop, 493
+page, 472 row-fallback, 197 table-fallback. The 472 row fallbacks are exactly
+the table cells the extractor emitted without their own bounding box.
+
+Scanning every table fact in the document against the three reference claims
+yields 2 matches and 0 conflicts for the 40.2% claim, 0 and 2 for the 90%
+variant, and nothing comparable for "all carbon emissions" — so the first two
+verdicts are decided arithmetically and the third correctly falls through to
+`insufficient`.
+
 ## Tests
 
 ```bash
