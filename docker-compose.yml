@@ -1,0 +1,19 @@
+services:
+  postgres:
+    image: pgvector/pgvector:0.8.5-pg18-trixie
+    environment:
+      POSTGRES_USER: claim_evidence
+      POSTGRES_PASSWORD: claim_evidence
+      POSTGRES_DB: claim_evidence
+    ports:
+      - "5433:5432"
+    volumes:
+      - claim-evidence-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U claim_evidence -d claim_evidence"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  claim-evidence-pgdata:

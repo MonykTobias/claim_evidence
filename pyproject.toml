@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "claim_evidence"
+version = "0.1.0"
+description = "Evidence-first claim auditing over completed document_extract output"
+requires-python = ">=3.12"
+dependencies = [
+    "pydantic>=2.7,<3",
+    "psycopg[binary]>=3.2,<4",
+    "pgvector>=0.3,<0.5",
+    "requests>=2.31,<3",
+    "Pillow>=11,<12",
+]
+
+[project.scripts]
+claim-evidence = "claim_evidence.cli:cli"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+claim_evidence = ["sql/*.sql"]
+
+[tool.mypy]
+python_version = "3.12"
+ignore_missing_imports = true
