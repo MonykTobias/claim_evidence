@@ -105,7 +105,12 @@ from claim_evidence import ClaimEvidence
 
 client = ClaimEvidence.from_env()
 
-ingest_report = client.ingest_document(output_root, source_pdf=source_pdf, source_uri=None)
+ingest_report = client.ingest_document(
+    output_root,
+    source_pdf=source_pdf,
+    source_uri=None,
+    progress=lambda event: print(event.phase, event.percent),  # optional
+)
 
 result = client.audit_claim(
     "Danone reduced Scope 1 and 2 energy and industry emissions "
