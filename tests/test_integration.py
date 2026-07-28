@@ -36,6 +36,7 @@ from claim_evidence.models import (  # noqa: E402
     Verdict,
     VersionStatus,
 )
+from claim_evidence.audit import MAX_PASSAGES, PASSAGE_CHARS  # noqa: E402
 from claim_evidence.ollama import OllamaClient  # noqa: E402
 
 ADMIN_URL = os.environ.get(
@@ -318,6 +319,24 @@ def check_supported_claim_cites_the_table(tmp: Path) -> None:
         check(selected > 0, "selected citations flagged in the trace")
 
 
+def check_adjudicator_prompt_is_bounded(tmp: Path) -> None:
+    """An over-long prompt is truncated by the runtime with no signal, so the
+    passage list is capped before it is sent."""
+    seen: list[str] = []
+
+    def capture(payload: dict[str, Any]) -> dict[str, Any]:
+        seen.append(payload["messages"][1]["content"])
+        return adjudication_reply(payload)
+
+    with make_client(default_session(Adjudication=capture)) as client:
+        client.audit_claim(VAGUE)
+    check(bool(seen), "the adjudicator was consulted")
+    passages = seen[0].split("Evidence:\n", 1)[1].strip().split("\n\n")
+    check(len(passages) <= MAX_PASSAGES, f"passage count capped ({len(passages)})")
+    longest = max(len(p) for p in passages)
+    check(longest <= PASSAGE_CHARS + 200, f"each passage is truncated ({longest} chars)")
+
+
 def check_contradicted_claim(tmp: Path) -> None:
     with make_client(default_session()) as client:
         result = client.audit_claim(CONTRADICTED)
@@ -425,6 +444,7 @@ def main() -> int:
         check_hybrid_search_finds_exact_and_semantic,
         check_vector_recall,
         check_supported_claim_cites_the_table,
+        check_adjudicator_prompt_is_bounded,
         check_contradicted_claim,
         check_vague_claim_is_insufficient,
         check_verdict_fails_closed_without_citable_evidence,

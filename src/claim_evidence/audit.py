@@ -55,6 +55,9 @@ Rules:
 - `supporting_evidence_ids` may only contain ids present in the passages.
 """
 
+MAX_PASSAGES = 15
+PASSAGE_CHARS = 800
+
 DIRECT_QUALITY = {
     EvidenceKind.NARRATIVE: EvidenceQuality.DIRECT_TEXT,
     EvidenceKind.TABLE_ROW: EvidenceQuality.DIRECT_TABLE,
@@ -212,9 +215,12 @@ def _adjudicate(
             _missing_qualifiers(parsed),
         )
 
+    # Bounded on purpose: an over-long prompt is silently truncated by the
+    # runtime, which drops evidence without any signal that it happened.
     passages = "\n\n".join(
-        f"[{cid.evidence_id}] page {cid.pdf_page} ({cid.source_kind}, {cid.quality}): {text}"
-        for cid, text, _ in usable
+        f"[{cid.evidence_id}] page {cid.pdf_page} ({cid.source_kind}, {cid.quality}): "
+        f"{text[:PASSAGE_CHARS]}"
+        for cid, text, _ in usable[:MAX_PASSAGES]
     )
     try:
         decision = client.structured(
@@ -226,7 +232,7 @@ def _adjudicate(
     except OllamaError as exc:
         raise AuditError(f"adjudication failed: {exc}") from exc
 
-    by_id = {cid.evidence_id: cid for cid, _, _ in usable}
+    by_id = {cid.evidence_id: cid for cid, _, _ in usable[:MAX_PASSAGES]}
     cited = [by_id[i] for i in decision.supporting_evidence_ids if i in by_id]
     if decision.verdict is not Verdict.INSUFFICIENT and not cited:
         # A verdict the model could not attach to a real passage is not a
@@ -365,4 +371,11 @@ def _finish(
     )
 
 
-__all__ = ["ADJUDICATION_SYSTEM", "AuditError", "audit_claim", "parse_claim"]
+__all__ = [
+    "ADJUDICATION_SYSTEM",
+    "MAX_PASSAGES",
+    "PASSAGE_CHARS",
+    "AuditError",
+    "audit_claim",
+    "parse_claim",
+]
