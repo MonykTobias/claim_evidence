@@ -59,14 +59,31 @@ class OllamaClient:
             raise OllamaError(
                 f"/api/embed returned {len(vectors or [])} vectors for {len(inputs)} inputs"
             )
+        return [self._fit_dimension(vector) for vector in vectors]
+
+    def _fit_dimension(self, vector: list[float]) -> list[float]:
+        """Match the configured dimension, truncating a longer vector.
+
+        Ollama's `/api/embed` has no output-dimension parameter, so a
+        Matryoshka-trained model such as qwen3-embedding returns its full width
+        (2560) even when a shorter representation is wanted. Keeping the prefix
+        is exactly how MRL embeddings are shortened, and `normalize_embedding`
+        re-normalizes afterwards.
+
+        This is only valid for MRL-trained models. A model that is not trained
+        that way must be configured with its native dimension; truncating it
+        would quietly degrade recall instead of failing.
+        """
         expected = self.settings.embed_dimensions
-        for vector in vectors:
-            if len(vector) != expected:
-                raise OllamaError(
-                    f"{self.settings.embed_model} returned dimension {len(vector)}, "
-                    f"expected {expected}; set CLAIM_EVIDENCE_EMBED_DIMENSIONS to match"
-                )
-        return vectors
+        if len(vector) == expected:
+            return vector
+        if len(vector) > expected:
+            return vector[:expected]
+        raise OllamaError(
+            f"{self.settings.embed_model} returned dimension {len(vector)}, "
+            f"which is shorter than the configured {expected}; "
+            f"set CLAIM_EVIDENCE_EMBED_DIMENSIONS to match the model"
+        )
 
     def embed_batched(self, inputs: Sequence[str]) -> Iterable[list[list[float]]]:
         size = max(1, self.settings.embed_batch_size)

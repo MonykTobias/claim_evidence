@@ -48,6 +48,13 @@ Point `CLAIM_EVIDENCE_DATABASE_URL` at a managed instance to skip Compose
 entirely. The embedding dimension is templated into the schema at `db init`, so
 changing the model means re-running `db init` on a fresh database.
 
+**On the 1024 default:** `qwen3-embedding:4b` natively returns 2560 dimensions
+and Ollama's `/api/embed` exposes no output-dimension parameter. Qwen3-Embedding
+is Matryoshka-trained, so the client keeps the leading 1024 values and
+re-normalizes — the documented way to shorten an MRL embedding. A model that is
+*not* MRL-trained must be configured with its native dimension; a vector shorter
+than the configured width is a hard error rather than a silent pad.
+
 ## CLI
 
 ```bash

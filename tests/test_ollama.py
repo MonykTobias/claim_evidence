@@ -32,14 +32,23 @@ def test_embed_batches_and_checks_dimension() -> None:
     check(client.embed(["a"])[0] == client.embed(["a"])[0], "embeddings deterministic")
 
 
-def test_wrong_dimension_is_an_error() -> None:
+def test_short_vector_is_an_error() -> None:
     session = FakeSession(dimensions=4)
     try:
         OllamaClient(SETTINGS, session).embed(["a"])
     except OllamaError as exc:
-        check("dimension 4" in str(exc), f"dimension mismatch reported ({exc})")
+        check("shorter than the configured 8" in str(exc), f"short vector rejected ({exc})")
         return
-    raise AssertionError("wrong embedding dimension was accepted")
+    raise AssertionError("an undersized embedding was accepted")
+
+
+def test_longer_vector_is_truncated_to_the_configured_width() -> None:
+    # qwen3-embedding returns its full 2560 width; /api/embed has no output
+    # dimension parameter, so the MRL prefix is taken.
+    session = FakeSession(dimensions=32)
+    vector = OllamaClient(SETTINGS, session).embed(["a"])[0]
+    check(len(vector) == 8, "longer vector truncated to the configured dimension")
+    check(vector == session.vector("a")[:8], "truncation keeps the leading prefix")
 
 
 def test_short_embedding_batch_is_an_error() -> None:
