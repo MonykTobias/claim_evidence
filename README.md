@@ -73,8 +73,30 @@ claim-evidence search "Scope 1 and 2 emissions versus 2020" --json
 claim-evidence audit "Danone reduced Scope 1 and 2 energy and industry emissions by 40.2% in 2025 versus 2020." --json
 ```
 
+```bash
+claim-evidence health
+```
+
+```bash
+claim-evidence documents
+```
+
+```bash
+claim-evidence trace AUDIT_ID --json
+```
+
+```bash
+claim-evidence evidence EVIDENCE_ID --json
+```
+
+```bash
+claim-evidence remove DOCUMENT_ID --confirm DOCUMENT_ID
+```
+
 `ingest --no-narrative-facts` indexes evidence and deterministic table facts but
 skips the LLM narrative fact extractor, which is the slow part of a first run.
+`ingest --force` rebuilds an unchanged source without taking the current
+version out of service.
 
 ## Python API
 
@@ -175,6 +197,82 @@ yields 2 matches and 0 conflicts for the 40.2% claim, 0 and 2 for the 90%
 variant, and nothing comparable for "all carbon emissions" — so the first two
 verdicts are decided arithmetically and the third correctly falls through to
 `insufficient`.
+
+## Frontend-support API
+
+A local frontend must never query these tables or re-derive the provenance
+rules. Everything it needs is on the client:
+
+```python
+client.initialize_database()          # idempotent schema + health report
+client.health()                       # database, schema, pgvector, models, counts
+
+client.list_documents()               # -> list[DocumentSummary]
+client.get_document(document_id)
+client.remove_document(document_id, confirm_document_id=document_id)
+
+client.get_audit_trace(audit_id)      # -> AuditTrace
+client.get_evidence(evidence_id)      # -> EvidenceDetail
+```
+
+Ids may be passed as `int` or `str`; anything else raises `ValidationError`.
+
+### Errors
+
+`NotFoundError`, `ValidationError`, `DependencyUnavailableError`, and
+`IndexNotReadyError` all derive from `ClaimEvidenceError`, so a caller maps a
+type rather than parsing a message. Driver exceptions and Ollama response
+bodies stay inside the package: `health()` reports a failing query by class,
+because a driver message can carry the host and user.
+
+### Re-indexing and removal
+
+`ingest_document(..., force=True)` rebuilds an unchanged source. The current
+version keeps serving queries throughout and is only retired once the
+replacement passes its integrity checks; if the rebuild fails, the previous
+version is still `ready`.
+
+`remove_document()` requires the id twice and deletes only index rows,
+returning per-table counts. It never touches the source PDF, the
+`document_extract` output directory, page images, or Ollama models —
+re-ingestion is the whole recovery path.
+
+### Rendering evidence
+
+`EvidenceDetail` carries `page_image_path` (the registered `page.png`, resolved
+from stored metadata — never from a caller-supplied path), `page_width`,
+`page_height`, `artifact_paths`, and every `Region`. Regions keep their roles
+separate: a table citation is descriptor + header + unit + value, not one box
+around the lot.
+
+```text
+claim_text  descriptor  header  unit  value  supporting_context  visual_region  unknown
+```
+
+Each region's `bbox` is `[left, top, right, bottom]` with
+`coordinate_space = "normalized_top_left"`, so multiplying by the page image's
+pixel size is all a renderer has to do. The package deliberately draws nothing:
+
+```python
+detail = client.get_evidence(evidence_id)
+page = Image.open(detail.page_image_path)
+w, h = page.size
+for region in detail.regions:
+    left, top, right, bottom = region.bbox
+    draw.rectangle((left * w, top * h, right * w, bottom * h), outline=colors[region.role])
+```
+
+`output_root` and `source_pdf` on `DocumentSummary` are server-side path
+metadata. A frontend backend may use them after its own allowed-root
+validation; they are not for an untrusted browser.
+
+### Retrieval trace
+
+`get_audit_trace()` returns the parsed claim, every candidate with its
+per-channel rank and score, the fused rank and score, context-expansion links,
+visual re-verification status, whether it was selected, and a short reason.
+This is retrieval metadata, not model reasoning — no prompts and no
+chain-of-thought are stored.
 
 ## Tests
 
