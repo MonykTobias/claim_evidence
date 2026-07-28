@@ -17,7 +17,7 @@ import unicodedata
 from decimal import Decimal, InvalidOperation
 from typing import Any, Iterable
 
-from .models import GeometryPrecision, Region
+from .models import GeometryPrecision, Region, RegionRole
 
 # Dashes, minus signs, and non-breaking hyphens all render as "-" in a PDF but
 # are distinct code points, which silently breaks substring quote checks.
@@ -134,7 +134,7 @@ def region_from(
     page_width: float,
     page_height: float,
     *,
-    role: str,
+    role: RegionRole,
     precision: GeometryPrecision,
 ) -> Region:
     norm, source, origin = normalize_bbox(bbox, page_width, page_height)

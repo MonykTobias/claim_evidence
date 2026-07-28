@@ -6,6 +6,13 @@
 
 CREATE EXTENSION IF NOT EXISTS vector;
 
+-- Lets health() report whether an existing database has the current shape.
+CREATE TABLE IF NOT EXISTS schema_meta (
+    id         integer     PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+    version    integer     NOT NULL,
+    applied_at timestamptz NOT NULL DEFAULT now()
+);
+
 CREATE TABLE IF NOT EXISTS document (
     id           bigserial PRIMARY KEY,
     name         text        NOT NULL,
@@ -30,9 +37,13 @@ CREATE TABLE IF NOT EXISTS document_version (
                   CHECK (status IN ('building', 'ready', 'inactive')),
     output_root   text        NOT NULL,
     source_pdf    text,
+    -- A forced rebuild re-indexes an unchanged source, so identity is
+    -- (document, fingerprint, attempt): the new 'building' row coexists with
+    -- the old 'ready' one, which keeps serving queries until the swap.
+    attempt       integer     NOT NULL DEFAULT 1,
     created_at    timestamptz NOT NULL DEFAULT now(),
     ready_at      timestamptz,
-    UNIQUE (document_id, fingerprint)
+    UNIQUE (document_id, fingerprint, attempt)
 );
 
 CREATE INDEX IF NOT EXISTS document_version_ready_idx
@@ -173,12 +184,48 @@ CREATE TABLE IF NOT EXISTS audit_candidate (
     audit_id       bigint  NOT NULL REFERENCES audit_run(id) ON DELETE CASCADE,
     evidence_id    bigint  NOT NULL REFERENCES evidence_unit(id) ON DELETE CASCADE,
     lexical_rank   integer,
+    lexical_score  double precision,
     vector_rank    integer,
+    vector_score   double precision,
     graph_rank     integer,
+    graph_score    double precision,
+    combined_rank  integer,
     combined_score double precision NOT NULL DEFAULT 0,
+    -- Set when this candidate was pulled in as a neighbour of another one.
+    expanded_from  bigint  REFERENCES evidence_unit(id) ON DELETE SET NULL,
+    visual_status  text    NOT NULL DEFAULT 'not_applicable'
+                   CHECK (visual_status IN ('not_applicable', 'verified',
+                                            'rejected', 'unavailable')),
     selected       boolean NOT NULL DEFAULT false,
-    note           text,
+    reason         text,
     UNIQUE (audit_id, evidence_id)
 );
 
 CREATE INDEX IF NOT EXISTS audit_candidate_audit_idx ON audit_candidate (audit_id);
+
+
+-- In-place upgrade for databases created before these columns existed. The
+-- CREATE TABLE statements above are authoritative for a fresh database; these
+-- keep `db init` idempotent on an existing one instead of demanding a re-index.
+ALTER TABLE document_version ADD COLUMN IF NOT EXISTS attempt integer NOT NULL DEFAULT 1;
+ALTER TABLE audit_candidate  ADD COLUMN IF NOT EXISTS lexical_score double precision;
+ALTER TABLE audit_candidate  ADD COLUMN IF NOT EXISTS vector_score double precision;
+ALTER TABLE audit_candidate  ADD COLUMN IF NOT EXISTS graph_score double precision;
+ALTER TABLE audit_candidate  ADD COLUMN IF NOT EXISTS combined_rank integer;
+ALTER TABLE audit_candidate  ADD COLUMN IF NOT EXISTS expanded_from bigint;
+ALTER TABLE audit_candidate  ADD COLUMN IF NOT EXISTS visual_status text NOT NULL DEFAULT 'not_applicable';
+ALTER TABLE audit_candidate  ADD COLUMN IF NOT EXISTS reason text;
+ALTER TABLE audit_candidate  DROP COLUMN IF EXISTS note;
+
+DO $$
+BEGIN
+    ALTER TABLE document_version DROP CONSTRAINT document_version_document_id_fingerprint_key;
+EXCEPTION WHEN undefined_object THEN
+    NULL;
+END $$;
+
+CREATE UNIQUE INDEX IF NOT EXISTS document_version_identity_idx
+    ON document_version (document_id, fingerprint, attempt);
+
+INSERT INTO schema_meta (id, version) VALUES (1, 2)
+ON CONFLICT (id) DO UPDATE SET version = EXCLUDED.version, applied_at = now();

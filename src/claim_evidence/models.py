@@ -49,6 +49,39 @@ class EvidenceQuality(StrEnum):
     NONE = "none"
 
 
+class RegionRole(StrEnum):
+    """What a region encloses. One closed vocabulary, so a renderer can style
+    a value cell differently from the descriptor without guessing."""
+
+    CLAIM_TEXT = "claim_text"
+    DESCRIPTOR = "descriptor"
+    HEADER = "header"
+    UNIT = "unit"
+    VALUE = "value"
+    SUPPORTING_CONTEXT = "supporting_context"
+    VISUAL_REGION = "visual_region"
+    UNKNOWN = "unknown"
+
+
+# Roles written by earlier builds, so an index created before the vocabulary
+# was closed still reads back without a re-ingest.
+_LEGACY_ROLES = {
+    "block": RegionRole.CLAIM_TEXT,
+    "cell": RegionRole.SUPPORTING_CONTEXT,
+    "row": RegionRole.SUPPORTING_CONTEXT,
+    "table": RegionRole.SUPPORTING_CONTEXT,
+    "page": RegionRole.SUPPORTING_CONTEXT,
+    "content": RegionRole.SUPPORTING_CONTEXT,
+    "visual": RegionRole.VISUAL_REGION,
+}
+
+
+def _coerce_role(value: Any) -> Any:
+    if isinstance(value, str) and value not in set(RegionRole):
+        return _LEGACY_ROLES.get(value, RegionRole.UNKNOWN)
+    return value
+
+
 class GeometryPrecision(StrEnum):
     """How tightly a region encloses the cited content."""
 
@@ -84,10 +117,13 @@ class Region(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     bbox: tuple[float, float, float, float]
-    role: str = "content"
+    role: RegionRole = RegionRole.SUPPORTING_CONTEXT
     precision: GeometryPrecision = GeometryPrecision.BLOCK
     source_bbox: tuple[float, float, float, float] | None = None
     source_origin: str | None = None
+    coordinate_space: Literal["normalized_top_left"] = "normalized_top_left"
+
+    _coerce_role = field_validator("role", mode="before")(_coerce_role)
 
 
 class Citation(BaseModel):

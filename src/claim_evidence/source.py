@@ -15,7 +15,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
 
-from .models import EvidenceKind, EvidenceQuality, EvidenceUnit, GeometryPrecision, Region
+from .models import (
+    EvidenceKind,
+    EvidenceQuality,
+    EvidenceUnit,
+    GeometryPrecision,
+    Region,
+    RegionRole,
+)
 from .normalize import (
     clean_text,
     normalize_for_match,
@@ -261,7 +268,7 @@ def narrative_units(page: PageSource, blocks: list[dict[str, Any]]) -> list[Evid
             bbox,
             page.width,
             page.height,
-            role="block",
+            role=RegionRole.CLAIM_TEXT,
             precision=GeometryPrecision.BLOCK,
         )
         heading_path = [clean_text(h) for h in block.get("heading_path") or []]
@@ -303,7 +310,7 @@ def flatten_header(rows: list[list[str]], header_rows: int, column: int) -> list
 def _cell_region(
     cell: dict[str, Any] | None,
     page: PageSource,
-    role: str,
+    role: RegionRole,
 ) -> Region | None:
     if not cell or not cell.get("bbox"):
         return None
@@ -328,7 +335,7 @@ def table_units(
         candidate["bbox"],
         page.width,
         page.height,
-        role="table",
+        role=RegionRole.SUPPORTING_CONTEXT,
         precision=GeometryPrecision.TABLE,
     )
     grid = (candidate.get("stats") or {}).get("grid") or {}
@@ -361,14 +368,14 @@ def table_units(
         row_regions = [
             region
             for c in range(num_cols)
-            if (region := _cell_region(cells.get((r, c)), page, "cell"))
+            if (region := _cell_region(cells.get((r, c)), page, RegionRole.SUPPORTING_CONTEXT))
         ]
         row_union = union_bbox([region.bbox for region in row_regions])
         row_unit = clean_text(row[unit_column]) if unit_column is not None and unit_column < len(row) else ""
 
         row_text = _row_text(descriptor, row_unit, headers, values, unit_column)
         row_fallback, row_precision = _fallback_regions(
-            row_union, table_region, role="row"
+            row_union, table_region, role=RegionRole.SUPPORTING_CONTEXT
         )
         units.append(
             EvidenceUnit(
@@ -401,12 +408,12 @@ def table_units(
             if c == 0 or c == unit_column:
                 continue
             header = headers[c] if c < len(headers) else []
-            value_region = _cell_region(cells.get((r, c)), page, "value")
+            value_region = _cell_region(cells.get((r, c)), page, RegionRole.VALUE)
             regions: list[Region] = []
             for role, cell in (
-                ("descriptor", cells.get((r, 0))),
-                ("header", cells.get((header_rows - 1, c))),
-                ("unit", cells.get((r, unit_column)) if unit_column is not None else None),
+                (RegionRole.DESCRIPTOR, cells.get((r, 0))),
+                (RegionRole.HEADER, cells.get((header_rows - 1, c))),
+                (RegionRole.UNIT, cells.get((r, unit_column)) if unit_column is not None else None),
             ):
                 region = _cell_region(cell, page, role)
                 if region:
@@ -418,7 +425,7 @@ def table_units(
                 # A cell without its own geometry still gets a highlightable
                 # region: the row it sits in, and failing that the whole table.
                 fallback, precision = _fallback_regions(
-                    row_union, table_region, role="value"
+                    row_union, table_region, role=RegionRole.VALUE
                 )
                 regions.extend(fallback)
             text = _value_text(descriptor, header, row_unit, value)
@@ -452,7 +459,7 @@ def _fallback_regions(
     row_union: tuple[float, float, float, float] | None,
     table_region: Region,
     *,
-    role: str,
+    role: RegionRole,
 ) -> tuple[list[Region], GeometryPrecision]:
     if row_union:
         return (
@@ -546,7 +553,7 @@ def visual_units(
                         bbox,
                         page.width,
                         page.height,
-                        role="visual",
+                        role=RegionRole.VISUAL_REGION,
                         precision=GeometryPrecision.CROP,
                     )
                 ],
@@ -570,7 +577,11 @@ def markdown_unit(page: PageSource, markdown: str) -> EvidenceUnit | None:
         quality=EvidenceQuality.NONE,
         artifact_path=f"{page.page_dir.name}/docling_final.md",
         regions=[
-            Region(bbox=(0.0, 0.0, 1.0, 1.0), role="page", precision=GeometryPrecision.PAGE)
+            Region(
+                bbox=(0.0, 0.0, 1.0, 1.0),
+                role=RegionRole.SUPPORTING_CONTEXT,
+                precision=GeometryPrecision.PAGE,
+            )
         ],
         geometry_precision=GeometryPrecision.PAGE,
     )
