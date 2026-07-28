@@ -411,9 +411,15 @@ def graph_search(
     document_ids: Sequence[int] | None,
     limit: int,
 ) -> list[dict[str, Any]]:
-    """Evidence reachable through facts that match the claim's qualifiers."""
+    """Evidence reachable through facts that match the claim's qualifiers.
+
+    Metric terms are OR'd, not AND'd. A claim carries words the source never
+    uses ("Danone reduced ..."), so requiring every term matches nothing and
+    quietly removes the graph leg from the fusion. The period filters do the
+    narrowing; ts_rank orders what survives.
+    """
     clause, params = _document_filter(document_ids)
-    pattern = " & ".join(t for t in metric_terms if t) or None
+    pattern = " | ".join(t for t in metric_terms if t) or None
     return conn.execute(
         f"""
         {_EVIDENCE_SELECT}
@@ -427,7 +433,10 @@ def graph_search(
           AND (%s::text IS NULL OR f.baseline_period IS NULL OR f.baseline_period = %s)
         GROUP BY e.id, p.pdf_page, p.printed_page_label, p.page_dir,
                  d.id, d.name, d.sha256, d.source_uri
-        ORDER BY e.id
+        ORDER BY max(
+            ts_rank(to_tsvector('english', f.normalized_metric),
+                    to_tsquery('english', COALESCE(%s, 'x')))
+        ) DESC, e.id
         LIMIT %s
         """,
         [
@@ -438,6 +447,7 @@ def graph_search(
             reporting_period,
             baseline_period,
             baseline_period,
+            pattern,
             limit,
         ],
     ).fetchall()

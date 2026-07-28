@@ -247,6 +247,12 @@ def check_hybrid_search_finds_exact_and_semantic(tmp: Path) -> None:
         top = matches[0].citation
         check(top.pdf_page in (1, 2), "citation carries a 1-based pdf page")
         check(bool(top.regions), "every citation carries at least one region")
+        # A claim says "Danone reduced ..."; the table never uses those words.
+        # AND'ing the metric terms silently removed this leg from the fusion.
+        check(
+            any(m.graph_rank is not None for m in matches),
+            "the graph leg contributes on a claim worded unlike the source",
+        )
 
 
 def check_vector_recall(tmp: Path) -> None:
