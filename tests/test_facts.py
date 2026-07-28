@@ -122,6 +122,24 @@ def test_approximate_claim_uses_tolerance() -> None:
           "the same number without hedging is exact and fails")
 
 
+def test_bounded_claims_use_their_operator() -> None:
+    fact = emissions_fact()  # a 40.2% reduction
+
+    at_least = heuristic_claim(SUPPORTED.replace("by 40.2%", "by at least 40%"))
+    check(at_least.comparison == ">=", "'at least' parsed as a lower bound")
+    check(compare(at_least, fact)[0] == "match", "a 40.2% drop satisfies 'at least 40%'")
+
+    too_high = heuristic_claim(SUPPORTED.replace("by 40.2%", "by at least 50%"))
+    check(compare(too_high, fact)[0] == "conflict", "'at least 50%' is not met by 40.2%")
+
+    at_most = heuristic_claim(SUPPORTED.replace("by 40.2%", "by no more than 50%"))
+    check(at_most.comparison == "<=", "'no more than' parsed as an upper bound")
+    check(compare(at_most, fact)[0] == "match", "40.2% is within 'no more than 50%'")
+
+    at_most_small = heuristic_claim(SUPPORTED.replace("by 40.2%", "by no more than 30%"))
+    check(compare(at_most_small, fact)[0] == "conflict", "40.2% exceeds 'no more than 30%'")
+
+
 def test_mismatched_qualifiers_are_incomparable() -> None:
     fact = emissions_fact()
     wrong_year = heuristic_claim(SUPPORTED.replace("2025", "2024"))

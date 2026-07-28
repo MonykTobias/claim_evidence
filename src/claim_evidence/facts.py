@@ -190,6 +190,7 @@ def heuristic_claim(claim: str) -> ParsedClaim:
     value, unit = _claim_value(text)
     direction = detect_direction(text)
     approximate = is_approximate(text)
+    operator = _claim_operator(text, approximate)
     reporting, baseline = (None, None)
     if len(years) >= 2:
         # "in 2025 versus 2020" -- the baseline is the one after the comparison.
@@ -204,13 +205,39 @@ def heuristic_claim(claim: str) -> ParsedClaim:
         value_decimal=value,
         unit=unit,
         direction=direction,
-        comparison="~" if approximate else "=",
+        comparison=operator,
         reporting_period=reporting,
         baseline_period=baseline,
         scope=text,
         approximate=approximate,
         key_terms=sorted(content_tokens(text)),
     )
+
+
+# One ordered alternation, longest phrase first: two regexes tried in sequence
+# match "more than" inside "no more than" and invert the bound.
+_BOUNDS = {
+    "no less than": ">=",
+    "no more than": "<=",
+    "at least": ">=",
+    "at most": "<=",
+    "more than": ">=",
+    "less than": "<=",
+    "up to": "<=",
+}
+_BOUND_RE = re.compile(r"\b(" + "|".join(_BOUNDS) + r")\b", re.I)
+
+
+def _claim_operator(text: str, approximate: bool) -> str:
+    """Read a bound out of the claim's wording.
+
+    "reduced by at least 40%" is satisfied by a 40.2% reduction; treating it as
+    equality would report a false contradiction.
+    """
+    match = _BOUND_RE.search(text)
+    if match:
+        return _BOUNDS[match.group(1).casefold()]
+    return "~" if approximate else "="
 
 
 def _claim_value(text: str) -> tuple[Decimal | None, str | None]:
@@ -294,11 +321,42 @@ def compare(claim: ParsedClaim, fact: dict[str, Any] | Fact) -> tuple[Comparison
 
     claimed = signed_change(claim.value_decimal, claim.direction)
     fact_direction = row.get("direction") or "unknown"
+    direction = claim.direction if claim.direction != "unknown" else fact_direction
     if claim.direction == "unknown" and fact_direction != "unknown":
         claimed = signed_change(claim.value_decimal, fact_direction)
-    if values_agree(claimed, observed, approximate=claim.approximate):
-        return "match", f"claimed {claimed} matches reported {observed}"
-    return "conflict", f"claimed {claimed} but the source reports {observed}"
+    return _apply_operator(claim.comparison, claimed, observed, direction, claim.approximate)
+
+
+def _apply_operator(
+    operator: str,
+    claimed: Decimal,
+    observed: Decimal,
+    direction: str,
+    approximate: bool,
+) -> tuple[Comparison, str]:
+    """Check a bounded claim ("by at least 40%") against the reported value.
+
+    Bounds are checked on magnitude when the claim states a direction, because
+    "reduced by at least 40%" means a bigger drop satisfies it even though the
+    signed value is smaller.
+    """
+    if operator in ("=", "~"):
+        if values_agree(claimed, observed, approximate=approximate or operator == "~"):
+            return "match", f"claimed {claimed} matches reported {observed}"
+        return "conflict", f"claimed {claimed} but the source reports {observed}"
+
+    left, right = (
+        (abs(observed), abs(claimed)) if direction in ("decrease", "increase")
+        else (observed, claimed)
+    )
+    satisfied = {
+        ">=": left >= right,
+        ">": left > right,
+        "<=": left <= right,
+        "<": left < right,
+    }[operator]
+    relation = f"claimed {operator} {claimed}, source reports {observed}"
+    return ("match", relation) if satisfied else ("conflict", relation)
 
 
 def metric_containment(claim_metric: str, fact_metric: str) -> float:
