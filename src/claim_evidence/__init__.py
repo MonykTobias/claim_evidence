@@ -9,7 +9,7 @@ from .errors import (
     NotFoundError,
     ValidationError,
 )
-from .progress import ProgressCallback, classify_error
+from .progress import ProgressCallback
 from .models import (
     AuditTrace,
     Citation,
@@ -60,7 +60,6 @@ __all__ = [
     "Settings",
     "TraceCandidate",
     "ValidationError",
-    "classify_error",
     "Verdict",
     "VersionStatus",
     "__version__",

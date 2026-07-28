@@ -266,6 +266,86 @@ for region in detail.regions:
 metadata. A frontend backend may use them after its own allowed-root
 validation; they are not for an untrusted browser.
 
+### Progress events
+
+Both long operations accept an optional callback. Callers passing nothing are
+unaffected.
+
+```python
+client.ingest_document(output_root, progress=events.append)
+client.audit_claim(claim, progress=events.append)
+```
+
+Each `ProgressEvent` carries `operation`, `phase`, `status`
+(`start`/`progress`/`completed`/`warning`/`failed`), a human-readable
+`message`, `completed`/`total`/`percent`, `document_id`, `audit_id`,
+`current_item`, `details`, and `timestamp`.
+
+`completed`, `total`, and `percent` are null when the work genuinely cannot be
+measured — an honest spinner beats an invented percentage. `percent` is
+phase-local and never decreases within a phase. A phase with nothing to do
+reports `0/0` at 100%, not a division error.
+
+Phases, in order:
+
+```text
+ingest   validating_input building_evidence embedding_evidence extracting_facts
+         building_indexes activating_version completed
+audit    parsing_claim retrieving_graph retrieving_full_text retrieving_vectors
+         fusing_candidates expanding_context verifying_visuals deciding_verdict
+         persisting_trace completed
+```
+
+Totals are real: pages for evidence, embedding batches, claim-like passages for
+fact extraction, integrity steps for index checks, and returned-versus-requested
+candidates for each retrieval channel.
+
+A callback that raises is dropped for the rest of the operation and the work
+continues. A broken UI must never corrupt an index build.
+
+#### Completion summaries
+
+The terminal `completed` event carries counts the operation already computed —
+no extra queries. Ingestion mirrors its `IngestReport`:
+
+```text
+document_version_id page_count evidence_count visual_evidence_count
+embedding_count fact_count warning_count elapsed_seconds no_op
+```
+
+Audit reports its retrieval story:
+
+```text
+verdict citation_count graph_candidate_count full_text_candidate_count
+vector_candidate_count fused_candidate_count expanded_candidate_count
+visual_candidate_count visually_verified_count selected_evidence_count
+elapsed_seconds
+```
+
+Channel counts are what each retriever *returned*; the persisted trace records
+only the candidates that survived fusion's cut, so the event count is the
+larger of the two. A channel that could not run at all — for example vectors
+when embeddings are unavailable — omits its key rather than reporting zero,
+because "ran and found nothing" and "never ran" are different facts.
+
+#### Failures
+
+A terminal `failed` event carries `failed_phase`, `error_code`, and `retryable`
+in `details`, then the original exception is re-raised unchanged.
+
+| `error_code` | `retryable` |
+|---|---|
+| `dependency_unavailable` | yes |
+| `internal_error` | yes |
+| `index_not_ready` | yes |
+| `validation_error` | no |
+| `not_found` | no |
+
+Only the package's own typed errors are quoted back to the caller; their
+messages are written for public consumption. Anything else — a driver error, a
+model response body, an unexpected bug — is reported by category, because those
+messages carry hosts, credentials, prompts, and source text.
+
 ### Retrieval trace
 
 `get_audit_trace()` returns the parsed claim, every candidate with its
