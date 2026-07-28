@@ -33,8 +33,12 @@ from .models import (
 from .normalize import all_years, content_tokens, normalize_for_match, scope_markers
 
 RRF_K = 60
-EXACT_TOKEN_BONUS = 0.5
-SCOPE_TOKEN_BONUS = 0.3
+# Scaled to the fusion signal, not to 1.0: a candidate ranked first by all
+# three retrievers scores 3/(RRF_K+1) ~= 0.049, so a full exact-token match is
+# worth about as much as that, and a scope match about half. Bonuses on a 0-1
+# scale would swamp the ranks entirely and leave ties broken by row id.
+EXACT_TOKEN_BONUS = 1.0 / RRF_K
+SCOPE_TOKEN_BONUS = 0.5 / RRF_K
 _NUMBER_TOKEN = re.compile(r"\d[\d.,]*")
 
 
