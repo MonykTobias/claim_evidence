@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
 
+from .errors import ValidationError
 from .models import (
     EvidenceKind,
     EvidenceQuality,
@@ -46,8 +47,12 @@ LEGACY_TEXT_CAP = 500
 NON_CITABLE_KINDS = frozenset({EvidenceKind.PAGE_MARKDOWN})
 
 
-class OutputValidationError(ValueError):
-    """The output root cannot be indexed as-is."""
+class OutputValidationError(ValidationError):
+    """The output root cannot be indexed as-is.
+
+    A package ValidationError, so a caller maps it to the same non-retryable
+    category as any other bad input rather than to an internal fault.
+    """
 
 
 @dataclass(frozen=True)
