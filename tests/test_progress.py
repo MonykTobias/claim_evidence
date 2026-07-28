@@ -328,6 +328,28 @@ def check_visual_counts(tmp: Path) -> None:
     )
 
 
+def check_empty_channel_reports_zero(tmp: Path) -> None:
+    """A channel that ran and found nothing reports 0, not a division error."""
+    root = build_root(tmp / "emptychannel")
+    events: list[ProgressEvent] = []
+    with make_client(default_session()) as client:
+        client.ingest_document(root, source_uri="urn:emptychannel")
+        # A period no fact in the fixture carries, so the graph channel runs
+        # and legitimately returns nothing.
+        client.audit_claim(
+            "Danone reduced Scope 1 and 2 emissions by 12% in 1974 versus 1968.",
+            progress=events.append,
+        )
+
+    graph = [e for e in events if e.phase == "retrieving_graph"]
+    check(graph[-1].completed == 0, "the empty channel reports zero candidates")
+    check(graph[-1].percent == 0.0, "zero of a non-zero request is 0%, not an error")
+    details = events[-1].details
+    check(details["graph_candidate_count"] == 0, "the summary reports zero")
+    check("graph_candidate_count" in details, "a channel that ran is reported, not omitted")
+    assert_well_formed(events, "audit")
+
+
 def check_vector_channel_is_omitted_when_it_cannot_run(tmp: Path) -> None:
     root = build_root(tmp / "novector")
     events: list[ProgressEvent] = []
@@ -565,6 +587,7 @@ def main() -> int:
         check_callback_exception_does_not_fail_the_build,
         check_audit_phases_and_counts,
         check_visual_counts,
+        check_empty_channel_reports_zero,
         check_vector_channel_is_omitted_when_it_cannot_run,
         check_dependency_failure_is_retryable,
         check_validation_failure_is_not_retryable,
