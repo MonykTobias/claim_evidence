@@ -12,7 +12,10 @@ CREATE TABLE IF NOT EXISTS document (
     sha256       text,
     source_uri   text,
     created_at   timestamptz NOT NULL DEFAULT now(),
-    UNIQUE (name, sha256)
+    -- NULLS NOT DISTINCT matters: ingesting without a source PDF leaves sha256
+    -- NULL, and the default NULL-is-distinct rule would make every re-ingest a
+    -- brand new document instead of matching the existing one.
+    UNIQUE NULLS NOT DISTINCT (name, sha256)
 );
 
 -- A version is only visible to queries once it reaches 'ready'. An interrupted

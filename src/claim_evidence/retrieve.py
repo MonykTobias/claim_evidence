@@ -45,15 +45,22 @@ def lexical_query(text: str, key_terms: Sequence[str] = ()) -> str:
     match nothing. Terms are OR'd instead and precision comes from ranking.
     """
     terms = list(dict.fromkeys([*key_terms, *sorted(content_tokens(text))]))
-    exact = _NUMBER_TOKEN.findall(text)
-    quoted = [f'"{value}"' for value in dict.fromkeys(exact)]
-    parts = [*quoted, *terms]
+    # A multi-word term must be a quoted phrase; bare words next to OR are
+    # parsed as an AND group and quietly drop the whole clause's recall.
+    quoted = [f'"{t}"' if " " in t else t for t in terms if t]
+    numbers = [f'"{value}"' for value in dict.fromkeys(_exact_numbers(text))]
+    parts = [*numbers, *quoted]
     return " OR ".join(parts) if parts else text
+
+
+def _exact_numbers(text: str) -> list[str]:
+    """Numeric tokens with sentence punctuation stripped ("2020." -> "2020")."""
+    return [match.strip(".,") for match in _NUMBER_TOKEN.findall(text) if match.strip(".,")]
 
 
 def exact_tokens(claim: ParsedClaim, claim_text: str) -> set[str]:
     """Tokens whose literal presence is strong evidence of relevance."""
-    tokens = {t for t in _NUMBER_TOKEN.findall(claim_text)}
+    tokens = set(_exact_numbers(claim_text))
     tokens |= set(all_years(claim_text))
     for period in (claim.reporting_period, claim.baseline_period):
         if period:

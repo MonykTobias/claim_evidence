@@ -32,10 +32,14 @@ class FakeSession:
         dimensions: int = 8,
         chat_replies: list[str] | None = None,
         embed_hook: Callable[[list[str]], Any] | None = None,
+        chat_router: dict[str, Callable[[dict[str, Any]], Any]] | None = None,
     ) -> None:
         self.dimensions = dimensions
         self.chat_replies = list(chat_replies or [])
         self.embed_hook = embed_hook
+        # Keyed by the response schema's title, so a test does not have to
+        # predict how many chat calls a pipeline makes or in what order.
+        self.chat_router = chat_router or {}
         self.requests: list[tuple[str, dict[str, Any]]] = []
 
     def post(self, url: str, json: dict[str, Any], timeout: float) -> FakeResponse:  # noqa: A002
@@ -49,10 +53,17 @@ class FakeSession:
                     return FakeResponse({"embeddings": override})
             return FakeResponse({"embeddings": [self.vector(t) for t in inputs]})
         if url.endswith("/api/chat"):
+            title = (payload.get("format") or {}).get("title")
+            handler = self.chat_router.get(title)
+            if handler is not None:
+                return FakeResponse({"message": {"content": reply(handler(payload))}})
             if not self.chat_replies:
-                raise AssertionError(f"unexpected chat call: {payload['messages'][-1]}")
+                raise AssertionError(f"unexpected chat call for schema {title}")
             return FakeResponse({"message": {"content": self.chat_replies.pop(0)}})
         raise AssertionError(f"unexpected url {url}")
+
+    def prompt_of(self, payload: dict[str, Any]) -> str:
+        return payload["messages"][1]["content"]
 
     def vector(self, text: str) -> list[float]:
         """Stable pseudo-embedding: same text always yields the same vector."""

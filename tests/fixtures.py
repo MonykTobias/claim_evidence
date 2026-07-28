@@ -17,6 +17,7 @@ def write_output_root(
     blocks: list[dict[str, Any]] | None = None,
     tables: dict[int, list[dict[str, Any]]] | None = None,
     total_pages: int | None = None,
+    images: dict[int, list[dict[str, Any]]] | None = None,
     statuses: dict[int, str] | None = None,
     drop_artifact: tuple[int, str] | None = None,
     duplicate_page: int | None = None,
@@ -36,7 +37,7 @@ def write_output_root(
         (page_dir / "layout_prompt_map.json").write_text(
             json.dumps({"page_size": [PAGE_W, PAGE_H], "blocks": []}), encoding="utf-8"
         )
-        (page_dir / "page.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+        _write_page_png(page_dir / "page.png")
         (page_dir / "page_state.json").write_text(
             json.dumps({"page": page, "total_pages": total_pages or pages}),
             encoding="utf-8",
@@ -44,6 +45,11 @@ def write_output_root(
         (page_dir / "table_candidates.json").write_text(
             json.dumps((tables or {}).get(page, [])), encoding="utf-8"
         )
+        page_images = (images or {}).get(page, [])
+        if page_images:
+            (page_dir / "image_summaries.jsonl").write_text(
+                "\n".join(json.dumps(i) for i in page_images), encoding="utf-8"
+            )
         if drop_artifact and drop_artifact[0] == page:
             (page_dir / drop_artifact[1]).unlink()
         manifest.append(
@@ -63,6 +69,25 @@ def write_output_root(
     if stale_page_dir:
         (root / stale_page_dir).mkdir(exist_ok=True)
     return root
+
+
+def _write_page_png(path: Path) -> None:
+    """A real (if boring) page image, so crop verification has something to open."""
+    from PIL import Image
+
+    Image.new("RGB", (int(PAGE_W), int(PAGE_H)), "white").save(path)
+
+
+def image_summary(page: int, index: int, summary: str) -> dict[str, Any]:
+    return {
+        "page": page,
+        "index": index,
+        "rel_path": f"images/picture_p{page:04d}_i{index:03d}.png",
+        "norm_rect": [0.1, 0.55, 0.7, 0.8],
+        "caption": "",
+        "summary": summary,
+        "classification": "chart",
+    }
 
 
 def block(

@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 import psycopg
+from pgvector import Vector
 from pgvector.psycopg import register_vector
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
@@ -43,12 +44,16 @@ def init_schema(conn: psycopg.Connection, embed_dim: int) -> None:
     register_vector(conn)
 
 
-def normalize_embedding(vector: Sequence[float]) -> list[float]:
-    """L2-normalize so the HNSW inner-product index ranks like cosine."""
+def normalize_embedding(vector: Sequence[float]) -> Vector:
+    """L2-normalize so the HNSW inner-product index ranks like cosine.
+
+    Returns a pgvector ``Vector`` rather than a list: a bare Python list is
+    adapted as ``double precision[]``, which has no ``<#>`` operator and fails
+    at query time instead of at write time.
+    """
     norm = math.sqrt(sum(v * v for v in vector))
-    if norm == 0:
-        return list(vector)
-    return [v / norm for v in vector]
+    values = list(vector) if norm == 0 else [v / norm for v in vector]
+    return Vector(values)
 
 
 # --- documents and versions -------------------------------------------------
