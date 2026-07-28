@@ -62,6 +62,15 @@ class FakeSession:
             return FakeResponse({"message": {"content": self.chat_replies.pop(0)}})
         raise AssertionError(f"unexpected url {url}")
 
+    def get(self, url: str, timeout: float) -> FakeResponse:
+        """No tag listing by default, so health() sees Ollama as unreachable.
+
+        Subclass and override to simulate a reachable daemon.
+        """
+        import requests
+
+        raise requests.ConnectionError(f"fake session has no endpoint for {url}")
+
     def prompt_of(self, payload: dict[str, Any]) -> str:
         return payload["messages"][1]["content"]
 

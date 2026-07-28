@@ -24,6 +24,7 @@ from fixtures import block, image_summary, kpi_table, write_output_root  # noqa:
 
 from claim_evidence import ClaimEvidence, Settings  # noqa: E402
 from claim_evidence.db import (  # noqa: E402
+    SCHEMA_VERSION,
     connect,
     exact_vector_search,
     normalize_embedding,
@@ -147,10 +148,20 @@ def check_schema_is_repeatable(tmp: Path) -> None:
     with make_client(default_session()) as client:
         client.init_db()
         client.init_db()
-        tables = client.conn.execute(
-            "SELECT count(*) AS n FROM pg_tables WHERE schemaname = 'public'"
-        ).fetchone()["n"]
-        check(tables == 11, f"all 11 tables present after a repeated init ({tables})")
+        tables = {
+            row["tablename"]
+            for row in client.conn.execute(
+                "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"
+            ).fetchall()
+        }
+        expected = {
+            "document", "document_version", "page", "evidence_unit", "evidence_region",
+            "entity", "entity_alias", "fact", "fact_evidence", "audit_run",
+            "audit_candidate",
+        }
+        check(expected <= tables, f"all 11 domain tables present ({sorted(expected - tables)})")
+        version = client.conn.execute("SELECT version FROM schema_meta").fetchone()
+        check(version["version"] == SCHEMA_VERSION, "schema version recorded")
 
 
 def check_ingestion_is_idempotent(tmp: Path) -> None:
