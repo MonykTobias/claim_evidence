@@ -161,6 +161,18 @@ The deterministic suites need no GPU, no Ollama, and no Docker; Ollama is
 replaced by a fake HTTP session. `tests/test_integration.py` needs the Compose
 database and skips cleanly without it.
 
+The live acceptance run is separate, because a first ingest of a 494-page
+report is not a unit test:
+
+```bash
+python tests/acceptance_danone.py
+```
+
+It indexes the completed Danone output and audits the three reference claims
+(supported at 40.2%, contradicted at 90%, and an "all carbon emissions" claim
+that must stay `insufficient`). It skips cleanly when the output root,
+database, or models are missing.
+
 ## Non-goals
 
 No autonomous agent loop, no REST API or MCP server, no generic ontology or
