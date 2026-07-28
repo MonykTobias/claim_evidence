@@ -25,7 +25,13 @@ from .db import (
     record_candidates,
     regions_for,
 )
-from .facts import CLAIM_PARSE_SYSTEM, compare, heuristic_claim, merge_claim
+from .facts import (
+    CLAIM_PARSE_SYSTEM,
+    SCOPE_MISMATCH,
+    compare,
+    heuristic_claim,
+    merge_claim,
+)
 from .models import (
     Adjudication,
     Citation,
@@ -117,26 +123,40 @@ def audit_claim(
     regions = regions_for(conn, [int(c["row"]["id"]) for c in candidates])
     citable = [c for c in candidates if c["row"]["citable"]]
 
-    verdict, rationale, citations, missing = _deterministic(
-        conn, parsed, citable, regions
+    visual_status: dict[int, str] = {}
+    reasons: dict[int, str] = {}
+    verdict, rationale, citations, missing, scope_ambiguous = _deterministic(
+        conn, parsed, citable, regions, reasons
     )
+    decided_by = "comparison"
     if verdict is None:
+        decided_by = "adjudicator"
         verdict, rationale, citations, missing = _adjudicate(
-            conn, client, claim, parsed, citable, regions
+            conn, client, claim, parsed, citable, regions, visual_status,
+            scope_ambiguous=scope_ambiguous,
         )
 
+    selected_ids = {citation.evidence_id for citation in citations}
     record_candidates(
         conn,
         audit_id,
         [
             {
-                "evidence_id": int(c["row"]["id"]),
+                "evidence_id": (evidence_id := int(c["row"]["id"])),
                 "lexical_rank": c.get("lexical_rank"),
+                "lexical_score": c.get("lexical_score"),
                 "vector_rank": c.get("vector_rank"),
+                "vector_score": c.get("vector_score"),
                 "graph_rank": c.get("graph_rank"),
+                "graph_score": c.get("graph_score"),
+                "combined_rank": c.get("combined_rank"),
                 "combined_score": c["score"],
-                "selected": int(c["row"]["id"]) in {c.evidence_id for c in citations},
-                "note": "expanded" if c.get("expanded_from") else None,
+                "expanded_from": c.get("expanded_from"),
+                "visual_status": visual_status.get(evidence_id, "not_applicable"),
+                "selected": evidence_id in selected_ids,
+                "reason": _candidate_reason(
+                    c, evidence_id, selected_ids, reasons, visual_status, decided_by
+                ),
             }
             for c in candidates
         ],
@@ -150,16 +170,20 @@ def _deterministic(
     parsed: ParsedClaim,
     candidates: Sequence[dict[str, Any]],
     regions: dict[int, list[dict[str, Any]]],
-) -> tuple[Verdict | None, str, list[Citation], list[str]]:
+    reasons: dict[int, str],
+) -> tuple[Verdict | None, str, list[Citation], list[str], bool]:
     """Arithmetic verdict when every material qualifier aligns.
 
     Returns ``None`` when nothing is comparable, handing the claim to the
-    semantic verifier rather than inventing an answer.
+    semantic verifier rather than inventing an answer. The trailing flag says
+    the only thing standing between the claim and the evidence was scope --
+    the claim names a boundary the report never reports on.
     """
     ids = [int(c["row"]["id"]) for c in candidates]
     rows = {int(c["row"]["id"]): c["row"] for c in candidates}
     matches: list[tuple[Citation, str]] = []
     conflicts: list[tuple[Citation, str]] = []
+    scope_rejections = 0
 
     for fact in facts_for_evidence(conn, ids):
         evidence_id = int(fact["evidence_id"])
@@ -167,8 +191,12 @@ def _deterministic(
         if row is None:
             continue
         outcome, reason = compare(parsed, fact)
+        reasons.setdefault(evidence_id, f"{outcome}: {reason}")
         if outcome == "incomparable":
+            if reason.startswith(SCOPE_MISMATCH):
+                scope_rejections += 1
             continue
+        reasons[evidence_id] = f"{outcome}: {reason}"
         citation = to_citation(row, regions.get(evidence_id, []))
         (matches if outcome == "match" else conflicts).append((citation, reason))
 
@@ -180,6 +208,7 @@ def _deterministic(
             + "; ".join(reason for _, reason in (matches[:1] + conflicts[:1])),
             [c for c, _ in matches[:2] + conflicts[:2]],
             [],
+            False,
         )
     if matches:
         return (
@@ -187,6 +216,7 @@ def _deterministic(
             f"Source evidence agrees: {matches[0][1]}.",
             [c for c, _ in matches[:3]],
             [],
+            False,
         )
     if conflicts:
         return (
@@ -194,8 +224,9 @@ def _deterministic(
             f"Source evidence disagrees: {conflicts[0][1]}.",
             [c for c, _ in conflicts[:3]],
             [],
+            False,
         )
-    return None, "", [], []
+    return None, "", [], [], scope_rejections > 0
 
 
 def _adjudicate(
@@ -205,8 +236,10 @@ def _adjudicate(
     parsed: ParsedClaim,
     candidates: Sequence[dict[str, Any]],
     regions: dict[int, list[dict[str, Any]]],
+    visual_status: dict[int, str],
+    scope_ambiguous: bool = False,
 ) -> tuple[Verdict, str, list[Citation], list[str]]:
-    usable = _verify_visuals(conn, client, claim, candidates, regions)
+    usable = _verify_visuals(conn, client, claim, candidates, regions, visual_status)
     if not usable:
         return (
             Verdict.INSUFFICIENT,
@@ -222,15 +255,34 @@ def _adjudicate(
         f"{text[:PASSAGE_CHARS]}"
         for cid, text, _ in usable[:MAX_PASSAGES]
     )
+    note = (
+        "\n\nNote: the evidence reports on narrower or different boundaries than "
+        "the claim names, so no passage is scope-comparable to it.\n"
+        if scope_ambiguous
+        else ""
+    )
     try:
         decision = client.structured(
             Adjudication,
             ADJUDICATION_SYSTEM,
             f"Claim:\n{claim}\n\nParsed qualifiers:\n"
-            f"{parsed.model_dump_json(exclude_none=True)}\n\nEvidence:\n{passages}",
+            f"{parsed.model_dump_json(exclude_none=True)}{note}\n\nEvidence:\n{passages}",
         )
     except OllamaError as exc:
         raise AuditError(f"adjudication failed: {exc}") from exc
+
+    if scope_ambiguous and decision.verdict is Verdict.CONTRADICTED:
+        # Every comparable-looking fact was rejected on scope, so the report
+        # simply does not measure what the claim asserts. Reporting a
+        # contradiction here would be a confidently wrong answer about a
+        # question the source never addresses.
+        return (
+            Verdict.INSUFFICIENT,
+            "No evidence shares the claim's scope, so it can be neither "
+            "confirmed nor contradicted.",
+            [],
+            sorted({*decision.missing_qualifiers, "scope"}),
+        )
 
     by_id = {cid.evidence_id: cid for cid, _, _ in usable[:MAX_PASSAGES]}
     cited = [by_id[i] for i in decision.supporting_evidence_ids if i in by_id]
@@ -252,11 +304,13 @@ def _verify_visuals(
     claim: str,
     candidates: Sequence[dict[str, Any]],
     regions: dict[int, list[dict[str, Any]]],
+    visual_status: dict[int, str],
 ) -> list[tuple[Citation, str, dict[str, Any]]]:
     """Citations the adjudicator may use.
 
     Visual candidates are cropped and re-checked; one that fails verification
-    is dropped entirely rather than offered as weak support.
+    is dropped entirely rather than offered as weak support. The outcome is
+    recorded per candidate so the trace shows why a chart was not used.
     """
     usable: list[tuple[Citation, str, dict[str, Any]]] = []
     for candidate in candidates:
@@ -278,10 +332,13 @@ def _verify_visuals(
 
         page_png = _page_png(conn, evidence_id)
         if page_png is None:
+            visual_status[evidence_id] = "unavailable"
             continue
         result = verify_visual(client, page_png, citation.regions, claim)
         if not result.supports_claim:
+            visual_status[evidence_id] = "rejected"
             continue
+        visual_status[evidence_id] = "verified"
         usable.append(
             (
                 citation.model_copy(update={"quality": EvidenceQuality.VERIFIED_VISUAL}),
@@ -369,6 +426,37 @@ def _finish(
         missing_qualifiers=list(missing),
         audit_id=audit_id,
     )
+
+
+def _candidate_reason(
+    candidate: dict[str, Any],
+    evidence_id: int,
+    selected_ids: set[int],
+    reasons: dict[int, str],
+    visual_status: dict[int, str],
+    decided_by: str,
+) -> str:
+    """One short sentence on why a candidate was used or set aside.
+
+    Retrieval metadata, not model reasoning: a deterministic comparison result,
+    a crop-verification outcome, or how the candidate entered the pool.
+    """
+    if evidence_id in reasons:
+        return reasons[evidence_id]
+    status = visual_status.get(evidence_id)
+    if status == "rejected":
+        return "visual: crop did not show the claim"
+    if status == "unavailable":
+        return "visual: page image unavailable"
+    if status == "verified":
+        return "visual: crop verified"
+    if evidence_id in selected_ids:
+        return f"selected by {decided_by}"
+    if candidate.get("expanded_from"):
+        return "context expansion from a higher-ranked candidate"
+    if not candidate["row"].get("citable", True):
+        return "retrieved as context; not citable"
+    return "retrieved but not selected"
 
 
 __all__ = [

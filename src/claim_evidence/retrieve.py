@@ -39,6 +39,10 @@ RRF_K = 60
 # scale would swamp the ranks entirely and leave ties broken by row id.
 EXACT_TOKEN_BONUS = 1.0 / RRF_K
 SCOPE_TOKEN_BONUS = 0.5 / RRF_K
+# Page Markdown is long, so it matches many query tokens and outranks the cell
+# that actually proves the claim. It is retrieval context and can never be
+# cited, so it is demoted by one bonus unit rather than allowed to fill the pool.
+NON_CITABLE_PENALTY = 1.0 / RRF_K
 _NUMBER_TOKEN = re.compile(r"\d[\d.,]*")
 
 
@@ -94,10 +98,14 @@ def fuse(
             entry = merged.setdefault(
                 evidence_id,
                 {"row": row, "score": 0.0, "lexical_rank": None,
-                 "vector_rank": None, "graph_rank": None},
+                 "vector_rank": None, "graph_rank": None, "lexical_score": None,
+                 "vector_score": None, "graph_score": None},
             )
             entry["score"] += 1.0 / (RRF_K + position)
             entry[f"{source}_rank"] = position
+            # The retriever's own score, kept for the audit trace.
+            if (channel_score := row.get(f"{source}_score")) is not None:
+                entry[f"{source}_score"] = float(channel_score)
 
     for entry in merged.values():
         text = normalize_for_match(entry["row"]["source_text"])
@@ -106,8 +114,13 @@ def fuse(
             entry["score"] += EXACT_TOKEN_BONUS * hits / len(tokens)
         if markers and scope_markers(entry["row"]["source_text"]) & markers:
             entry["score"] += SCOPE_TOKEN_BONUS
+        if not entry["row"].get("citable", True):
+            entry["score"] -= NON_CITABLE_PENALTY
 
-    return sorted(merged.values(), key=lambda e: (-e["score"], int(e["row"]["id"])))
+    ordered = sorted(merged.values(), key=lambda e: (-e["score"], int(e["row"]["id"])))
+    for position, entry in enumerate(ordered, start=1):
+        entry["combined_rank"] = position
+    return ordered
 
 
 def retrieve(
@@ -162,6 +175,7 @@ def expand(
                     "lexical_rank": None,
                     "vector_rank": None,
                     "graph_rank": None,
+                    "combined_rank": None,
                     "expanded_from": int(candidate["row"]["id"]),
                 }
             )

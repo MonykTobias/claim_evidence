@@ -14,12 +14,30 @@ import psycopg
 
 from .audit import audit_claim as _audit_claim
 from .config import Settings
-from .db import connect, ready_documents
-from .ingest import ensure_schema, ingest_document
-from .models import ClaimResult, EvidenceMatch, IngestReport
-from .ollama import OllamaClient, OllamaError
-from .retrieve import expand, retrieve, to_matches
+from .db import connect, delete_document, ready_documents
+from .errors import ValidationError
 from .facts import heuristic_claim
+from .frontend import (
+    as_id,
+    get_audit_trace,
+    get_document,
+    get_evidence,
+    health,
+    list_documents,
+)
+from .ingest import ensure_schema, ingest_document
+from .models import (
+    AuditTrace,
+    ClaimResult,
+    DocumentSummary,
+    EvidenceDetail,
+    EvidenceMatch,
+    HealthReport,
+    IngestReport,
+    RemovalReport,
+)
+from .ollama import OllamaClient, OllamaError
+from .retrieve import retrieve, to_matches
 
 
 class ClaimEvidence:
@@ -51,8 +69,51 @@ class ClaimEvidence:
     def init_db(self) -> None:
         ensure_schema(self.conn, self.settings)
 
+    def initialize_database(self) -> HealthReport:
+        """Apply the idempotent schema, then report the same diagnostics as
+        `health()` so a caller sees in one call whether it can proceed."""
+        ensure_schema(self.conn, self.settings)
+        return self.health()
+
+    def health(self) -> HealthReport:
+        return health(self.conn, self.settings, self.ollama.session)
+
     def documents(self) -> list[dict]:
         return ready_documents(self.conn)
+
+    def list_documents(self) -> list[DocumentSummary]:
+        return list_documents(self.conn)
+
+    def get_document(self, document_id: int | str) -> DocumentSummary:
+        return get_document(self.conn, document_id)
+
+    def remove_document(
+        self, document_id: int | str, *, confirm_document_id: int | str
+    ) -> RemovalReport:
+        """Delete one document's index rows.
+
+        Requires the id twice: an accidental call with the wrong argument
+        should be a validation error, not a silent re-index of 494 pages.
+        Source PDFs, output directories, and page images are never touched.
+        """
+        identifier = as_id(document_id, "document_id")
+        confirmation = as_id(confirm_document_id, "confirm_document_id")
+        if identifier != confirmation:
+            raise ValidationError(
+                "confirm_document_id must equal document_id; nothing was removed"
+            )
+        summary = get_document(self.conn, identifier)
+        deleted = delete_document(self.conn, identifier)
+        self.conn.commit()
+        return RemovalReport(
+            document_id=identifier, name=summary.name, deleted=deleted
+        )
+
+    def get_audit_trace(self, audit_id: int | str) -> AuditTrace:
+        return get_audit_trace(self.conn, audit_id)
+
+    def get_evidence(self, evidence_id: int | str) -> EvidenceDetail:
+        return get_evidence(self.conn, evidence_id)
 
     # --- ingestion ----------------------------------------------------------
 
@@ -62,8 +123,14 @@ class ClaimEvidence:
         *,
         source_pdf: str | Path | None = None,
         source_uri: str | None = None,
+        force: bool = False,
         extract_narrative_facts: bool = True,
     ) -> IngestReport:
+        """Index a completed output root.
+
+        Unchanged sources are a no-op. ``force=True`` rebuilds anyway, keeping
+        the current version queryable until the replacement passes its checks.
+        """
         return ingest_document(
             self.conn,
             self.ollama,
@@ -71,6 +138,7 @@ class ClaimEvidence:
             output_root,
             source_pdf=source_pdf,
             source_uri=source_uri,
+            force=force,
             extract_narrative_facts=extract_narrative_facts,
         )
 

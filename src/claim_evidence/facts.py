@@ -41,6 +41,9 @@ _CLAIM_LIKE = re.compile(
     re.IGNORECASE,
 )
 _METRIC_CONTAINMENT = 0.5
+# Prefix on the one incomparable reason that means "this claim names a boundary
+# no evidence shares", which is an ambiguous claim rather than a wrong one.
+SCOPE_MISMATCH = "scope mismatch"
 
 
 def is_claim_like(text: str) -> bool:
@@ -314,7 +317,9 @@ def compare(claim: ParsedClaim, fact: dict[str, Any] | Fact) -> tuple[Comparison
     claim_scope = claim.scope or claim.metric
     fact_scope = row.get("scope") or row.get("metric") or ""
     if not scopes_comparable(claim_scope, fact_scope):
-        return "incomparable", f"scope {claim_scope!r} is not comparable to {fact_scope!r}"
+        return "incomparable", (
+            f"{SCOPE_MISMATCH}: {claim_scope!r} is not comparable to {fact_scope!r}"
+        )
 
     if metric_containment(claim.metric, str(row.get("metric") or "")) < _METRIC_CONTAINMENT:
         return "incomparable", "metric wording does not overlap enough to compare"
@@ -387,6 +392,7 @@ __all__ = [
     "CLAIM_PARSE_SYSTEM",
     "FACT_EXTRACTION_SYSTEM",
     "accept_llm_facts",
+    "SCOPE_MISMATCH",
     "compare",
     "fact_extraction_prompt",
     "heuristic_claim",

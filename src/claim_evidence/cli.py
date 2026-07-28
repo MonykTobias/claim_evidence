@@ -9,12 +9,19 @@ from typing import Sequence
 
 from .audit import AuditError
 from .client import ClaimEvidence
+from .errors import ClaimEvidenceError
 from .ingest import IngestionError
-from .models import ClaimResult, EvidenceMatch, IngestReport
+from .models import ClaimResult, EvidenceMatch, HealthReport, IngestReport
 from .ollama import OllamaError
 from .source import OutputValidationError
 
-USER_ERRORS = (OutputValidationError, IngestionError, AuditError, OllamaError)
+USER_ERRORS = (
+    ClaimEvidenceError,
+    OutputValidationError,
+    IngestionError,
+    AuditError,
+    OllamaError,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -35,6 +42,12 @@ def build_parser() -> argparse.ArgumentParser:
     ingest.add_argument("--pdf", dest="source_pdf", help="source PDF for SHA-256 identity")
     ingest.add_argument("--source-uri", dest="source_uri")
     ingest.add_argument(
+        "--force",
+        action="store_true",
+        help="rebuild even when the source is unchanged; the current version "
+        "keeps serving queries until the replacement passes its checks",
+    )
+    ingest.add_argument(
         "--no-narrative-facts",
         action="store_true",
         help="index evidence only; skip the LLM narrative fact extractor",
@@ -45,6 +58,24 @@ def build_parser() -> argparse.ArgumentParser:
     search.add_argument("--limit", type=int, default=20)
     search.add_argument("--document-id", type=int, action="append", dest="document_ids")
     search.add_argument("--json", action="store_true")
+
+    sub.add_parser("health", help="report database, schema, and model status")
+
+    sub.add_parser("documents", help="list indexed documents")
+
+    remove = sub.add_parser("remove", help="delete one document's index rows")
+    remove.add_argument("document_id")
+    remove.add_argument(
+        "--confirm", required=True, help="repeat DOCUMENT_ID to confirm"
+    )
+
+    trace = sub.add_parser("trace", help="show one audit's retrieval trace")
+    trace.add_argument("audit_id")
+    trace.add_argument("--json", action="store_true")
+
+    evidence = sub.add_parser("evidence", help="show one evidence unit's regions")
+    evidence.add_argument("evidence_id")
+    evidence.add_argument("--json", action="store_true")
 
     audit = sub.add_parser("audit", help="audit one atomic claim")
     audit.add_argument("claim")
@@ -67,11 +98,53 @@ def main(argv: Sequence[str] | None = None) -> int:
                     print(f"{row['id']}\t{row['name']}\tversion {row['version_id']}")
             return 0
 
+        if args.command == "health":
+            print(_format_health(client.health()))
+            return 0
+
+        if args.command == "documents":
+            for doc in client.list_documents():
+                print(
+                    f"{doc.document_id}\t{doc.name}\t{doc.status}\t"
+                    f"{doc.page_count} pages\t{doc.evidence_count} evidence\t"
+                    f"{doc.fact_count} facts\t{doc.embedding_model}"
+                )
+            return 0
+
+        if args.command == "remove":
+            report = client.remove_document(
+                args.document_id, confirm_document_id=args.confirm
+            )
+            print(f"removed document {report.document_id} ({report.name})")
+            for table, count in sorted(report.deleted.items()):
+                print(f"  {table:<18} {count}")
+            print("source files and output directories were not touched")
+            return 0
+
+        if args.command == "trace":
+            trace = client.get_audit_trace(args.audit_id)
+            print(
+                json.dumps(trace.model_dump(mode="json"), indent=2)
+                if args.json
+                else _format_trace(trace)
+            )
+            return 0
+
+        if args.command == "evidence":
+            detail = client.get_evidence(args.evidence_id)
+            print(
+                json.dumps(detail.model_dump(mode="json"), indent=2)
+                if args.json
+                else _format_evidence(detail)
+            )
+            return 0
+
         if args.command == "ingest":
             report = client.ingest_document(
                 args.output_root,
                 source_pdf=args.source_pdf,
                 source_uri=args.source_uri,
+                force=args.force,
                 extract_narrative_facts=not args.no_narrative_facts,
             )
             print(_format_ingest(report))
@@ -152,6 +225,70 @@ def _format_result(result: ClaimResult) -> str:
         elif cite.quote:
             lines.append(f"      quote: {cite.quote[:180]}")
         lines.append(f"      regions: {regions}")
+    return "\n".join(lines)
+
+
+def _format_health(report: HealthReport) -> str:
+    lines = [
+        f"database   {'reachable' if report.database_reachable else 'UNREACHABLE'}",
+        f"schema     v{report.schema_version} "
+        f"({'current' if report.schema_current else 'OUT OF DATE'})",
+        f"pgvector   {report.pgvector_version or 'not installed'}",
+        f"ollama     {'reachable' if report.ollama_reachable else 'UNREACHABLE'}",
+    ]
+    for model in report.models:
+        state = "available" if model.available else "NOT PULLED"
+        lines.append(f"  {model.role:<7}{model.name} [{state}]")
+    lines += [
+        f"documents  {report.documents_ready} ready, "
+        f"{report.documents_building} building, {report.documents_inactive} inactive",
+        f"index      {report.evidence_units} evidence, "
+        f"{report.embeddings} embeddings, {report.facts} facts",
+    ]
+    for problem in report.problems:
+        lines.append(f"problem:   {problem}")
+    return "\n".join(lines)
+
+
+def _format_trace(trace) -> str:
+    lines = [
+        f"audit {trace.audit_id}: {trace.claim}",
+        f"  verdict   {trace.verdict} ({trace.evidence_quality})",
+        f"  rationale {trace.rationale}",
+        f"  channels  {len(trace.lexical_candidates)} lexical, "
+        f"{len(trace.vector_candidates)} vector, {len(trace.graph_candidates)} graph",
+        f"  citations {trace.citation_ids}",
+    ]
+    for candidate in trace.candidates:
+        mark = "*" if candidate.selected else " "
+        lines.append(
+            f" {mark}[{candidate.evidence_id}] p.{candidate.pdf_page} "
+            f"{candidate.source_kind} rrf#{candidate.combined_rank} "
+            f"score={candidate.combined_score:.4f} "
+            f"L{candidate.lexical_rank} V{candidate.vector_rank} G{candidate.graph_rank}"
+        )
+        lines.append(f"      {candidate.reason}")
+    return "\n".join(lines)
+
+
+def _format_evidence(detail) -> str:
+    lines = [
+        f"evidence {detail.evidence_id} in {detail.document_name} p.{detail.pdf_page}",
+        f"  kind      {detail.source_kind} ({detail.evidence_quality}, "
+        f"{detail.geometry_precision})",
+        f"  page      {detail.page_width} x {detail.page_height}",
+        f"  image     {detail.page_image_path or 'none'}",
+        f"  text      {detail.text[:200]}",
+    ]
+    for region in detail.regions:
+        left, top, right, bottom = region.bbox
+        lines.append(
+            f"  region    {region.role:<20}{region.precision:<8}"
+            f"[{left:.4f}, {top:.4f}, {right:.4f}, {bottom:.4f}] "
+            f"({region.coordinate_space})"
+        )
+    for path in detail.artifact_paths:
+        lines.append(f"  artifact  {path}")
     return "\n".join(lines)
 
 

@@ -83,6 +83,7 @@ def ingest_document(
     *,
     source_pdf: str | Path | None = None,
     source_uri: str | None = None,
+    force: bool = False,
     extract_narrative_facts: bool = True,
 ) -> IngestReport:
     reader = OutputReader(output_root)
@@ -95,7 +96,7 @@ def ingest_document(
 
     document_id = upsert_document(conn, document_name, sha256, source_uri)
     existing = find_version(conn, document_id, fingerprint)
-    if existing and existing["status"] == VersionStatus.READY:
+    if existing and existing["status"] == VersionStatus.READY and not force:
         # Same source, same embedding model: nothing to rebuild. Report the
         # stored counts anyway, so a no-op run does not read as an empty one.
         return IngestReport(
@@ -117,6 +118,7 @@ def ingest_document(
         embed_dim=settings.embed_dimensions,
         output_root=str(reader.root),
         source_pdf=str(source_pdf_path) if source_pdf_path else None,
+        force=force,
     )
 
     subject = organization_name(document_name, source_uri)
@@ -152,6 +154,8 @@ def ingest_document(
         extract_narrative_facts,
     )
 
+    # Only now is the replacement allowed to take over. If _verify raises,
+    # the previous version is still 'ready' and still serving queries.
     _verify(conn, version_id, unit_count, settings)
     activate_version(conn, version_id)
     conn.commit()

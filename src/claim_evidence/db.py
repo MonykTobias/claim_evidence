@@ -581,23 +581,33 @@ def record_candidates(
         cur.executemany(
             """
             INSERT INTO audit_candidate (
-                audit_id, evidence_id, lexical_rank, vector_rank, graph_rank,
-                combined_score, selected, note
+                audit_id, evidence_id,
+                lexical_rank, lexical_score, vector_rank, vector_score,
+                graph_rank, graph_score, combined_rank, combined_score,
+                expanded_from, visual_status, selected, reason
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (audit_id, evidence_id) DO UPDATE SET
-                selected = EXCLUDED.selected, note = EXCLUDED.note
+                visual_status = EXCLUDED.visual_status,
+                selected = EXCLUDED.selected,
+                reason = EXCLUDED.reason
             """,
             [
                 (
                     audit_id,
                     c["evidence_id"],
                     c.get("lexical_rank"),
+                    c.get("lexical_score"),
                     c.get("vector_rank"),
+                    c.get("vector_score"),
                     c.get("graph_rank"),
+                    c.get("graph_score"),
+                    c.get("combined_rank"),
                     c.get("combined_score", 0.0),
+                    c.get("expanded_from"),
+                    c.get("visual_status", "not_applicable"),
                     c.get("selected", False),
-                    c.get("note"),
+                    c.get("reason"),
                 )
                 for c in candidates
             ],
