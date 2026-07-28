@@ -227,6 +227,66 @@ def check_warnings_are_emitted_once(tmp: Path) -> None:
     )
 
 
+def check_resumed_build_reports_the_version_total(tmp: Path) -> None:
+    """A resumed build only writes the embeddings that were still missing, so
+    the summary must report what the version holds, not what this run wrote."""
+    root = build_root(tmp / "resumed")
+    calls = {"n": 0}
+
+    class DiesHalfway(type(default_session())):
+        def post(self, url: str, json: dict[str, Any], timeout: float):  # noqa: A002
+            if url.endswith("/api/embed"):
+                calls["n"] += 1
+                if calls["n"] > 1:
+                    import requests
+
+                    raise requests.ConnectionError("dropped mid-build")
+            return super().post(url, json=json, timeout=timeout)
+
+    dying = DiesHalfway(dimensions=8)
+    dying.chat_router = default_session().chat_router
+    with make_client(dying) as client:
+        # Batch size 1 so the first batch lands and the second fails.
+        client.settings = client.settings.__class__(
+            **{**client.settings.__dict__, "embed_batch_size": 1}
+        )
+        client.ollama.settings = client.settings
+        try:
+            client.ingest_document(root, source_uri="urn:resumed")
+        except Exception:
+            pass
+        else:
+            raise AssertionError("the simulated drop did not interrupt the build")
+        # Scoped to this document's version: the shared test database already
+        # holds embeddings from every earlier check.
+        partial = client.conn.execute(
+            """
+            SELECT count(e.embedding) AS n FROM evidence_unit e
+            JOIN document_version v ON v.id = e.version_id
+            WHERE v.output_root = %s
+            """,
+            (str(Path(root).resolve()),),
+        ).fetchone()["n"]
+        check(partial > 0, f"the interrupted run embedded some units ({partial})")
+
+    events: list[ProgressEvent] = []
+    with make_client(default_session()) as client:
+        report = client.ingest_document(
+            root, source_uri="urn:resumed", progress=events.append
+        )
+        total = client.conn.execute(
+            "SELECT count(embedding) AS n FROM evidence_unit WHERE version_id = %s",
+            (report.version_id,),
+        ).fetchone()["n"]
+
+    check(report.embedded_units == total, "the report counts the version's embeddings")
+    check(
+        events[-1].details["embedding_count"] == total,
+        f"the summary reports {total}, not just this run's writes",
+    )
+    check(total > partial, "the resumed run finished the remaining embeddings")
+
+
 def check_callback_exception_does_not_fail_the_build(tmp: Path) -> None:
     root = build_root(tmp / "badcb")
     seen: list[ProgressEvent] = []
@@ -584,6 +644,7 @@ def main() -> int:
         check_idempotent_ingest_reports_no_op,
         check_zero_candidates_do_not_divide_by_zero,
         check_warnings_are_emitted_once,
+        check_resumed_build_reports_the_version_total,
         check_callback_exception_does_not_fail_the_build,
         check_audit_phases_and_counts,
         check_visual_counts,

@@ -213,7 +213,7 @@ def _ingest(
         total=len(pages),
     )
 
-    embedded = _embed_pending(conn, client, settings, version_id, reporter)
+    _embed_pending(conn, client, settings, version_id, reporter)
     # Drain the reader's warnings here, before fact extraction: _build_facts
     # emits its own, and draining afterwards would send each of those twice.
     _warn_new(reporter, "embedding_evidence", reader, warned)
@@ -230,7 +230,7 @@ def _ingest(
         reporter,
     )
 
-    _verify(conn, version_id, unit_count, settings, reporter)
+    embedded = _verify(conn, version_id, unit_count, settings, reporter)
 
     reporter.start("activating_version", "Activating the new version")
     activate_version(conn, version_id)
@@ -456,13 +456,21 @@ def _verify(
     expected_units: int,
     settings: Settings,
     reporter: ProgressReporter,
-) -> None:
-    """Count, foreign-key, citation-path, and embedding-dimension checks."""
+) -> int:
+    """Count, foreign-key, citation-path, and embedding-dimension checks.
+
+    Returns the version's embedding count, taken from the check query it
+    already runs: a resumed build only writes the embeddings that were still
+    missing, so "written this run" understates the finished index.
+    """
     total = len(VERIFY_STEPS)
     reporter.start("building_indexes", "Checking index integrity", total=total)
-    stored = conn.execute(
-        "SELECT count(*) AS n FROM evidence_unit WHERE version_id = %s", (version_id,)
-    ).fetchone()["n"]
+    counts = conn.execute(
+        "SELECT count(*) AS n, count(embedding) AS embedded"
+        " FROM evidence_unit WHERE version_id = %s",
+        (version_id,),
+    ).fetchone()
+    stored = counts["n"]
     if stored != expected_units:
         raise IngestionError(f"stored {stored} evidence units, expected {expected_units}")
     reporter.step(
@@ -515,6 +523,7 @@ def _verify(
     reporter.done(
         "building_indexes", "Index checks passed", completed=total, total=total
     )
+    return int(counts["embedded"])
 
 
 def ensure_schema(conn: psycopg.Connection, settings: Settings) -> None:
