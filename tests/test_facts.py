@@ -1,0 +1,217 @@
+"""Table-fact derivation, hallucination rejection, and claim comparison."""
+
+from __future__ import annotations
+
+import sys
+import tempfile
+from decimal import Decimal
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from fixtures import block, kpi_table, write_output_root  # noqa: E402
+
+from claim_evidence.facts import (  # noqa: E402
+    accept_llm_facts,
+    compare,
+    heuristic_claim,
+    is_claim_like,
+    merge_claim,
+    metric_containment,
+    table_fact,
+)
+from claim_evidence.models import (  # noqa: E402
+    EvidenceKind,
+    EvidenceUnit,
+    Fact,
+    ParsedClaim,
+)
+from claim_evidence.source import OutputReader, page_units  # noqa: E402
+
+SUPPORTED = "Danone reduced Scope 1 and 2 energy and industry emissions by 40.2% in 2025 versus 2020."
+CONTRADICTED = SUPPORTED.replace("40.2%", "90%")
+VAGUE = "Danone reduced all carbon emissions by 90% from 2020 to 2025."
+
+
+def check(condition: bool, message: str) -> None:
+    if not condition:
+        raise AssertionError(message)
+    print(f"[ok] {message}")
+
+
+def kpi_units() -> list[EvidenceUnit]:
+    with tempfile.TemporaryDirectory() as temp:
+        root = write_output_root(
+            Path(temp) / "run",
+            pages=1,
+            blocks=[block(1, 1, "Nature indicators", heading_path=["4.8.2"])],
+            tables={1: [kpi_table()]},
+        )
+        reader = OutputReader(root)
+        page = reader.validate()[0]
+        return list(page_units(reader, page, reader.blocks_by_page().get(1, [])))
+
+
+def emissions_fact() -> Fact:
+    unit = next(
+        u
+        for u in kpi_units()
+        if u.kind is EvidenceKind.TABLE_VALUE and u.table_context.get("value") == "(40.2) %"
+    )
+    fact = table_fact(unit, "Danone")
+    assert fact is not None
+    return fact
+
+
+def test_table_fact_reads_sign_period_and_baseline() -> None:
+    fact = emissions_fact()
+    check(fact.value_decimal == Decimal("-40.2"), "parenthesized value is negative")
+    check(fact.unit == "%", "percentage-of-variation unit folded to %")
+    check(fact.reporting_period == "2025", "reporting period from the column header")
+    check(fact.baseline_period == "2020", "baseline period from the row descriptor")
+    check(fact.direction == "decrease", "negative variation is a decrease")
+    check(fact.extraction_method == "table", "table facts need no model")
+    check(fact.quote == "(40.2) %", "quote is the displayed value")
+
+
+def test_textual_cell_becomes_value_text() -> None:
+    unit = EvidenceUnit(
+        unit_key="p0001:table_value:tc:r2:c6",
+        page=1,
+        kind=EvidenceKind.TABLE_VALUE,
+        text="x",
+        normalized_text="x",
+        table_context={
+            "descriptor": "Renewable electricity proportion",
+            "header_path": ["Externally verified"],
+            "value": "Yes",
+            "unit": "",
+        },
+    )
+    fact = table_fact(unit, "Danone")
+    check(fact is not None and fact.value_text == "Yes", "non-numeric cell kept as text")
+    check(fact.value_decimal is None, "no numeric value invented for a word")
+
+
+def test_supported_claim_matches() -> None:
+    verdict, reason = compare(heuristic_claim(SUPPORTED), emissions_fact())
+    check(verdict == "match", f"exact claim matches ({reason})")
+
+
+def test_contradicted_claim_conflicts() -> None:
+    verdict, reason = compare(heuristic_claim(CONTRADICTED), emissions_fact())
+    check(verdict == "conflict", f"90% conflicts with 40.2% ({reason})")
+
+
+def test_vague_claim_is_incomparable_not_contradicted() -> None:
+    verdict, reason = compare(heuristic_claim(VAGUE), emissions_fact())
+    check(verdict == "incomparable", f"vague scope refuses comparison ({reason})")
+    check("scope" in reason, "reason names the scope mismatch")
+
+
+def test_approximate_claim_uses_tolerance() -> None:
+    hedged = "Danone reduced Scope 1 and 2 energy and industry emissions by roughly 40% in 2025 versus 2020."
+    parsed = heuristic_claim(hedged)
+    check(parsed.approximate, "hedged wording detected")
+    verdict, _ = compare(parsed, emissions_fact())
+    check(verdict == "match", "40% within 5% of 40.2%")
+
+    exact = hedged.replace("roughly 40%", "40%")
+    check(compare(heuristic_claim(exact), emissions_fact())[0] == "conflict",
+          "the same number without hedging is exact and fails")
+
+
+def test_mismatched_qualifiers_are_incomparable() -> None:
+    fact = emissions_fact()
+    wrong_year = heuristic_claim(SUPPORTED.replace("2025", "2024"))
+    check(compare(wrong_year, fact)[0] == "incomparable", "different period refuses")
+
+    no_baseline = ParsedClaim(
+        metric="Scope 1 and 2 energy and industry emissions",
+        scope="Scope 1 and 2 energy and industry emissions",
+        value_decimal=Decimal("40.2"),
+        unit="%",
+        direction="decrease",
+        reporting_period="2025",
+    )
+    check(
+        compare(no_baseline, fact)[0] == "incomparable",
+        "a claim without a baseline is not compared to a vs-baseline value",
+    )
+
+    wrong_unit = no_baseline.model_copy(update={"unit": "number", "baseline_period": "2020"})
+    check(compare(wrong_unit, fact)[0] == "incomparable", "unit mismatch refuses")
+
+
+def test_valueless_comparison_is_incomparable() -> None:
+    claim = ParsedClaim(metric="emissions", scope="scope 1 and 2")
+    check(compare(claim, emissions_fact())[0] == "incomparable", "no number to compare")
+
+
+def test_metric_containment() -> None:
+    fact = emissions_fact()
+    high = metric_containment("Scope 1 and 2 energy and industry emissions", fact.metric)
+    low = metric_containment("all carbon emissions", fact.metric)
+    check(high > low, f"matching wording scores higher ({high} > {low})")
+    check(metric_containment("", fact.metric) == 0.0, "empty metric scores zero")
+
+
+def test_claim_like_gate() -> None:
+    check(is_claim_like("We reduced emissions by 40.2% in 2025."), "quantified prose")
+    check(is_claim_like("Our target is carbon neutrality by 2050."), "target prose")
+    check(not is_claim_like("This section describes our approach."), "generic prose")
+    check(not is_claim_like("2025"), "a bare token is not a claim")
+
+
+def test_hallucinated_fact_is_rejected() -> None:
+    unit = EvidenceUnit(
+        unit_key="p0359:narrative:p0359-b0003",
+        page=359,
+        kind=EvidenceKind.NARRATIVE,
+        text="Scope 1 and 2 emissions fell by 40.2% against the 2020 baseline.",
+        normalized_text="",
+    )
+    facts = [
+        Fact(subject="Danone", metric="scope 1 and 2", value_decimal=Decimal("-40.2"),
+             quote="fell by 40.2%"),
+        Fact(subject="Danone", metric="scope 3", value_decimal=Decimal("-61.0"),
+             quote="Scope 3 emissions fell by 61%"),
+        Fact(subject="Danone", metric="scope 1 and 2", quote="fell by 40.2%"),
+    ]
+    kept, rejected = accept_llm_facts(facts, unit, "Danone")
+    check(len(kept) == 1, "only the grounded fact survives")
+    check(kept[0].extraction_method == "llm", "surviving fact marked as llm-extracted")
+    check(kept[0].evidence_keys == [unit.unit_key], "fact bound to its own evidence")
+    check(any("quote not in source" in r for r in rejected), "invented quote rejected")
+    check(any("no value" in r for r in rejected), "valueless fact rejected")
+
+
+def test_merge_claim_fills_gaps_only() -> None:
+    model = ParsedClaim(metric="scope 1 and 2 emissions", value_decimal=Decimal("40.2"))
+    merged = merge_claim(model, heuristic_claim(SUPPORTED))
+    check(merged.value_decimal == Decimal("40.2"), "model value kept")
+    check(merged.reporting_period == "2025", "missing period filled from heuristic")
+    check(merged.metric == "scope 1 and 2 emissions", "model metric not overwritten")
+
+
+def test_from_to_wording_orders_periods() -> None:
+    parsed = heuristic_claim(VAGUE)
+    check(parsed.reporting_period == "2025", "'from 2020 to 2025' reports 2025")
+    check(parsed.baseline_period == "2020", "'from 2020' is the baseline")
+
+    versus = heuristic_claim(SUPPORTED)
+    check(versus.reporting_period == "2025", "'in 2025 versus 2020' reports 2025")
+    check(versus.baseline_period == "2020", "'versus 2020' is the baseline")
+
+
+def main() -> int:
+    for name, func in sorted(globals().items()):
+        if name.startswith("test_") and callable(func):
+            func()
+    print("\nall checks passed")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
