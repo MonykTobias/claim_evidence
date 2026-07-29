@@ -5,17 +5,14 @@ Needs the Compose PostgreSQL; skips cleanly without it. Ollama is faked.
 
 from __future__ import annotations
 
-import sys
 import tempfile
 from pathlib import Path
 from typing import Any
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import psycopg  # noqa: E402
-from fixtures import block, kpi_table, write_output_root  # noqa: E402
-from test_integration import (  # noqa: E402
+import psycopg
+from fixtures import block, kpi_table, write_output_root
+from test_integration import (
     SUPPORTED,
     build_root,
     default_session,
@@ -23,9 +20,9 @@ from test_integration import (  # noqa: E402
     reset_database,
 )
 
-from claim_evidence.ingest import VERIFY_STEPS  # noqa: E402
-from claim_evidence.models import ProgressEvent  # noqa: E402
-from claim_evidence.progress import (  # noqa: E402
+from claim_evidence.ingest import VERIFY_STEPS
+from claim_evidence.models import ProgressEvent
+from claim_evidence.progress import (
     DEPENDENCY_ERROR_MESSAGE,
     ERROR_CODES,
     INTERNAL_ERROR_MESSAGE,

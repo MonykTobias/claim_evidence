@@ -2,29 +2,26 @@
 
 from __future__ import annotations
 
-import sys
 import tempfile
 from decimal import Decimal
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from PIL import Image  # noqa: E402
+from PIL import Image
 
-from claim_evidence.facts import heuristic_claim  # noqa: E402
-from claim_evidence.models import (  # noqa: E402
+from claim_evidence.facts import heuristic_claim
+from claim_evidence.models import (
     GeometryPrecision,
     ParsedClaim,
     Region,
     VisualVerification,
 )
-from claim_evidence.retrieve import (  # noqa: E402
+from claim_evidence.retrieve import (
     exact_tokens,
     fuse,
     lexical_query,
 )
-from claim_evidence.vision import CROP_PADDING, crop_region, verify_visual  # noqa: E402
+from claim_evidence.vision import CROP_PADDING, crop_region, verify_visual
 
 CLAIM = "Danone reduced Scope 1 and 2 energy and industry emissions by 40.2% in 2025 versus 2020."
 

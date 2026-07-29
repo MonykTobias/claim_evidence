@@ -2,17 +2,14 @@
 
 from __future__ import annotations
 
-import sys
 import tempfile
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from fixtures import block, kpi_table, markdown_only_table, write_output_root  # noqa: E402
+from fixtures import block, kpi_table, markdown_only_table, write_output_root
 
-from claim_evidence.models import EvidenceKind, GeometryPrecision  # noqa: E402
-from claim_evidence.source import (  # noqa: E402
+from claim_evidence.models import EvidenceKind, GeometryPrecision
+from claim_evidence.source import (
     OutputReader,
     OutputValidationError,
     block_text,

@@ -8,18 +8,16 @@ from __future__ import annotations
 
 import os
 import socket
-import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-import psycopg  # noqa: E402
+import psycopg
 
-from claim_evidence import Settings  # noqa: E402
-from claim_evidence.config import DEFAULT_DATABASE_CONNECT_TIMEOUT  # noqa: E402
-from claim_evidence.db import connect  # noqa: E402
-from claim_evidence.errors import DependencyUnavailableError, ValidationError  # noqa: E402
+from claim_evidence import Settings
+from claim_evidence.config import DEFAULT_DATABASE_CONNECT_TIMEOUT
+from claim_evidence.db import connect
+from claim_evidence.errors import DependencyUnavailableError, ValidationError
 
 SECRET_URL = "postgresql://secret_user:hunter2@db.internal.example:5432/claim_evidence"
 

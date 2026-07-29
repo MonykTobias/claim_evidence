@@ -3,24 +3,21 @@
 from __future__ import annotations
 
 import json
-import sys
 from decimal import Decimal
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from fake_ollama import FakeSession, reply  # noqa: E402
+from fake_ollama import FakeSession, reply
 
-from claim_evidence.config import DEFAULT_NUM_CTX, Settings  # noqa: E402
-from claim_evidence.errors import ValidationError  # noqa: E402
-from claim_evidence.models import (  # noqa: E402
+from claim_evidence.config import DEFAULT_NUM_CTX, Settings
+from claim_evidence.errors import ValidationError
+from claim_evidence.models import (
     Adjudication,
     Fact,
     FactExtraction,
     VisualVerification,
 )
-from claim_evidence.ollama import OllamaClient, OllamaError, gbnf_safe_schema  # noqa: E402
+from claim_evidence.ollama import OllamaClient, OllamaError, gbnf_safe_schema
 
 SETTINGS = Settings(embed_dimensions=8, embed_batch_size=2)
 

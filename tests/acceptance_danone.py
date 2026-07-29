@@ -14,17 +14,15 @@ version because the fingerprint is unchanged.
 from __future__ import annotations
 
 import os
-import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-import psycopg  # noqa: E402
-import requests  # noqa: E402
+import psycopg
+import requests
 
-from claim_evidence import ClaimEvidence, Settings  # noqa: E402
-from claim_evidence.models import EvidenceQuality, Verdict  # noqa: E402
+from claim_evidence import ClaimEvidence, Settings
+from claim_evidence.models import EvidenceQuality, Verdict
 
 OUTPUT_ROOT = Path(
     os.environ.get(

@@ -5,18 +5,15 @@ Needs the Compose PostgreSQL; skips cleanly without it. Ollama is faked.
 
 from __future__ import annotations
 
-import sys
 import tempfile
 from pathlib import Path
 from typing import Any
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import psycopg  # noqa: E402
-from fake_ollama import FakeSession  # noqa: E402
-from fixtures import block, image_summary, kpi_table, write_output_root  # noqa: E402
-from test_integration import (  # noqa: E402
+import psycopg
+from fake_ollama import FakeSession
+from fixtures import block, image_summary, kpi_table, write_output_root
+from test_integration import (
     DIMENSIONS,
     VAGUE,
     build_root,
@@ -26,14 +23,14 @@ from test_integration import (  # noqa: E402
     settings,
 )
 
-from claim_evidence import (  # noqa: E402
+from claim_evidence import (
     ClaimEvidence,
     NotFoundError,
     ValidationError,
     VersionStatus,
 )
-from claim_evidence.db import SCHEMA_VERSION  # noqa: E402
-from claim_evidence.models import EvidenceKind, GeometryPrecision, RegionRole  # noqa: E402
+from claim_evidence.db import SCHEMA_VERSION
+from claim_evidence.models import EvidenceKind, GeometryPrecision, RegionRole
 
 SUPPORTED = "Danone reduced Scope 1 and 2 energy and industry emissions by 40.2% in 2025 versus 2020."
 

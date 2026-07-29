@@ -13,7 +13,21 @@ A claim may be supported by text, tables, or a chart, but **visual evidence must
 be re-checked from the cited crop** before it can support a verdict, and
 generated Markdown never supports anything on its own.
 
+This is the **canonical RAG/knowledge-graph backend**. The sibling
+`document_knowledge` directory is a non-runtime scaffold and must not be
+installed or imported.
+
 ## Install
+
+Python 3.12. One environment holds all three prototype packages; install them
+together from the directory containing the checkouts, so nothing needs a
+`sys.path` insertion:
+
+```bash
+py -3.12 -m pip install -e claim_evidence -e document_extract -r gw_detector_v2/requirements.txt
+```
+
+For this package alone:
 
 ```bash
 python -m pip install -e .

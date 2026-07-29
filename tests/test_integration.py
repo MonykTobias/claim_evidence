@@ -12,40 +12,37 @@ from __future__ import annotations
 import json
 import os
 import random
-import sys
 from pathlib import Path
 from typing import Any
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import psycopg  # noqa: E402
-from fake_ollama import FakeSession  # noqa: E402
-from fixtures import block, image_summary, kpi_table, write_output_root  # noqa: E402
+import psycopg
+from fake_ollama import FakeSession
+from fixtures import block, image_summary, kpi_table, write_output_root
 
-from claim_evidence import ClaimEvidence, Settings  # noqa: E402
-from claim_evidence.db import (  # noqa: E402
+from claim_evidence import ClaimEvidence, Settings
+from claim_evidence.db import (
     SCHEMA_VERSION,
     connect,
     exact_vector_search,
     normalize_embedding,
     vector_search,
 )
-from claim_evidence.models import (  # noqa: E402
+from claim_evidence.models import (
     EvidenceKind,
     EvidenceQuality,
     GeometryPrecision,
     Verdict,
     VersionStatus,
 )
-from claim_evidence.audit import MAX_PASSAGES, PASSAGE_CHARS  # noqa: E402
-from claim_evidence.errors import (  # noqa: E402
+from claim_evidence.audit import MAX_PASSAGES, PASSAGE_CHARS
+from claim_evidence.errors import (
     IndexNotReadyError,
     NotFoundError,
     ValidationError,
 )
-from claim_evidence.ingest import identity_key  # noqa: E402
-from claim_evidence.ollama import OllamaClient  # noqa: E402
+from claim_evidence.ingest import identity_key
+from claim_evidence.ollama import OllamaClient
 
 ADMIN_URL = os.environ.get(
     "CLAIM_EVIDENCE_DATABASE_URL",

@@ -2,14 +2,12 @@
 
 from __future__ import annotations
 
-import sys
 from decimal import Decimal
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from claim_evidence.models import GeometryPrecision  # noqa: E402
-from claim_evidence.normalize import (  # noqa: E402
+from claim_evidence.models import GeometryPrecision
+from claim_evidence.normalize import (
     contains_quote,
     detect_direction,
     normalize_bbox,

@@ -2,17 +2,14 @@
 
 from __future__ import annotations
 
-import sys
 import tempfile
 from decimal import Decimal
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from fixtures import block, kpi_table, write_output_root  # noqa: E402
+from fixtures import block, kpi_table, write_output_root
 
-from claim_evidence.facts import (  # noqa: E402
+from claim_evidence.facts import (
     accept_llm_facts,
     compare,
     compare_detailed,
@@ -22,13 +19,13 @@ from claim_evidence.facts import (  # noqa: E402
     metric_containment,
     table_fact,
 )
-from claim_evidence.models import (  # noqa: E402
+from claim_evidence.models import (
     EvidenceKind,
     EvidenceUnit,
     Fact,
     ParsedClaim,
 )
-from claim_evidence.source import OutputReader, page_units  # noqa: E402
+from claim_evidence.source import OutputReader, page_units
 
 SUPPORTED = "Danone reduced Scope 1 and 2 energy and industry emissions by 40.2% in 2025 versus 2020."
 CONTRADICTED = SUPPORTED.replace("40.2%", "90%")
