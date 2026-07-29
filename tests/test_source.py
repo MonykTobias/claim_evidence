@@ -266,12 +266,15 @@ def test_source_sha256_is_the_real_pdf_digest() -> None:
             "sha256_file is the digest any standard tool reports",
         )
         root = write_output_root(Path(temp) / "run", pages=1)
-        token = OutputReader(root).legacy_pdf_token(pdf)
+        digests = OutputReader(root).artifact_digests()
         check(
-            token == hashlib.sha256(sha256_file(pdf).encode()).hexdigest(),
-            "the legacy identity token is still the hash of the hex digest",
+            all(len(d) == 64 or d == "absent" for d in digests.values()),
+            "every declared artifact contributes a content digest or a stated absence",
         )
-        check(token != sha256_file(pdf), "and is not the public source hash")
+        check(
+            "page_image@1" in digests and "manifest" in digests,
+            "root and per-page artifacts are both hashed by role",
+        )
 
 
 def test_text_full_preferred_over_capped_text() -> None:

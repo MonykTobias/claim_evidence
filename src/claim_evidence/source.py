@@ -256,39 +256,43 @@ class OutputReader:
 
     # --- identity -----------------------------------------------------------
 
-    def extraction_fingerprint(self) -> str:
-        """Content identity of this extraction output.
+    def artifact_digests(self) -> dict[str, str]:
+        """SHA-256 of every artifact the run contract declares evidence-bearing.
 
-        Every authoritative artifact is hashed by *content*, streamed, in
-        manifest page order. Hashing sizes instead -- which is what this used to
-        do -- means a re-run that improves a table reconstruction or redraws a
-        page image without changing its length is indistinguishable from no
-        change at all, and the improved extraction is silently never indexed.
+        Keyed by role and page so the map says *what* changed, not only that
+        something did. Hashing content rather than size is the whole point: a
+        re-run that improves a table reconstruction or redraws a page image
+        without changing its length would otherwise be indistinguishable from
+        no change at all, and the better extraction would silently never be
+        indexed.
 
-        ``page.png`` counts: it is the image visual re-verification crops from,
-        so a changed page image changes what a verdict can be based on.
+        ``page_image`` counts. It is what visual re-verification crops from, so
+        a changed page image changes what a verdict can rest on.
 
         Only manifest-listed pages contribute, so a stale directory the
-        manifest has dropped cannot move the fingerprint.
+        manifest has dropped cannot move the fingerprint. A declared-optional
+        artifact that is absent is recorded as ``"absent"`` rather than
+        skipped, so a page that gains or loses one is a different build.
         """
-        digest = hashlib.sha256()
-        _absorb(digest, self.root / MANIFEST_NAME, MANIFEST_NAME)
-        _absorb(digest, self.root / BLOCKS_NAME, BLOCKS_NAME)
+        roles = self.run["evidence_bearing_roles"]
+        root_roles = self.run["artifacts"]["root"]
+        page_roles = self.run["artifacts"]["page"]
+
+        digests: dict[str, str] = {}
+        for role in roles:
+            if role in root_roles:
+                digests[role] = _digest_of(self.root / root_roles[role])
         for page in self.validate():
-            for name in FINGERPRINTED_ARTIFACTS:
-                _absorb(digest, page.artifact(name), f"{page.page}/{name}")
-        return digest.hexdigest()
+            for role in roles:
+                if role in page_roles:
+                    digests[f"{role}@{page.page}"] = _digest_of(
+                        page.artifact(page_roles[role])
+                    )
+        return digests
 
-    def legacy_pdf_token(self, source_pdf: str | Path) -> str:
-        """The PDF hash representation this package used before M-3.
-
-        A hash *of the hex digest text*, which was never a useful public value
-        -- but `document.identity_key` was derived from it, so recomputing
-        identity on the real digest would split every already-indexed PDF into
-        a second document. Kept for that one purpose and nothing else; the
-        public source hash is :func:`sha256_file`.
-        """
-        return hashlib.sha256(sha256_file(Path(source_pdf)).encode()).hexdigest()
+    def extraction_fingerprint(self) -> str:
+        """One value over every declared evidence-bearing artifact's content."""
+        return canonical_digest(self.artifact_digests())
 
     # --- artifacts ----------------------------------------------------------
 
@@ -338,19 +342,29 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _absorb(digest: "hashlib._Hash", path: Path, label: str) -> None:
-    """Fold one optional file into a running digest, content and all.
+def canonical_json(payload: Any) -> bytes:
+    """The one canonical encoding: sorted keys, compact, UTF-8, not escaped.
 
-    The label goes in first so the same bytes under a different name -- or an
-    artifact that appears and disappears -- cannot leave the digest unchanged.
+    Two runs that agree on the facts must produce identical bytes, or a
+    fingerprint is a record of formatting rather than of content.
     """
-    digest.update(f"\x1f{label}:".encode())
-    if not path.is_file():
-        digest.update(b"absent")
-        return
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1 << 20), b""):
-            digest.update(chunk)
+    return json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+
+
+def canonical_digest(payload: Any) -> str:
+    return hashlib.sha256(canonical_json(payload)).hexdigest()
+
+
+def _digest_of(path: Path) -> str:
+    """Content digest, or ``"absent"`` for a declared-optional artifact.
+
+    An absent artifact is recorded rather than skipped: a page that gains or
+    loses its image summaries is a different build, and a skipped entry would
+    make those two builds identical.
+    """
+    return sha256_file(path) if path.is_file() else "absent"
 
 
 def _load_json(path: Path, default: Any) -> Any:
@@ -782,6 +796,8 @@ def _in_reading_order(units: list[EvidenceUnit]) -> list[EvidenceUnit]:
 
 __all__ = [
     "FINGERPRINTED_ARTIFACTS",
+    "canonical_digest",
+    "canonical_json",
     "NON_CITABLE_KINDS",
     "OutputReader",
     "OutputValidationError",

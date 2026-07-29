@@ -33,10 +33,14 @@ class FakeSession:
         chat_replies: list[str] | None = None,
         embed_hook: Callable[[list[str]], Any] | None = None,
         chat_router: dict[str, Callable[[dict[str, Any]], Any]] | None = None,
+        model_digests: dict[str, str] | None = None,
     ) -> None:
         self.dimensions = dimensions
         self.chat_replies = list(chat_replies or [])
         self.embed_hook = embed_hook
+        # Model name -> digest. A model absent from this map answers without
+        # one, which is how the tag-only path is exercised.
+        self.model_digests = dict(model_digests or {})
         # Keyed by the response schema's title, so a test does not have to
         # predict how many chat calls a pipeline makes or in what order.
         self.chat_router = chat_router or {}
@@ -52,6 +56,9 @@ class FakeSession:
                 if override is not None:
                     return FakeResponse({"embeddings": override})
             return FakeResponse({"embeddings": [self.vector(t) for t in inputs]})
+        if url.endswith("/api/show"):
+            digest = self.model_digests.get(payload.get("model", ""))
+            return FakeResponse({"digest": digest} if digest else {})
         if url.endswith("/api/chat"):
             title = (payload.get("format") or {}).get("title")
             handler = self.chat_router.get(title)

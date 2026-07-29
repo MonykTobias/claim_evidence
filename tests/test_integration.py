@@ -590,7 +590,7 @@ def check_resume_reconciles_the_building_version(tmp: Path) -> None:
         upsert_fact,
         upsert_page,
     )
-    from claim_evidence.ingest import identity_key, index_fingerprint
+    from claim_evidence.ingest import build_fingerprint, identity_key
     from claim_evidence.models import Fact
     from claim_evidence.source import OutputReader, page_units
 
@@ -612,7 +612,10 @@ def check_resume_reconciles_the_building_version(tmp: Path) -> None:
         # Seed an attempt that died before activation, holding stale text, a
         # unit the source no longer produces, a page that is gone, and a fact
         # built from all of it.
-        fingerprint = index_fingerprint(None, reader.extraction_fingerprint(), config)
+        fingerprint = build_fingerprint(
+            reader, config, client.ollama,
+            source_sha256=None, extract_narrative_facts=True,
+        )
         document_id = upsert_document(
             conn, reader.root.name, None, "urn:resume",
             identity_key(reader.root, None, "urn:resume"),
@@ -1284,15 +1287,13 @@ def check_source_hash_is_the_real_pdf_digest(tmp: Path) -> None:
         summary = client.get_document(report.document_id)
         check(summary.source_sha256 == expected, "and it is what the public API returns")
 
-        # Identity stays on the pre-M-3 token so correcting the hash cannot
-        # split an already-indexed PDF into a second document.
+        # Identity is keyed on the PDF's own bytes (PD-04), so the public hash
+        # and the internal key are derived from one fact about the document.
         from claim_evidence.ingest import identity_key
-        from claim_evidence.source import OutputReader
 
-        token = OutputReader(root).legacy_pdf_token(pdf)
         check(
-            stored["identity_key"] == identity_key(Path(root), token, None),
-            "identity_key still keys on the legacy token",
+            stored["identity_key"] == identity_key(Path(root), expected, None),
+            "identity_key is derived from the PDF's SHA-256",
         )
         again = client.ingest_document(root, source_pdf=pdf)
         check(

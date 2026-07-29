@@ -19,6 +19,12 @@ from typing import Any, Iterable
 
 from .models import GeometryPrecision, Region, RegionRole
 
+# Bump when a change here would give the same source different stored evidence
+# -- different normalized text, a different region, a different parsed value.
+# It is part of the build fingerprint, so bumping it rebuilds; not bumping it
+# after such a change leaves an index whose text no longer matches its rules.
+NORMALIZATION_VERSION = 1
+
 # Dashes, minus signs, and non-breaking hyphens all render as "-" in a PDF but
 # are distinct code points, which silently breaks substring quote checks.
 _DASHES = dict.fromkeys(map(ord, "‐‑‒–—―−­"), "-")

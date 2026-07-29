@@ -8,8 +8,8 @@ checks pass, so a half-built index is never visible to a query.
 
 from __future__ import annotations
 
-import hashlib
 import logging
+import os
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -39,6 +39,8 @@ from .db import (
 )
 from .facts import (
     FACT_EXTRACTION_SYSTEM,
+    FACT_PROMPT_VERSION,
+    FACT_SCHEMA_VERSION,
     accept_llm_facts,
     fact_extraction_prompt,
     is_claim_like,
@@ -55,10 +57,10 @@ from .models import (
     VersionStatus,
 )
 from .progress import ProgressCallback, ProgressReporter, classify_error
-from .normalize import normalize_for_match
-from .errors import ClaimEvidenceError, IndexNotReadyError
+from .normalize import NORMALIZATION_VERSION, normalize_for_match
+from .errors import ClaimEvidenceError, IndexNotReadyError, ValidationError
 from .ollama import OllamaClient, OllamaError
-from .source import OutputReader, page_units, sha256_file
+from .source import OutputReader, canonical_digest, page_units, sha256_file
 
 # Table values are reached through their row, their fact, and lexical search.
 # Embedding 11k near-identical "(40.2) %" strings buys nothing semantically and
@@ -90,47 +92,160 @@ VERIFY_STEPS = (
 )
 
 
-def identity_key(
-    root: Path, pdf_token: str | None, source_uri: str | None
-) -> str:
-    """The document's internal identity: hash of a namespace-tagged basis.
+# Bumped when the *meaning* of an identity basis changes, so a redefinition
+# cannot silently equate old and new keys.
+IDENTITY_VERSION = 1
+FINGERPRINT_VERSION = 1
 
-    Strongest available source wins -- the PDF, then a logical source URI, then
-    the canonical output root. The tag is inside the hash so a URI and a path
-    that happen to read the same are still different documents. `root` is
-    already resolved, which on Windows also settles its casing.
 
-    ``pdf_token`` is `OutputReader.legacy_pdf_token`, not the public source
-    SHA. It is deliberately the pre-M-3 representation: identity has to stay
-    put across that change, or every already-indexed PDF becomes a second
-    document the day its hash is corrected.
+def normalize_source_uri(uri: str) -> str:
+    """Normalize a logical URI to the bounded extent PD-04 supports.
+
+    Scheme and host are case-insensitive by RFC; the path is not, and lowering
+    it would merge two genuinely different documents. Only the file-URI and
+    local-Windows forms this prototype is tested against are supported --
+    exhaustive canonicalization is deferred (PV-010).
     """
-    if pdf_token is not None:
-        basis = f"pdf:{pdf_token}"
-    elif source_uri:
-        basis = f"uri:{source_uri}"
-    else:
-        basis = f"output:{root}"
-    return hashlib.sha256(basis.encode("utf-8")).hexdigest()
+    text = uri.strip()
+    scheme, separator, rest = text.partition("://")
+    if not separator:
+        return text
+    host, slash, path = rest.partition("/")
+    return f"{scheme.lower()}://{host.lower()}{slash}{path}".rstrip("/")
+
+
+def canonical_local_path(root: Path) -> str:
+    """A local Windows extraction-output path in one settled spelling.
+
+    ``resolve(strict=True)`` requires the directory to exist, which is the
+    point: a path-based identity for something that is not there identifies
+    nothing. ``normcase`` settles Windows' case-insensitivity and separator
+    choice. Moving a path-only source therefore creates a new logical document,
+    which is the accepted limitation (GR-063), not an oversight.
+    """
+    try:
+        resolved = root.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ValidationError(
+            "the extraction output root does not exist, so it cannot identify a "
+            "document; pass the source PDF or a logical source URI"
+        ) from exc
+    return os.path.normcase(str(resolved))
+
+
+def identity_basis(
+    root: Path, source_sha256: str | None, source_uri: str | None
+) -> tuple[str, str]:
+    """The strongest available basis for this document's identity, and its kind.
+
+    In PD-04's order: the PDF's own bytes, then a logical URI, then the local
+    output path. The kind travels with the value so a URI and a path that
+    happen to read the same are still two documents.
+    """
+    if source_sha256:
+        return "pdf_sha256", source_sha256.lower()
+    if source_uri and source_uri.strip():
+        return "source_uri", normalize_source_uri(source_uri)
+    return "local_output_path", canonical_local_path(root)
+
+
+def identity_key(
+    root: Path, source_sha256: str | None, source_uri: str | None
+) -> str:
+    """The document's internal identity: a digest of a versioned, tagged basis.
+
+    Never a public field. The basis kind is inside the digest, so the same text
+    in two roles cannot collide, and the version is inside it so redefining a
+    basis later cannot silently equate the old and new meanings.
+    """
+    kind, value = identity_basis(root, source_sha256, source_uri)
+    return canonical_digest(
+        {"identity_version": IDENTITY_VERSION, "basis": kind, "value": value}
+    )
 
 
 def index_fingerprint(
-    source_sha256: str | None, extraction_sha256: str, settings: Settings
+    source_sha256: str | None,
+    artifacts_sha256: str,
+    settings: Settings,
+    *,
+    extraction_contract_version: str,
+    extraction_settings: dict[str, Any],
+    fact_mode: str,
+    embed_model_identity: dict[str, Any],
+    fact_model_identity: dict[str, Any],
 ) -> str:
-    """What this version was built from, as one value.
+    """Everything this version would be built from, as one canonical value.
 
-    Tagged components, so a PDF hash and an extraction hash cannot be confused
-    for one another: the same bytes in a different role must give a different
-    fingerprint. Changing the source, the extraction output, or the embedding
-    configuration all invalidate the version -- which is the point, because
-    each of them changes what the index would contain.
+    The rule for what belongs here is simple and worth stating: if changing it
+    changes a stored evidence unit, embedding, or fact, it is in. If it only
+    changes how long the build takes or where it connects, it is out --
+    timeouts, batch sizes, URLs, and UI settings would otherwise invalidate a
+    perfectly good index every time someone tuned them. Audit-time model
+    settings are out for the same reason: they cannot alter what was stored.
     """
-    digest = hashlib.sha256()
-    digest.update(f"pdf:{source_sha256 or ''}".encode())
-    digest.update(f"\x1fextraction:{extraction_sha256}".encode())
-    for part in settings.index_fingerprint_parts:
-        digest.update(b"\x1f" + part.encode())
-    return digest.hexdigest()
+    payload = {
+        "fingerprint_version": FINGERPRINT_VERSION,
+        "source_pdf_sha256": (source_sha256 or "").lower(),
+        "extraction": {
+            "contract_version": extraction_contract_version,
+            # The settings the extractor declares as evidence-affecting: the
+            # visual-value mode, the models, the prompt digests. The artifact
+            # hashes alone would miss a re-extraction that produced identical
+            # files under different rules, and would also make every re-run
+            # differ if run.json were hashed whole -- it carries a timestamp.
+            "settings": extraction_settings,
+            "artifacts_sha256": artifacts_sha256,
+        },
+        "evidence_normalization_version": NORMALIZATION_VERSION,
+        "embedding": {
+            **embed_model_identity,
+            "dimensions": settings.embed_dimensions,
+        },
+        "facts": {
+            "mode": fact_mode,
+            "model": fact_model_identity,
+            "prompt_version": FACT_PROMPT_VERSION,
+            "schema_version": FACT_SCHEMA_VERSION,
+            "num_ctx": settings.num_ctx,
+            # The only generation options this package sets, stated rather than
+            # assumed: a future change to them changes what facts come out.
+            "options": {"temperature": 0},
+        },
+    }
+    return canonical_digest(payload)
+
+
+def build_fingerprint(
+    reader: OutputReader,
+    settings: Settings,
+    client: OllamaClient,
+    *,
+    source_sha256: str | None,
+    extract_narrative_facts: bool,
+) -> str:
+    """The fingerprint for the build these inputs describe.
+
+    One place assembles it, so the value ingestion stores and the value a
+    caller computes to ask "would this rebuild?" cannot drift apart.
+    """
+    return index_fingerprint(
+        source_sha256,
+        reader.extraction_fingerprint(),
+        settings,
+        extraction_contract_version=reader.run["contract_version"],
+        extraction_settings=reader.run["settings"],
+        fact_mode="table_and_narrative" if extract_narrative_facts else "table_only",
+        embed_model_identity=client.model_identity(settings.embed_model),
+        fact_model_identity=(
+            client.model_identity(settings.chat_model)
+            if extract_narrative_facts
+            # Not consulted when no narrative facts are extracted, and naming a
+            # model that took no part in the build would make the fingerprint
+            # depend on something that did not affect it.
+            else {"name": None, "digest": None, "reproducibility": "not_used"}
+        ),
+    )
 
 
 def ingest_document(
@@ -214,15 +329,18 @@ def _ingest(
 
     source_pdf_path = Path(source_pdf) if source_pdf else None
     document_name = (source_pdf_path or reader.root).name
-    # Three identities, deliberately not one value doing three jobs: the public
-    # source hash anyone can verify with `sha256sum`, the private identity token
-    # H-3 keyed documents on, and the fingerprint of everything this version was
-    # built from. Without a PDF the source hash is null rather than quietly
-    # holding an output fingerprint under a field named for the source.
+    # Two values doing two jobs, deliberately not one doing both: the public
+    # source hash anyone can verify with `sha256sum`, and the fingerprint of
+    # everything this version would be built from. Without a PDF the source
+    # hash is null rather than quietly holding an extraction digest under a
+    # field named for the source.
     source_sha256 = sha256_file(source_pdf_path) if source_pdf_path else None
-    pdf_token = reader.legacy_pdf_token(source_pdf_path) if source_pdf_path else None
-    fingerprint = index_fingerprint(
-        source_sha256, reader.extraction_fingerprint(), settings
+    fingerprint = build_fingerprint(
+        reader,
+        settings,
+        client,
+        source_sha256=source_sha256,
+        extract_narrative_facts=extract_narrative_facts,
     )
 
     document_id = upsert_document(
@@ -230,7 +348,7 @@ def _ingest(
         document_name,
         source_sha256,
         source_uri,
-        identity_key(reader.root, pdf_token, source_uri),
+        identity_key(reader.root, source_sha256, source_uri),
     )
     reporter.document_id = document_id
     existing = find_version(conn, document_id, fingerprint)
@@ -692,7 +810,12 @@ __all__ = [
     "VERIFY_STEPS",
     "IngestionError",
     "ensure_schema",
+    "FINGERPRINT_VERSION",
+    "IDENTITY_VERSION",
+    "canonical_local_path",
+    "identity_basis",
     "identity_key",
     "index_fingerprint",
+    "normalize_source_uri",
     "ingest_document",
 ]

@@ -122,6 +122,12 @@ def table_facts(units: Iterable[EvidenceUnit], subject: str) -> list[Fact]:
 
 # --- LLM narrative facts ----------------------------------------------------
 
+# Both are part of the build fingerprint: a reworded prompt or a changed
+# response schema produces different facts from the same passage, so a build
+# made under the old one must not be reused under the new.
+FACT_PROMPT_VERSION = 1
+FACT_SCHEMA_VERSION = 1
+
 FACT_EXTRACTION_SYSTEM = """\
 You extract auditable facts from one passage of a corporate report.
 
