@@ -20,6 +20,24 @@ class ValidationError(ClaimEvidenceError):
     """The caller's arguments are wrong; no state was changed."""
 
 
+class UnsupportedClaimError(ValidationError):
+    """The claim is well-formed but outside what version 1 audits.
+
+    Separate from ``ValidationError`` because it is a different answer: the
+    request was understood and is being declined, which is an HTTP 422 rather
+    than a 400. It carries a stable ``reason_code`` so a caller branches on the
+    category instead of matching the message text.
+
+    Never an ``insufficient`` verdict. That verdict says the sources were
+    searched and hold nothing comparable; using it here would report a limit of
+    this tool as a finding about the document.
+    """
+
+    def __init__(self, message: str, *, reason_code: str = "unsupported_claim") -> None:
+        super().__init__(message)
+        self.reason_code = reason_code
+
+
 class DependencyUnavailableError(ClaimEvidenceError):
     """PostgreSQL, pgvector, or Ollama could not be reached or used."""
 
@@ -33,5 +51,6 @@ __all__ = [
     "DependencyUnavailableError",
     "IndexNotReadyError",
     "NotFoundError",
+    "UnsupportedClaimError",
     "ValidationError",
 ]

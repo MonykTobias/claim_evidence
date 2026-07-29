@@ -312,15 +312,6 @@ def _existing(path: Path) -> str | None:
         return None
 
 
-def require_ready(conn: psycopg.Connection) -> None:
-    """Fail with a typed error rather than returning a confidently empty result."""
-    ready = conn.execute(
-        "SELECT count(*) AS n FROM document_version WHERE status = 'ready'"
-    ).fetchone()["n"]
-    if not ready:
-        raise IndexNotReadyError("no ready document version; ingest a document first")
-
-
 __all__ = [
     "as_id",
     "get_audit_trace",
@@ -328,6 +319,5 @@ __all__ = [
     "get_evidence",
     "health",
     "list_documents",
-    "require_ready",
     "to_summary",
 ]

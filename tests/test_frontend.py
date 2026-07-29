@@ -33,6 +33,9 @@ from claim_evidence.db import SCHEMA_VERSION
 from claim_evidence.models import EvidenceKind, GeometryPrecision, RegionRole
 
 SUPPORTED = "Danone reduced Scope 1 and 2 energy and industry emissions by 40.2% in 2025 versus 2020."
+# The reporting entity is stated explicitly: version 1 never infers it
+# from a filename.
+ENTITY = "Danone S.A."
 
 
 def check(condition: bool, message: str) -> None:
@@ -246,7 +249,7 @@ def check_removal_deletes_only_its_own_rows(tmp: Path) -> None:
     with make_client(default_session()) as client:
         keep = client.ingest_document(keep_root, source_uri="urn:keep")
         drop = client.ingest_document(drop_root, source_uri="urn:drop")
-        client.audit_claim(SUPPORTED, document_ids=[drop.document_id])
+        client.audit_claim(SUPPORTED, scope=[drop.document_id], reporting_entity=ENTITY)
 
         report = client.remove_document(
             drop.document_id, confirm_document_id=drop.document_id
@@ -299,7 +302,7 @@ def check_removed_document_leaves_query_scope(tmp: Path) -> None:
             "removed evidence never appears in search",
         )
         try:
-            client.audit_claim(SUPPORTED, document_ids=[report.document_id])
+            client.audit_claim(SUPPORTED, scope=[report.document_id], reporting_entity=ENTITY)
         except NotFoundError as exc:
             # Not an empty verdict: "no evidence" would read as a statement
             # about the report rather than about the removed selection.
@@ -315,7 +318,7 @@ def check_trace_reports_every_channel(tmp: Path) -> None:
     root = build_root(tmp / "trace")
     with make_client(default_session()) as client:
         client.ingest_document(root, source_uri="urn:trace")
-        result = client.audit_claim(SUPPORTED)
+        result = client.audit_claim(SUPPORTED, scope="all", reporting_entity=ENTITY)
         trace = client.get_audit_trace(result.audit_id)
 
         check(trace.audit_id == result.audit_id, "trace is the audit that ran")
@@ -352,7 +355,7 @@ def check_trace_carries_no_prompt_text(tmp: Path) -> None:
     root = build_root(tmp / "noprompt")
     with make_client(default_session()) as client:
         client.ingest_document(root, source_uri="urn:noprompt")
-        result = client.audit_claim(VAGUE)
+        result = client.audit_claim(VAGUE, scope="all", reporting_entity=ENTITY)
         blob = client.get_audit_trace(result.audit_id).model_dump_json()
         for leak in (
             "You decide whether",
@@ -367,7 +370,7 @@ def check_expansion_relationships_are_recorded(tmp: Path) -> None:
     root = build_root(tmp / "expansion")
     with make_client(default_session()) as client:
         client.ingest_document(root, source_uri="urn:expansion")
-        result = client.audit_claim(SUPPORTED)
+        result = client.audit_claim(SUPPORTED, scope="all", reporting_entity=ENTITY)
         trace = client.get_audit_trace(result.audit_id)
         expanded = [c for c in trace.candidates if c.expanded_from]
         check(bool(expanded), "context expansion recorded")
@@ -382,7 +385,7 @@ def check_evidence_detail(tmp: Path) -> None:
     root = build_root(tmp / "detail")
     with make_client(default_session()) as client:
         client.ingest_document(root, source_uri="urn:detail")
-        result = client.audit_claim(SUPPORTED)
+        result = client.audit_claim(SUPPORTED, scope="all", reporting_entity=ENTITY)
         cited = result.citations[0].evidence_id
 
         detail = client.get_evidence(str(cited))

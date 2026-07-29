@@ -121,6 +121,7 @@ def audit_claim(
     document_ids: Sequence[int] | None = None,
     index_references: Sequence[IndexReference] = (),
     limit: int = 20,
+    reporting_entity: str = "",
     progress: ProgressCallback | None = None,
 ) -> ClaimResult:
     reporter = ProgressReporter(progress, "audit")
@@ -128,7 +129,7 @@ def audit_claim(
         return _audit(
             conn, client, settings, claim,
             document_ids=document_ids, index_references=index_references,
-            limit=limit, reporter=reporter,
+            limit=limit, reporting_entity=reporting_entity, reporter=reporter,
         )
     except BaseException as exc:
         reporter.fail(exc)
@@ -163,9 +164,15 @@ def _audit(
     document_ids: Sequence[int] | None,
     index_references: Sequence[IndexReference],
     limit: int,
+    reporting_entity: str = "",
     reporter: ProgressReporter,
 ) -> ClaimResult:
     parsed = parse_claim(client, claim, reporter)
+    if reporting_entity:
+        # The caller named who the claim is about. That is authoritative over
+        # anything the model inferred from wording, and over anything derived
+        # from a filename.
+        parsed = parsed.model_copy(update={"subject": reporting_entity})
     audit_id = create_audit(
         conn,
         claim,

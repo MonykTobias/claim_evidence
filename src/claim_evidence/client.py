@@ -13,6 +13,7 @@ from typing import Sequence
 import psycopg
 
 from .audit import audit_claim as _audit_claim
+from .claims import validate_claim
 from .config import Settings
 from .db import (
     connect,
@@ -34,6 +35,7 @@ from .frontend import (
 )
 from .ingest import ensure_schema, ingest_document, retry_failed_facts
 from .models import (
+    AuditRequest,
     AuditTrace,
     ClaimResult,
     DocumentSummary,
@@ -196,7 +198,11 @@ class ClaimEvidence:
         document must be an error the caller can act on -- passing it straight
         to SQL retrieves nothing, and "nothing retrieved" reads as `insufficient`,
         which is a factual statement about the report rather than about the
-        request. ``None`` and ``[]`` both mean every ready document.
+        request.
+
+        ``None`` here means the caller asked for ``scope="all"``. It is not the
+        same as an empty selection, which the request model rejects before this
+        is reached.
         """
         if not document_ids:
             rows = document_scope(self.conn, None)
@@ -254,19 +260,37 @@ class ClaimEvidence:
         self,
         claim: str,
         *,
-        document_ids: Sequence[int] | None = None,
+        scope: str | Sequence[int],
+        reporting_entity: str,
         limit: int = 20,
         progress: ProgressCallback | None = None,
     ) -> ClaimResult:
-        scope, references = self._resolve_scope(document_ids)
+        """Audit one claim against an explicitly chosen corpus.
+
+        ``scope`` is ``"all"`` or a non-empty list of document ids. There is no
+        value meaning "whatever you think best": an omitted selection used to
+        widen silently to every document, which turns a frontend that had not
+        finished loading into a much larger query whose answer looks normal.
+
+        The claim is validated against the version-1 grammar *before* anything
+        is written or any model is called, so an unsupported claim costs a typed
+        error and nothing else.
+        """
+        request = AuditRequest(
+            claim=claim, scope=list(scope) if not isinstance(scope, str) else scope,
+            limit=limit,
+        )
+        supported = validate_claim(request.claim, reporting_entity=reporting_entity)
+        selection, references = self._resolve_scope(request.document_ids)
         return _audit_claim(
             self.conn,
             self.ollama,
             self.settings,
-            claim,
-            document_ids=scope,
+            supported.text,
+            document_ids=selection,
             index_references=references,
-            limit=limit,
+            limit=request.limit,
+            reporting_entity=supported.reporting_entity,
             progress=progress,
         )
 

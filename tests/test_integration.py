@@ -54,6 +54,9 @@ DIMENSIONS = 8
 SUPPORTED = "Danone reduced Scope 1 and 2 energy and industry emissions by 40.2% in 2025 versus 2020."
 CONTRADICTED = SUPPORTED.replace("40.2%", "90%")
 VAGUE = "Danone reduced all carbon emissions by 90% from 2020 to 2025."
+# The reporting entity is stated explicitly: version 1 never infers it
+# from a filename.
+ENTITY = "Danone S.A."
 
 
 def check(condition: bool, message: str) -> None:
@@ -414,7 +417,7 @@ def check_vector_recall(tmp: Path) -> None:
 
 def check_supported_claim_cites_the_table(tmp: Path) -> None:
     with make_client(default_session()) as client:
-        result = client.audit_claim(SUPPORTED)
+        result = client.audit_claim(SUPPORTED, scope="all", reporting_entity=ENTITY)
         check(result.verdict is Verdict.SUPPORTED, f"exact claim supported ({result.rationale})")
         check(
             result.evidence_quality is EvidenceQuality.DIRECT_TABLE,
@@ -454,7 +457,7 @@ def check_adjudicator_prompt_is_bounded(tmp: Path) -> None:
         return adjudication_reply(payload)
 
     with make_client(default_session(Adjudication=capture)) as client:
-        client.audit_claim(VAGUE)
+        client.audit_claim(VAGUE, scope="all", reporting_entity=ENTITY)
     check(bool(seen), "the adjudicator was consulted")
     passages = seen[0].split("Evidence:\n", 1)[1].strip().split("\n\n")
     check(len(passages) <= MAX_PASSAGES, f"passage count capped ({len(passages)})")
@@ -464,7 +467,7 @@ def check_adjudicator_prompt_is_bounded(tmp: Path) -> None:
 
 def check_contradicted_claim(tmp: Path) -> None:
     with make_client(default_session()) as client:
-        result = client.audit_claim(CONTRADICTED)
+        result = client.audit_claim(CONTRADICTED, scope="all", reporting_entity=ENTITY)
         check(result.verdict is Verdict.CONTRADICTED, f"90% contradicted ({result.rationale})")
         check("40.2" in result.rationale, "rationale names the reported value")
         check(bool(result.citations), "contradiction is cited")
@@ -472,7 +475,7 @@ def check_contradicted_claim(tmp: Path) -> None:
 
 def check_vague_claim_is_insufficient(tmp: Path) -> None:
     with make_client(default_session()) as client:
-        result = client.audit_claim(VAGUE)
+        result = client.audit_claim(VAGUE, scope="all", reporting_entity=ENTITY)
         check(
             result.verdict is Verdict.INSUFFICIENT,
             f"vague scope is not forced into a contradiction ({result.verdict})",
@@ -491,7 +494,13 @@ def check_verdict_fails_closed_without_citable_evidence(tmp: Path) -> None:
         }
     )
     with make_client(session) as client:
-        result = client.audit_claim("Danone employs many people across its operations.")
+        # A claim version 1 accepts, about a figure the fixture never states:
+        # the model is scripted to support it anyway, and must be refused.
+        result = client.audit_claim(
+            "Danone reported 12,345 tonnes of packaging waste in 2025.",
+            scope="all",
+            reporting_entity=ENTITY,
+        )
         check(
             result.verdict is not Verdict.SUPPORTED,
             f"uncited support is refused ({result.verdict})",
@@ -506,7 +515,7 @@ def check_visual_evidence_needs_crop_verification(tmp: Path) -> None:
     refusing = default_session()
     with make_client(refusing) as client:
         client.ingest_document(root, source_uri="urn:visual")
-        result = client.audit_claim(claim)
+        result = client.audit_claim(claim, scope="all", reporting_entity=ENTITY)
         check(
             result.evidence_quality is not EvidenceQuality.VERIFIED_VISUAL,
             "an unverified crop cannot become verified visual evidence",
@@ -530,7 +539,7 @@ def check_visual_evidence_needs_crop_verification(tmp: Path) -> None:
         },
     )
     with make_client(accepting) as client:
-        result = client.audit_claim(claim)
+        result = client.audit_claim(claim, scope="all", reporting_entity=ENTITY)
         visual = [c for c in result.citations if c.source_kind is EvidenceKind.VISUAL]
         if visual:
             check(
@@ -569,7 +578,7 @@ def check_middle_range_keeps_pdf_pages(tmp: Path) -> None:
         pages = {m.citation.pdf_page for m in matches}
         check(pages <= {10, 11}, f"search citations keep the pdf page numbers ({pages})")
 
-        result = client.audit_claim(SUPPORTED, document_ids=[report.document_id])
+        result = client.audit_claim(SUPPORTED, scope=[report.document_id], reporting_entity=ENTITY)
         check(result.verdict is Verdict.SUPPORTED, f"claim supported ({result.rationale})")
         check(
             all(c.pdf_page in (10, 11) for c in result.citations),
@@ -872,12 +881,12 @@ def check_document_scope_is_validated(tmp: Path) -> None:
         unknown = 10_000_000
         for call, label in (
             (lambda: client.search_evidence(SUPPORTED, document_ids=[unknown]), "search"),
-            (lambda: client.audit_claim(SUPPORTED, document_ids=[unknown]), "audit"),
+            (lambda: client.audit_claim(SUPPORTED, scope=[unknown], reporting_entity=ENTITY), "audit"),
         ):
             _expect(NotFoundError, call, f"{label}: an unknown document is not found")
         _expect(
             NotFoundError,
-            lambda: client.audit_claim(SUPPORTED, document_ids=[ready, unknown]),
+            lambda: client.audit_claim(SUPPORTED, scope=[ready, unknown], reporting_entity=ENTITY),
             "a mixed selection fails as a whole rather than searching the valid part",
         )
         for value in (True, "abc", 1.5):
@@ -901,7 +910,7 @@ def check_document_scope_is_validated(tmp: Path) -> None:
         client.conn.commit()
         _expect(
             IndexNotReadyError,
-            lambda: client.audit_claim(SUPPORTED, document_ids=[int(building)]),
+            lambda: client.audit_claim(SUPPORTED, scope=[int(building)], reporting_entity=ENTITY),
             "a building-only document is not ready",
         )
         _expect(
@@ -914,7 +923,7 @@ def check_document_scope_is_validated(tmp: Path) -> None:
         client.remove_document(removed.document_id, confirm_document_id=removed.document_id)
         _expect(
             NotFoundError,
-            lambda: client.audit_claim(SUPPORTED, document_ids=[removed.document_id]),
+            lambda: client.audit_claim(SUPPORTED, scope=[removed.document_id], reporting_entity=ENTITY),
             "a removed document is not found",
         )
         client.conn.execute("DELETE FROM document WHERE id = %s", (building,))
@@ -929,7 +938,7 @@ def check_invalid_scope_costs_nothing(tmp: Path) -> None:
         calls = len(session.requests)
         _expect(
             NotFoundError,
-            lambda: client.audit_claim(SUPPORTED, document_ids=[10_000_001]),
+            lambda: client.audit_claim(SUPPORTED, scope=[10_000_001], reporting_entity=ENTITY),
             "an unknown scope is rejected",
         )
         check(len(session.requests) == calls, "the model was never called")
@@ -943,7 +952,7 @@ def check_empty_index_is_not_an_insufficient_verdict(tmp: Path) -> None:
         client.conn.commit()
         _expect(
             IndexNotReadyError,
-            lambda: client.audit_claim(SUPPORTED),
+            lambda: client.audit_claim(SUPPORTED, scope="all", reporting_entity=ENTITY),
             "an empty index raises rather than returning insufficient",
         )
         _expect(
@@ -962,7 +971,7 @@ def _qualifiers(comparison) -> dict[str, Any]:
 
 def check_supported_claim_explains_itself(tmp: Path) -> None:
     with make_client(default_session()) as client:
-        result = client.audit_claim(SUPPORTED)
+        result = client.audit_claim(SUPPORTED, scope="all", reporting_entity=ENTITY)
         explanation = result.decision_explanation
         check(explanation is not None, "a verdict carries a structured explanation")
         check(
@@ -1016,7 +1025,7 @@ def check_supported_claim_explains_itself(tmp: Path) -> None:
 
 def check_contradicted_claim_explains_the_conflict(tmp: Path) -> None:
     with make_client(default_session()) as client:
-        result = client.audit_claim(CONTRADICTED)
+        result = client.audit_claim(CONTRADICTED, scope="all", reporting_entity=ENTITY)
         explanation = result.decision_explanation
         check(
             explanation.verdict_rule == "comparable_numeric_conflict",
@@ -1038,7 +1047,7 @@ def check_contradicted_claim_explains_the_conflict(tmp: Path) -> None:
 
 def check_vague_claim_explains_the_scope_gap(tmp: Path) -> None:
     with make_client(default_session()) as client:
-        result = client.audit_claim(VAGUE)
+        result = client.audit_claim(VAGUE, scope="all", reporting_entity=ENTITY)
         explanation = result.decision_explanation
         check(
             explanation.verdict_rule in ("scope_not_comparable", "missing_material_qualifier"),
@@ -1070,7 +1079,7 @@ def check_vague_claim_explains_the_scope_gap(tmp: Path) -> None:
 
 def check_explanation_round_trips_through_the_trace(tmp: Path) -> None:
     with make_client(default_session()) as client:
-        result = client.audit_claim(SUPPORTED)
+        result = client.audit_claim(SUPPORTED, scope="all", reporting_entity=ENTITY)
         trace = client.get_audit_trace(result.audit_id)
         check(
             trace.decision_explanation.verdict_rule
@@ -1089,7 +1098,7 @@ def check_explanation_round_trips_through_the_trace(tmp: Path) -> None:
             "index references persist",
         )
 
-        insufficient = client.audit_claim(VAGUE)
+        insufficient = client.audit_claim(VAGUE, scope="all", reporting_entity=ENTITY)
         empty_trace = client.get_audit_trace(insufficient.audit_id)
         check(not insufficient.citations, "the vague claim cites nothing")
         check(
@@ -1104,7 +1113,7 @@ def check_explanation_round_trips_through_the_trace(tmp: Path) -> None:
 
 def check_explanation_carries_no_model_text(tmp: Path) -> None:
     with make_client(default_session()) as client:
-        result = client.audit_claim(VAGUE)
+        result = client.audit_claim(VAGUE, scope="all", reporting_entity=ENTITY)
         stored = client.conn.execute(
             "SELECT decision_explanation, timings, index_references"
             " FROM audit_run WHERE id = %s",
@@ -1268,7 +1277,7 @@ def check_audit_persists_its_scope_and_status(tmp: Path) -> None:
         ready = {int(r["id"]) for r in client.documents()}
         chosen = sorted(ready)[0]
 
-        scoped = client.audit_claim(VAGUE, document_ids=[chosen])
+        scoped = client.audit_claim(VAGUE, scope=[chosen], reporting_entity=ENTITY)
         trace = client.get_audit_trace(scoped.audit_id)
         check(not scoped.citations, "the vague claim cites nothing")
         check(
@@ -1279,7 +1288,7 @@ def check_audit_persists_its_scope_and_status(tmp: Path) -> None:
         check(trace.completed_at is not None, "and carries its completion time")
         check(trace.failure_code is None, "with no failure metadata")
 
-        everything = client.audit_claim(SUPPORTED)
+        everything = client.audit_claim(SUPPORTED, scope="all", reporting_entity=ENTITY)
         all_trace = client.get_audit_trace(everything.audit_id)
         check(
             set(all_trace.document_ids) == ready,
@@ -1299,7 +1308,7 @@ def check_trace_survives_document_removal(tmp: Path) -> None:
     root = build_root(tmp / "doomed")
     with make_client(default_session()) as client:
         report = client.ingest_document(root, source_uri="urn:doomed")
-        result = client.audit_claim(SUPPORTED, document_ids=[report.document_id])
+        result = client.audit_claim(SUPPORTED, scope=[report.document_id], reporting_entity=ENTITY)
         client.remove_document(report.document_id, confirm_document_id=report.document_id)
 
         trace = client.get_audit_trace(result.audit_id)
@@ -1324,7 +1333,7 @@ def check_failed_audit_is_explicit_and_safe(tmp: Path) -> None:
                 "SELECT count(*) AS n FROM audit_run"
             ).fetchone()["n"]
             try:
-                client.audit_claim(SUPPORTED)
+                client.audit_claim(SUPPORTED, scope="all", reporting_entity=ENTITY)
             except audit_module.AuditError:
                 pass
             else:
@@ -1361,7 +1370,7 @@ def check_scope_failure_creates_no_audit_row(tmp: Path) -> None:
         before = client.conn.execute("SELECT count(*) AS n FROM audit_run").fetchone()["n"]
         _expect(
             NotFoundError,
-            lambda: client.audit_claim(SUPPORTED, document_ids=[10_000_002]),
+            lambda: client.audit_claim(SUPPORTED, scope=[10_000_002], reporting_entity=ENTITY),
             "an invalid scope is rejected",
         )
         after = client.conn.execute("SELECT count(*) AS n FROM audit_run").fetchone()["n"]

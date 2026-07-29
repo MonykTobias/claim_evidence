@@ -13,6 +13,7 @@ from typing import Any
 import psycopg
 from fixtures import block, kpi_table, write_output_root
 from test_integration import (
+    ENTITY,
     SUPPORTED,
     build_root,
     default_session,
@@ -103,7 +104,7 @@ def check_ingest_without_a_callback_is_unchanged(tmp: Path) -> None:
     with make_client(default_session()) as client:
         report = client.ingest_document(root, source_uri="urn:nocb")
         check(report.evidence_units > 0, "ingestion works with no callback")
-        result = client.audit_claim(SUPPORTED)
+        result = client.audit_claim(SUPPORTED, scope="all", reporting_entity=ENTITY)
         check(result.verdict is not None, "audit works with no callback")
 
 
@@ -300,7 +301,7 @@ def check_callback_exception_does_not_fail_the_build(tmp: Path) -> None:
         report = client.ingest_document(root, source_uri="urn:badcb", progress=explode)
         check(report.evidence_units > 0, "ingestion completed despite a broken callback")
         check(len(seen) == 1, "the callback is dropped after it first raises")
-        result = client.audit_claim(SUPPORTED, progress=explode)
+        result = client.audit_claim(SUPPORTED, progress=explode, scope="all", reporting_entity=ENTITY)
         check(result.verdict is not None, "audit completed despite a broken callback")
 
 
@@ -312,7 +313,7 @@ def check_audit_phases_and_counts(tmp: Path) -> None:
     events: list[ProgressEvent] = []
     with make_client(default_session()) as client:
         client.ingest_document(root, source_uri="urn:auditphases")
-        result = client.audit_claim(SUPPORTED, progress=events.append)
+        result = client.audit_claim(SUPPORTED, progress=events.append, scope="all", reporting_entity=ENTITY)
         trace = client.get_audit_trace(result.audit_id)
 
     assert_well_formed(events, "audit")
@@ -360,7 +361,7 @@ def check_visual_counts(tmp: Path) -> None:
     events: list[ProgressEvent] = []
     with make_client(default_session()) as client:
         client.ingest_document(plain, source_uri="urn:novisual")
-        client.audit_claim(SUPPORTED, progress=events.append)
+        client.audit_claim(SUPPORTED, progress=events.append, scope="all", reporting_entity=ENTITY)
     visual = [e for e in events if e.phase == "verifying_visuals"]
     check(bool(visual), "the visual phase reports even with nothing to check")
     check(visual[-1].total == 0, "zero visual candidates report a zero total")
@@ -381,7 +382,11 @@ def check_visual_counts(tmp: Path) -> None:
     events = []
     with make_client(accepting) as client:
         client.ingest_document(charts, source_uri="urn:withvisual")
-        client.audit_claim("The chart shows emissions falling.", progress=events.append)
+        client.audit_claim("The chart shows emissions falling by 40.2% in 2025 versus 2020.",
+            progress=events.append,
+            scope="all",
+            reporting_entity=ENTITY,
+        )
     details = events[-1].details
     check(
         details["visually_verified_count"] <= details["visual_candidate_count"],
@@ -400,6 +405,8 @@ def check_empty_channel_reports_zero(tmp: Path) -> None:
         client.audit_claim(
             "Danone reduced Scope 1 and 2 emissions by 12% in 1974 versus 1968.",
             progress=events.append,
+            scope="all",
+            reporting_entity=ENTITY,
         )
 
     graph = [e for e in events if e.phase == "retrieving_graph"]
@@ -429,7 +436,7 @@ def check_vector_channel_is_omitted_when_it_cannot_run(tmp: Path) -> None:
     session = NoEmbedSession(dimensions=8)
     session.chat_router = default_session().chat_router
     with make_client(session) as client:
-        client.audit_claim(SUPPORTED, progress=events.append)
+        client.audit_claim(SUPPORTED, progress=events.append, scope="all", reporting_entity=ENTITY)
 
     details = events[-1].details
     check(
@@ -575,7 +582,7 @@ def check_serialization_is_stable_and_safe(tmp: Path) -> None:
     events: list[ProgressEvent] = []
     with make_client(default_session()) as client:
         client.ingest_document(root, source_uri="urn:serial", progress=events.append)
-        client.audit_claim(SUPPORTED, progress=events.append)
+        client.audit_claim(SUPPORTED, progress=events.append, scope="all", reporting_entity=ENTITY)
 
     import json
 
