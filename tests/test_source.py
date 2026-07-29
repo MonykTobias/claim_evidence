@@ -6,7 +6,13 @@ import tempfile
 from pathlib import Path
 
 
-from fixtures import block, kpi_table, markdown_only_table, write_output_root
+from fixtures import (
+    block,
+    image_summary,
+    kpi_table,
+    markdown_only_table,
+    write_output_root,
+)
 
 from claim_evidence.models import EvidenceKind, GeometryPrecision
 from claim_evidence.source import (
@@ -397,6 +403,100 @@ def test_real_danone_page_359() -> None:
         "Scope 1 & 2" in target.table_context["descriptor"],
         "descriptor is the scope 1 & 2 emissions row",
     )
+
+
+def test_artifact_paths_are_root_relative_and_resolve() -> None:
+    """Every citable unit must name a file that is actually there."""
+    with tempfile.TemporaryDirectory() as temp:
+        root = write_output_root(
+            Path(temp) / "run",
+            pages=1,
+            blocks=[block(1, 1, "Emissions fell against the 2020 baseline.")],
+            tables={1: [kpi_table()]},
+            images={1: [image_summary(1, 1, "Emissions chart")]},
+        )
+        reader = OutputReader(root)
+        page = reader.validate()[0]
+        units = list(page_units(reader, page, reader.blocks_by_page().get(1, [])))
+        citable = [u for u in units if u.citable]
+        check(len(citable) > 3, f"{len(citable)} citable units to check")
+        for unit in citable:
+            relative = Path(unit.artifact_path)
+            check(
+                not relative.is_absolute() and ".." not in relative.parts,
+                f"{unit.unit_key} names a contained relative artifact",
+            )
+            check(
+                (root / relative).is_file(),
+                f"{unit.unit_key} artifact resolves: {unit.artifact_path}",
+            )
+
+
+def test_narrative_provenance_points_at_the_root_blocks_file() -> None:
+    """Regression: narrative citations named a per-page blocks.jsonl that never existed."""
+    with tempfile.TemporaryDirectory() as temp:
+        root = write_output_root(
+            Path(temp) / "run",
+            pages=1,
+            blocks=[block(1, 1, "Danone reduced emissions by 40.2%.")],
+        )
+        reader = OutputReader(root)
+        page = reader.validate()[0]
+        units = list(page_units(reader, page, reader.blocks_by_page().get(1, [])))
+        narrative = next(u for u in units if u.kind is EvidenceKind.NARRATIVE)
+        check(
+            narrative.artifact_path == "blocks.jsonl",
+            f"narrative provenance is the root blocks file ({narrative.artifact_path})",
+        )
+        check((root / narrative.artifact_path).is_file(), "and that file exists")
+
+
+def test_every_unit_carries_a_source_order_and_tables_carry_a_context_key() -> None:
+    with tempfile.TemporaryDirectory() as temp:
+        root = write_output_root(
+            Path(temp) / "run",
+            pages=1,
+            blocks=[block(1, 1, "A paragraph."), block(1, 2, "Another paragraph.")],
+            tables={1: [kpi_table()]},
+            images={1: [image_summary(1, 1, "A chart")]},
+        )
+        reader = OutputReader(root)
+        page = reader.validate()[0]
+        units = list(page_units(reader, page, reader.blocks_by_page().get(1, [])))
+        orders = [u.source_order for u in units]
+        check(orders == list(range(len(units))), "source order is dense and 0-based")
+        check(len(set(orders)) == len(orders), "and unique within the page")
+        for unit in units:
+            if unit.kind in (EvidenceKind.TABLE_ROW, EvidenceKind.TABLE_VALUE):
+                check(
+                    bool(unit.context_key),
+                    f"{unit.unit_key} carries the context key its row is found by",
+                )
+        rows = [u for u in units if u.kind is EvidenceKind.TABLE_ROW]
+        values = [u for u in units if u.kind is EvidenceKind.TABLE_VALUE]
+        check(
+            {v.context_key for v in values} <= {r.context_key for r in rows},
+            "every value cell shares its row's context key",
+        )
+
+
+def test_page_markdown_sorts_last_in_source_order() -> None:
+    """It covers the whole page, so by position it would be every unit's neighbour."""
+    with tempfile.TemporaryDirectory() as temp:
+        root = write_output_root(
+            Path(temp) / "run",
+            pages=1,
+            blocks=[block(1, 1, "A paragraph.")],
+            tables={1: [kpi_table()]},
+        )
+        reader = OutputReader(root)
+        page = reader.validate()[0]
+        units = list(page_units(reader, page, reader.blocks_by_page().get(1, [])))
+        markdown = next(u for u in units if u.kind is EvidenceKind.PAGE_MARKDOWN)
+        check(
+            markdown.source_order == max(u.source_order for u in units),
+            "generated page markdown is last in source order",
+        )
 
 
 def main() -> int:

@@ -118,10 +118,26 @@ def fuse(
         if not entry["row"].get("citable", True):
             entry["score"] -= NON_CITABLE_PENALTY
 
-    ordered = sorted(merged.values(), key=lambda e: (-e["score"], int(e["row"]["id"])))
+    # Ties break on where the evidence sits in the document, not on when its
+    # row happened to be inserted. Evidence ids record ingestion and resume
+    # history, so an id tiebreak makes the order of two equally-scored
+    # candidates depend on which attempt built them.
+    ordered = sorted(merged.values(), key=_document_position)
     for position, entry in enumerate(ordered, start=1):
         entry["combined_rank"] = position
     return ordered
+
+
+def _document_position(entry: dict[str, Any]) -> tuple[float, int, int, int]:
+    """Sort key: best score first, then reading order, then id as a last resort."""
+    row = entry["row"]
+    order = row.get("source_order")
+    return (
+        -entry["score"],
+        int(row.get("pdf_page") or 0),
+        int(order) if order is not None else 1 << 30,
+        int(row["id"]),
+    )
 
 
 def retrieve(

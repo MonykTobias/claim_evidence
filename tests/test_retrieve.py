@@ -142,6 +142,55 @@ def test_claim_without_a_number_has_no_value_tokens() -> None:
     check(Decimal("0") != claim.value_decimal, "value stays absent")
 
 
+def _candidate(evidence_id: int, page: int, source_order: int) -> dict:
+    return {
+        "id": evidence_id,
+        "pdf_page": page,
+        "source_order": source_order,
+        "source_text": "identical text on every candidate",
+        "citable": True,
+    }
+
+
+def test_equal_scores_break_ties_on_source_order_not_row_id() -> None:
+    """Evidence ids record ingestion history, not what the page says."""
+    from claim_evidence.retrieve import fuse
+
+    # Inserted backwards: the first unit on the page has the highest id.
+    rows = [
+        _candidate(evidence_id=900, page=1, source_order=0),
+        _candidate(evidence_id=800, page=1, source_order=1),
+        _candidate(evidence_id=700, page=2, source_order=0),
+    ]
+    fused = fuse({"lexical": rows})
+    # One channel, so every rank differs; give them identical scores instead by
+    # fusing each as rank 1 from its own channel.
+    fused = fuse({
+        "lexical": [rows[0]],
+        "vector": [rows[1]],
+        "graph": [rows[2]],
+    })
+    order = [int(entry["row"]["id"]) for entry in fused]
+    check(
+        order == [900, 800, 700],
+        f"equal-scoring candidates follow page then source order, got {order}",
+    )
+    check(
+        order != sorted(order),
+        "and not the ascending row-id order a naive tiebreak would give",
+    )
+
+
+def test_a_candidate_without_source_order_sorts_last_but_stays() -> None:
+    from claim_evidence.retrieve import fuse
+
+    known = _candidate(evidence_id=10, page=1, source_order=5)
+    unknown = dict(_candidate(evidence_id=11, page=1, source_order=0), source_order=None)
+    fused = fuse({"lexical": [known], "vector": [unknown]})
+    order = [int(entry["row"]["id"]) for entry in fused]
+    check(order == [10, 11], "an unordered candidate sorts last rather than vanishing")
+
+
 def main() -> int:
     for name, func in sorted(globals().items()):
         if name.startswith("test_") and callable(func):

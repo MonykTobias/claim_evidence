@@ -645,6 +645,7 @@ def upsert_fact(
 _EVIDENCE_COLUMNS = """
     e.id, e.unit_key, e.kind, e.quality, e.citable, e.source_text,
     e.heading_path, e.table_context, e.artifact_path, e.geometry_precision,
+    e.source_order, e.context_key,
     p.pdf_page, p.printed_page_label, p.page_dir,
     d.id AS document_id, d.name AS document_name, d.sha256, d.source_uri
 """

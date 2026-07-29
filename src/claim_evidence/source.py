@@ -416,7 +416,12 @@ def narrative_units(page: PageSource, blocks: list[dict[str, Any]]) -> list[Evid
                 normalized_text=normalize_for_match(" > ".join(heading_path + [text])),
                 quality=EvidenceQuality.DIRECT_TEXT,
                 heading_path=heading_path,
-                artifact_path=f"{page.rel}/{BLOCKS_NAME}",
+                # Root-relative, because that is where the file is. Narrative
+                # blocks come from one document-wide `blocks.jsonl` at the
+                # output root, not from a per-page copy: pointing at
+                # `page_0001/blocks.jsonl` named a file that has never existed,
+                # so every narrative citation resolved to nothing.
+                artifact_path=BLOCKS_NAME,
                 regions=[region],
                 geometry_precision=GeometryPrecision.BLOCK,
                 truncated_source=truncated,

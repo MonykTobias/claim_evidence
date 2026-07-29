@@ -17,6 +17,8 @@ import psycopg
 
 log = logging.getLogger(__name__)
 
+from document_extract.contracts import PAGE_ARTIFACT_ROLES
+
 from .config import Settings
 from .db import (
     activate_version,
@@ -86,6 +88,8 @@ VERIFY_STEPS = (
     "page coverage",
     "page links",
     "citation paths",
+    "artifact containment",
+    "source order",
     "embedding coverage",
     "embedding dimension",
     "fact links",
@@ -443,7 +447,9 @@ def _ingest(
         reporter,
     )
 
-    embedded = _verify(conn, version_id, unit_count, len(pages), settings, reporter)
+    embedded = _verify(
+        conn, version_id, unit_count, len(pages), settings, reporter, reader.root
+    )
 
     reporter.start("activating_version", "Activating the new version")
     activate_version(conn, version_id)
@@ -679,6 +685,7 @@ def _verify(
     expected_pages: int,
     settings: Settings,
     reporter: ProgressReporter,
+    root: Path,
 ) -> int:
     """The gate between a built version and a queryable one.
 
@@ -741,6 +748,27 @@ def _verify(
         raise IngestionError(f"{uncited} citable units have no region to highlight")
     passed(4, "Citation paths verified")
 
+    _verify_artifacts(conn, version_id, root)
+    passed(5, "Artifact containment verified")
+
+    unordered = conn.execute(
+        """
+        SELECT count(*) AS n FROM evidence_unit
+        WHERE version_id = %s AND (source_order IS NULL
+              OR (citable AND kind IN ('table_row', 'table_value')
+                  AND context_key IS NULL))
+        """,
+        (version_id,),
+    ).fetchone()["n"]
+    if unordered:
+        # Without a complete source order, context expansion silently falls
+        # back to insertion order, which is the bug this replaces rather than a
+        # graceful degradation of it.
+        raise IngestionError(
+            f"{unordered} units have no source order or no context key"
+        )
+    passed(6, "Source order verified")
+
     unembedded = conn.execute(
         """
         SELECT count(*) AS n FROM evidence_unit
@@ -750,7 +778,7 @@ def _verify(
     ).fetchone()["n"]
     if unembedded:
         raise IngestionError(f"{unembedded} embeddable units have no embedding")
-    passed(5, "Embedding coverage verified")
+    passed(7, "Embedding coverage verified")
 
     wrong = conn.execute(
         """
@@ -764,7 +792,7 @@ def _verify(
         raise IngestionError(
             f"{wrong} stored embeddings are not {settings.embed_dimensions}-dimensional"
         )
-    passed(6, "Embedding dimension verified")
+    passed(8, "Embedding dimension verified")
 
     crossed = conn.execute(
         """
@@ -782,6 +810,58 @@ def _verify(
         "building_indexes", "Index checks passed", completed=total, total=total
     )
     return int(counts["embedded"])
+
+
+def _verify_artifacts(conn: psycopg.Connection, version_id: int, root: Path) -> None:
+    """Every citable unit must point at a real file inside the extraction root.
+
+    Run before activation, not at render time. A citation whose artifact is
+    missing or escapes the root is not a degraded citation -- it is one the
+    product cannot show the user, and shipping it means the verdict claims
+    provenance it cannot produce on request.
+    """
+    rows = conn.execute(
+        """
+        SELECT DISTINCT e.artifact_path, p.page_dir
+        FROM evidence_unit e JOIN page p ON p.id = e.page_id
+        WHERE e.version_id = %s AND e.citable
+        """,
+        (version_id,),
+    ).fetchall()
+
+    missing: list[str] = []
+    escaping: list[str] = []
+    for row in rows:
+        relative = str(row["artifact_path"] or "")
+        if not relative:
+            missing.append("(unset)")
+            continue
+        candidate = Path(relative)
+        if candidate.is_absolute() or candidate.anchor:
+            escaping.append(relative)
+            continue
+        resolved = (root / candidate).resolve()
+        if root != resolved and root not in resolved.parents:
+            escaping.append(relative)
+        elif not resolved.is_file():
+            missing.append(relative)
+    if escaping:
+        # The offending value is not echoed: it is attacker-controlled input in
+        # the case that matters, and naming it hands back a filesystem probe.
+        raise IngestionError(
+            f"{len(escaping)} evidence artifact path(s) escape the extraction root"
+        )
+    if missing:
+        raise IngestionError(
+            f"{len(missing)} evidence artifact(s) do not exist: {sorted(set(missing))[:5]}"
+        )
+
+    # Page images are what a visual citation is cropped from, so a page whose
+    # image is gone cannot support one.
+    for page_dir in {str(row["page_dir"]) for row in rows}:
+        image = (root / page_dir / PAGE_ARTIFACT_ROLES["page_image"]).resolve()
+        if root not in image.parents or not image.is_file():
+            raise IngestionError(f"page directory {page_dir} has no usable page image")
 
 
 def ensure_schema(conn: psycopg.Connection, settings: Settings) -> str:

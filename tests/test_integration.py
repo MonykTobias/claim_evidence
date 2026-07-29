@@ -62,10 +62,117 @@ def check(condition: bool, message: str) -> None:
     print(f"[ok] {message}")
 
 
+# --- pytest-visible activation checks ---------------------------------------
+#
+# The rest of this file is a sequenced end-to-end script driven by main(). These
+# few are written as independent pytest cases because activation is the gate the
+# lean plan verifies by name, and a gate is worth being able to run on its own.
+
+
+def _database_available() -> bool:
+    try:
+        with psycopg.connect(ADMIN_URL, connect_timeout=3):
+            return True
+    except psycopg.OperationalError:
+        return False
+
+
+def _ingest_into_a_fresh_database(root: Path):
+    import pytest
+
+    if not _database_available():
+        pytest.skip("PostgreSQL is not reachable; run `docker compose up -d`")
+    reset_database()
+    client = make_client(default_session())
+    client.init_db()
+    return client
+
+
+def test_activation_refuses_a_missing_evidence_artifact(tmp_path: Path) -> None:
+    """A citation the product cannot show is not a citation."""
+    from claim_evidence.ingest import IngestionError, _verify_artifacts
+
+    root = build_root(tmp_path / "missing-artifact")
+    client = _ingest_into_a_fresh_database(root)
+    try:
+        report = client.ingest_document(root, source_uri="urn:missing-artifact")
+        assert report.status is VersionStatus.READY
+
+        # The artifact a stored unit names disappears -- a partially deleted
+        # output directory, which is the realistic way this happens.
+        (root / "blocks.jsonl").unlink()
+        try:
+            _verify_artifacts(client.conn, report.version_id, Path(root))
+        except IngestionError as exc:
+            assert "blocks.jsonl" in str(exc), exc
+        else:
+            raise AssertionError("a missing evidence artifact must block activation")
+    finally:
+        client.close()
+
+
+def test_a_document_without_narrative_blocks_cites_no_narrative(tmp_path: Path) -> None:
+    """Absent source data produces no evidence, never an unresolvable citation."""
+    root = write_output_root(
+        tmp_path / "no-blocks", pages=1, blocks=[], tables={1: [kpi_table()]}
+    )
+    client = _ingest_into_a_fresh_database(root)
+    try:
+        report = client.ingest_document(root, source_uri="urn:no-blocks")
+        assert report.status is VersionStatus.READY
+        narrative = client.conn.execute(
+            "SELECT count(*) AS n FROM evidence_unit"
+            " WHERE version_id = %s AND kind = 'narrative'",
+            (report.version_id,),
+        ).fetchone()["n"]
+        assert narrative == 0, "no narrative units without narrative blocks"
+    finally:
+        client.close()
+
+
+def test_activation_refuses_an_artifact_outside_the_extraction_root(
+    tmp_path: Path,
+) -> None:
+    """Containment is checked before activation, not at render time."""
+    from claim_evidence.ingest import IngestionError
+    from claim_evidence.source import OutputReader, page_units
+
+    root = build_root(tmp_path / "escaping")
+    client = _ingest_into_a_fresh_database(root)
+    try:
+        report = client.ingest_document(root, source_uri="urn:escaping")
+        assert report.status is VersionStatus.READY
+
+        # Point one stored unit at a file outside the root and re-run the gate
+        # directly: this is the state a tampered or buggy producer would leave.
+        from claim_evidence.ingest import _verify_artifacts
+
+        client.conn.execute(
+            """
+            UPDATE evidence_unit SET artifact_path = %s
+            WHERE id = (SELECT min(id) FROM evidence_unit WHERE version_id = %s
+                        AND citable)
+            """,
+            ("../outside/secrets.txt", report.version_id),
+        )
+        client.conn.commit()
+        try:
+            _verify_artifacts(client.conn, report.version_id, Path(root))
+        except IngestionError as exc:
+            assert "escape" in str(exc)
+            assert "secrets.txt" not in str(exc), (
+                "the escaping path is not echoed back to the caller"
+            )
+        else:
+            raise AssertionError("an escaping artifact path must be refused")
+    finally:
+        client.close()
+
+
 # --- harness ----------------------------------------------------------------
 
 
-def test_database_url() -> str:
+def database_url() -> str:
     return ADMIN_URL.rsplit("/", 1)[0] + f"/{TEST_DB}"
 
 
@@ -77,7 +184,7 @@ def reset_database() -> None:
 
 def settings() -> Settings:
     return Settings(
-        database_url=test_database_url(),
+        database_url=database_url(),
         embed_dimensions=DIMENSIONS,
         embed_batch_size=16,
         chat_model="fake-chat",
