@@ -131,7 +131,11 @@ class OllamaClient:
             "messages": [{"role": "system", "content": system}, message],
             "format": gbnf_safe_schema(schema),
             "stream": False,
-            "options": {"temperature": 0},
+            # Bounded context on purpose: the runner otherwise loads the model
+            # at its 64k default and spends the KV cache on room these prompts
+            # never use. Embeddings are untouched -- /api/embed has no such
+            # option, and passing one would be noise at best.
+            "options": {"temperature": 0, "num_ctx": self.settings.num_ctx},
         }
 
         last_error: Exception | None = None

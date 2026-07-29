@@ -45,10 +45,19 @@ ollama pull qwen3-embedding:4b
 | `CLAIM_EVIDENCE_VISION_MODEL` | same as the chat model |
 | `CLAIM_EVIDENCE_EMBED_BATCH_SIZE` | `32` |
 | `CLAIM_EVIDENCE_REQUEST_TIMEOUT` | `600` |
+| `CLAIM_EVIDENCE_NUM_CTX` | `16384` |
 
 Point `CLAIM_EVIDENCE_DATABASE_URL` at a managed instance to skip Compose
 entirely. The embedding dimension is templated into the schema at `db init`, so
 changing the model means re-running `db init` on a fresh database.
+
+`CLAIM_EVIDENCE_NUM_CTX` is the context window for chat and vision requests;
+embeddings are unaffected, since `/api/embed` has no such option. Every
+structured call this package makes is bounded — one evidence passage for fact
+extraction, at most `MAX_PASSAGES` × `PASSAGE_CHARS` for adjudication — so the
+model's 64k default buys nothing and spends KV-cache memory that would
+otherwise hold model layers on the GPU. Raise it only for prompts measured to
+need it.
 
 An unreachable database raises `DependencyUnavailableError` after
 `CLAIM_EVIDENCE_DATABASE_CONNECT_TIMEOUT` rather than blocking on the operating

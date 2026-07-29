@@ -16,6 +16,11 @@ DEFAULT_DATABASE_URL = (
 )
 DEFAULT_DATABASE_CONNECT_TIMEOUT = 10.0
 DEFAULT_BUILD_STALE_MINUTES = 60.0
+# Every structured call this package makes is bounded: one evidence passage for
+# fact extraction, at most 15 passages of 800 characters for adjudication. The
+# model's 64k default buys nothing for prompts that size and costs KV-cache
+# memory that would otherwise hold model layers on the GPU.
+DEFAULT_NUM_CTX = 16384
 DEFAULT_OLLAMA_BASE_URL = "http://localhost:11434"
 DEFAULT_EMBED_MODEL = "qwen3-embedding:4b"
 DEFAULT_EMBED_DIMENSIONS = 1024
@@ -42,6 +47,8 @@ class Settings:
     # with narrative facts is legitimately slow, and calling live work dead is
     # worse than reporting a dead build late.
     build_stale_minutes: float = DEFAULT_BUILD_STALE_MINUTES
+    # Context window for chat and vision requests. Embeddings are unaffected.
+    num_ctx: int = DEFAULT_NUM_CTX
 
     def __post_init__(self) -> None:
         # Validated for every construction path, not just from_env(), and the
@@ -50,8 +57,10 @@ class Settings:
             ("CLAIM_EVIDENCE_DATABASE_CONNECT_TIMEOUT", self.database_connect_timeout),
             ("CLAIM_EVIDENCE_BUILD_STALE_MINUTES", self.build_stale_minutes),
         ):
-            if not isinstance(value, (int, float)) or value <= 0:
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
                 raise ValidationError(f"{variable} must be a positive number")
+        if isinstance(self.num_ctx, bool) or not isinstance(self.num_ctx, int) or self.num_ctx <= 0:
+            raise ValidationError("CLAIM_EVIDENCE_NUM_CTX must be a positive integer")
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -66,6 +75,7 @@ class Settings:
             build_stale_minutes=_positive_float(
                 "CLAIM_EVIDENCE_BUILD_STALE_MINUTES", DEFAULT_BUILD_STALE_MINUTES
             ),
+            num_ctx=_positive_int("CLAIM_EVIDENCE_NUM_CTX", DEFAULT_NUM_CTX),
             ollama_base_url=os.environ.get(
                 "OLLAMA_BASE_URL", DEFAULT_OLLAMA_BASE_URL
             ).rstrip("/"),
@@ -107,9 +117,20 @@ def _positive_float(variable: str, default: float) -> float:
         raise ValidationError(f"{variable} must be a positive number") from None
 
 
+def _positive_int(variable: str, default: int) -> int:
+    raw = os.environ.get(variable)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        raise ValidationError(f"{variable} must be a positive integer") from None
+
+
 __all__ = [
     "DEFAULT_BUILD_STALE_MINUTES",
     "DEFAULT_DATABASE_CONNECT_TIMEOUT",
     "DEFAULT_DATABASE_URL",
+    "DEFAULT_NUM_CTX",
     "Settings",
 ]
