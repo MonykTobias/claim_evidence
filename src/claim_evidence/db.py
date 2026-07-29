@@ -25,7 +25,7 @@ from .models import EvidenceUnit, Fact, VersionStatus
 
 SQL_DIR = Path(__file__).parent / "sql"
 EMBED_DIM_TOKEN = "EMBED_DIM"
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 def connect(
