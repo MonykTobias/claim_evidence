@@ -14,7 +14,14 @@ import psycopg
 
 from .audit import audit_claim as _audit_claim
 from .config import Settings
-from .db import connect, delete_document, document_scope, ready_documents
+from .db import (
+    connect,
+    delete_document,
+    document_scope,
+    queryable_version,
+    ready_documents,
+    reconcile_interrupted,
+)
 from .errors import IndexNotReadyError, NotFoundError, ValidationError
 from .facts import heuristic_claim
 from .frontend import (
@@ -25,7 +32,7 @@ from .frontend import (
     health,
     list_documents,
 )
-from .ingest import ensure_schema, ingest_document
+from .ingest import ensure_schema, ingest_document, retry_failed_facts
 from .models import (
     AuditTrace,
     ClaimResult,
@@ -148,6 +155,35 @@ class ClaimEvidence:
             extract_narrative_facts=extract_narrative_facts,
             progress=progress,
         )
+
+    def retry_facts(self, document_id: int | str) -> IngestReport:
+        """Re-run only the narrative fact candidates that failed.
+
+        Evidence, provenance, and embeddings are left exactly as they are: they
+        are already correct, and rebuilding them to recover a handful of
+        optional facts is minutes of work to fix seconds of it. A version whose
+        last failure clears is promoted from degraded back to ready.
+        """
+        identifier = as_id(document_id, "document_id")
+        version = queryable_version(self.conn, identifier)
+        if version is None:
+            raise IndexNotReadyError(
+                f"document {identifier} has no queryable version to retry"
+            )
+        return retry_failed_facts(
+            self.conn, self.ollama, self.settings, int(version["id"])
+        )
+
+    def reconcile_interrupted(self) -> dict[str, int]:
+        """Mark work left running by a dead process as interrupted.
+
+        Call once at startup. Never invents a completed or failed outcome for
+        work whose end nobody saw, and never touches data that is already
+        queryable.
+        """
+        counts = reconcile_interrupted(self.conn)
+        self.conn.commit()
+        return counts
 
     # --- query --------------------------------------------------------------
 

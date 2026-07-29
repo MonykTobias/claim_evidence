@@ -121,9 +121,21 @@ class Verdict(StrEnum):
 
 
 class VersionStatus(StrEnum):
+    """Where one build got to.
+
+    ``degraded`` is queryable: evidence, provenance, and embeddings are all
+    complete and only optional narrative fact enrichment is missing, which
+    makes for a smaller index rather than a wrong one. ``interrupted`` is what
+    a build that was still running when its process died becomes -- it is not
+    ``failed``, because nobody observed it fail.
+    """
+
     BUILDING = "building"
     READY = "ready"
+    DEGRADED = "degraded"
+    FAILED = "failed"
     INACTIVE = "inactive"
+    INTERRUPTED = "interrupted"
 
 
 class Region(PublicModel):
@@ -353,9 +365,22 @@ class IngestReport(PublicModel):
     visual_evidence_units: int = 0
     embedded_units: int = 0
     facts: int = 0
+    # How much of the optional narrative enrichment landed. `degraded` is these
+    # two numbers disagreeing, not a judgement call, and the failed keys are
+    # what a targeted retry re-processes.
+    fact_candidates_total: int = 0
+    fact_candidates_succeeded: int = 0
+    failed_fact_candidates: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
     skipped_artifacts: list[str] = Field(default_factory=list)
     rejected_facts: list[str] = Field(default_factory=list)
+
+    @property
+    def fact_coverage(self) -> float | None:
+        """Fraction of requested candidates that produced facts, or None."""
+        if not self.fact_candidates_total:
+            return None
+        return round(self.fact_candidates_succeeded / self.fact_candidates_total, 4)
 
 
 def phase_percent(completed: int | None, total: int | None) -> float | None:
@@ -425,13 +450,18 @@ class HealthReport(PublicModel):
     schema_embedding_dimensions: int | None = None
     configured_embedding_dimensions: int | None = None
     documents_ready: int = 0
+    # Queryable, with some optional narrative fact coverage missing. Counted
+    # separately from `ready` so "usable" and "complete" stay distinguishable.
+    documents_degraded: int = 0
     # Recently active builds only. A build whose process died cannot write its
     # own failure, so it is classified by silence instead: still 'building'
-    # with no progress for longer than the stale threshold is 'interrupted'.
+    # with no progress for longer than the stale threshold is 'interrupted',
+    # as is anything startup reconciliation has already marked so.
     documents_building: int = 0
     documents_failed: int = 0
     documents_interrupted: int = 0
     documents_inactive: int = 0
+    audits_interrupted: int = 0
     # The queryable index: rows belonging to a ready version, which is exactly
     # what retrieval can reach. Historical rows from failed, superseded and
     # half-built versions are counted separately.

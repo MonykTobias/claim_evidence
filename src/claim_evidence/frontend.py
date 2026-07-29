@@ -98,10 +98,12 @@ def health(
                 )
             counts = index_counts(conn, settings.build_stale_minutes)
             report.documents_ready = counts["ready"]
+            report.documents_degraded = counts["degraded"]
             report.documents_building = counts["building"]
             report.documents_failed = counts["failed"]
             report.documents_interrupted = counts["interrupted"]
             report.documents_inactive = counts["inactive"]
+            report.audits_interrupted = counts["interrupted_audits"]
             report.evidence_units = counts["evidence"]
             report.embeddings = counts["embeddings"]
             report.facts = counts["facts"]

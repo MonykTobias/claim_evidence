@@ -21,15 +21,20 @@ from document_extract.contracts import PAGE_ARTIFACT_ROLES
 
 from .config import Settings
 from .db import (
+    QUERYABLE_STATUSES,
     activate_version,
     add_alias,
+    clear_fact_failures,
     delete_facts,
     delete_stale_pages,
+    failed_fact_candidates,
     find_version,
     init_schema,
     mark_version_failed,
     note_progress,
+    record_fact_failure,
     set_embeddings,
+    set_fact_coverage,
     start_version,
     units_missing_embeddings,
     upsert_document,
@@ -60,7 +65,12 @@ from .models import (
 )
 from .progress import ProgressCallback, ProgressReporter, classify_error
 from .normalize import NORMALIZATION_VERSION, normalize_for_match
-from .errors import ClaimEvidenceError, IndexNotReadyError, ValidationError
+from .errors import (
+    ClaimEvidenceError,
+    IndexNotReadyError,
+    NotFoundError,
+    ValidationError,
+)
 from .ollama import OllamaClient, OllamaError
 from .source import OutputReader, canonical_digest, page_units, sha256_file
 
@@ -356,18 +366,27 @@ def _ingest(
     )
     reporter.document_id = document_id
     existing = find_version(conn, document_id, fingerprint)
-    if existing and existing["status"] == VersionStatus.READY and not force:
-        # Same source, same embedding model: nothing to rebuild. Report the
-        # stored counts anyway, so a no-op run does not read as an empty one.
+    # Reuse requires an exact fingerprint *and* a queryable state. A degraded
+    # version qualifies -- rebuilding it from scratch would re-derive identical
+    # evidence to chase the same optional facts; `retry_facts` is the cheaper
+    # and more targeted way to finish it.
+    if existing and existing["status"] in QUERYABLE_STATUSES and not force:
+        version_id = int(existing["id"])
+        failed_keys = [
+            row["unit_key"] for row in failed_fact_candidates(conn, version_id)
+        ]
         report = IngestReport(
             document_id=document_id,
-            version_id=int(existing["id"]),
-            status=VersionStatus.READY,
+            version_id=version_id,
+            status=VersionStatus(existing["status"]),
             fingerprint=fingerprint,
             reused_existing=True,
             pages=len(pages),
+            fact_candidates_total=int(existing["fact_candidates_total"]),
+            fact_candidates_succeeded=int(existing["fact_candidates_succeeded"]),
+            failed_fact_candidates=failed_keys,
             warnings=reader.warnings,
-            **_stored_counts(conn, int(existing["id"])),
+            **_stored_counts(conn, version_id),
         )
         reporter.done(
             "completed",
@@ -451,16 +470,38 @@ def _ingest(
         conn, version_id, unit_count, len(pages), settings, reporter, reader.root
     )
 
+    # PD-06: evidence, provenance, and embeddings are required and have all
+    # passed by now. Narrative facts are enrichment, so a partial failure among
+    # them is `degraded` -- queryable, with the shortfall counted -- rather than
+    # a failed build or, worse, a `ready` one that quietly holds fewer facts
+    # than it should and gets reused as if it were complete.
+    failed_keys = [row["unit_key"] for row in failed_fact_candidates(conn, version_id)]
+    status = VersionStatus.DEGRADED if failed_keys else VersionStatus.READY
+
     reporter.start("activating_version", "Activating the new version")
-    activate_version(conn, version_id)
+    activate_version(conn, version_id, str(status))
     conn.commit()
-    reporter.done("activating_version", "Version activated", completed=1, total=1)
+    reporter.done(
+        "activating_version",
+        f"Version activated as {status}",
+        completed=1,
+        total=1,
+    )
+
+    coverage = conn.execute(
+        "SELECT fact_candidates_total AS total, fact_candidates_succeeded AS ok"
+        " FROM document_version WHERE id = %s",
+        (version_id,),
+    ).fetchone()
 
     report = IngestReport(
         document_id=document_id,
         version_id=version_id,
-        status=VersionStatus.READY,
+        status=status,
         fingerprint=fingerprint,
+        fact_candidates_total=int(coverage["total"]),
+        fact_candidates_succeeded=int(coverage["ok"]),
+        failed_fact_candidates=failed_keys,
         pages=len(pages),
         evidence_units=unit_count,
         visual_evidence_units=sum(
@@ -616,6 +657,7 @@ def _build_facts(
         )
         return stored, rejected
 
+    succeeded = 0
     for index, unit in enumerate(candidates, start=1):
         try:
             extraction = client.structured(
@@ -624,7 +666,12 @@ def _build_facts(
                 fact_extraction_prompt(unit, subject),
             )
         except OllamaError:
-            # One passage the model could not process is not a failed index.
+            # One passage the model could not process is not a failed index --
+            # but it is not a silent success either. The key and a category are
+            # recorded so a retry can process exactly this candidate again; the
+            # passage and the model's error text are not stored.
+            record_fact_failure(conn, version_id, unit.unit_key, "model_unavailable")
+            conn.commit()
             reader.warnings.append(f"fact extraction failed for {unit.unit_key}")
             reporter.warn(
                 "extracting_facts", "A passage could not be processed by the model"
@@ -634,6 +681,8 @@ def _build_facts(
         rejected.extend(dropped)
         for fact in kept:
             stored += _store_fact(conn, version_id, fact, subject_entity, evidence_ids)
+        succeeded += 1
+        clear_fact_failures(conn, version_id, [unit.unit_key])
         note_progress(conn, version_id)
         conn.commit()
         reporter.step(
@@ -644,9 +693,11 @@ def _build_facts(
             current_item=unit.unit_key,
         )
 
+    set_fact_coverage(conn, version_id, total=len(candidates), succeeded=succeeded)
+    conn.commit()
     reporter.done(
         "extracting_facts",
-        f"Stored {stored} facts",
+        f"Stored {stored} facts from {succeeded} of {len(candidates)} passages",
         completed=len(candidates),
         total=len(candidates),
     )
@@ -812,6 +863,135 @@ def _verify(
     return int(counts["embedded"])
 
 
+def retry_failed_facts(
+    conn: psycopg.Connection,
+    client: OllamaClient,
+    settings: Settings,
+    version_id: int,
+    *,
+    progress: ProgressCallback | None = None,
+) -> IngestReport:
+    """Re-run fact extraction for the candidates that failed, and only those.
+
+    Evidence, provenance, and embeddings are already correct and expensive; a
+    retry that rebuilt them would spend minutes re-deriving identical rows to
+    fix a handful of missing facts. The version is read out of the database
+    rather than re-derived from the source, so nothing here depends on the
+    extraction output still being byte-identical.
+    """
+    reporter = ProgressReporter(progress, "ingest")
+    version = conn.execute(
+        "SELECT v.*, d.name FROM document_version v"
+        " JOIN document d ON d.id = v.document_id WHERE v.id = %s",
+        (version_id,),
+    ).fetchone()
+    if version is None:
+        raise NotFoundError(f"no document version with id {version_id}")
+    reporter.document_id = int(version["document_id"])
+
+    pending = failed_fact_candidates(conn, version_id)
+    reporter.start("extracting_facts", "Retrying failed passages", total=len(pending))
+    subject = organization_name(version["name"], None)
+    subject_entity = upsert_entity(
+        conn, "organization", subject, normalized_name(subject)
+    )
+
+    stored = succeeded = 0
+    for index, row in enumerate(pending, start=1):
+        unit = conn.execute(
+            "SELECT id, unit_key, source_text, heading_path FROM evidence_unit"
+            " WHERE version_id = %s AND unit_key = %s",
+            (version_id, row["unit_key"]),
+        ).fetchone()
+        if unit is None:
+            # The unit no longer exists, so neither does the candidate. Nothing
+            # to retry and nothing to keep reporting as outstanding.
+            clear_fact_failures(conn, version_id, [row["unit_key"]])
+            conn.commit()
+            continue
+        candidate = EvidenceUnit(
+            unit_key=unit["unit_key"],
+            page=0,
+            kind=EvidenceKind.NARRATIVE,
+            text=unit["source_text"],
+            normalized_text=normalize_for_match(unit["source_text"]),
+            heading_path=list(unit["heading_path"] or []),
+        )
+        try:
+            extraction = client.structured(
+                FactExtraction,
+                FACT_EXTRACTION_SYSTEM,
+                fact_extraction_prompt(candidate, subject),
+            )
+        except OllamaError:
+            record_fact_failure(
+                conn, version_id, row["unit_key"], "model_unavailable"
+            )
+            conn.commit()
+            reporter.warn(
+                "extracting_facts", "A passage could not be processed by the model"
+            )
+            continue
+        kept, _dropped = accept_llm_facts(extraction.facts, candidate, subject)
+        for fact in kept:
+            stored += _store_fact(
+                conn, version_id, fact, subject_entity,
+                {candidate.unit_key: int(unit["id"])},
+            )
+        succeeded += 1
+        clear_fact_failures(conn, version_id, [row["unit_key"]])
+        conn.commit()
+        reporter.step(
+            "extracting_facts",
+            f"Retried {index} of {len(pending)} passages",
+            completed=index,
+            total=len(pending),
+            current_item=row["unit_key"],
+        )
+
+    remaining = [r["unit_key"] for r in failed_fact_candidates(conn, version_id)]
+    conn.execute(
+        "UPDATE document_version"
+        "   SET fact_candidates_succeeded = fact_candidates_succeeded + %s"
+        " WHERE id = %s",
+        (succeeded, version_id),
+    )
+    # Promotion is the point of the retry: a version whose last failure is gone
+    # is complete, and must stop reporting itself as degraded.
+    status = VersionStatus.DEGRADED if remaining else VersionStatus.READY
+    if str(version["status"]) in QUERYABLE_STATUSES:
+        activate_version(conn, version_id, str(status))
+    conn.commit()
+
+    coverage = conn.execute(
+        "SELECT fact_candidates_total AS total, fact_candidates_succeeded AS ok"
+        " FROM document_version WHERE id = %s",
+        (version_id,),
+    ).fetchone()
+    counts = _stored_counts(conn, version_id)
+    report = IngestReport(
+        document_id=int(version["document_id"]),
+        version_id=version_id,
+        status=status,
+        fingerprint=version["fingerprint"],
+        pages=conn.execute(
+            "SELECT count(*) AS n FROM page WHERE version_id = %s", (version_id,)
+        ).fetchone()["n"],
+        fact_candidates_total=int(coverage["total"]),
+        fact_candidates_succeeded=int(coverage["ok"]),
+        failed_fact_candidates=remaining,
+        **counts,
+    )
+    reporter.done(
+        "completed",
+        f"Retried {len(pending)} passages; {len(remaining)} still failing",
+        completed=1,
+        total=1,
+        details=_completion_details(report, reporter),
+    )
+    return report
+
+
 def _verify_artifacts(conn: psycopg.Connection, version_id: int, root: Path) -> None:
     """Every citable unit must point at a real file inside the extraction root.
 
@@ -898,4 +1078,5 @@ __all__ = [
     "index_fingerprint",
     "normalize_source_uri",
     "ingest_document",
+    "retry_failed_facts",
 ]

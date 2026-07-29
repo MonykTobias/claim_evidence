@@ -1,8 +1,11 @@
 """PostgreSQL access layer.
 
-Versioned SQL files run directly; there is no ORM and no migration framework.
-Every read path filters on ``document_version.status = 'ready'``, which is what
-keeps an interrupted build invisible to queries rather than partially visible.
+One schema file runs directly; there is no ORM and no migration framework.
+Every read path filters on the *queryable* statuses, which is what keeps a
+half-built version invisible to queries rather than partially visible. A
+version is queryable when it is ``ready`` or ``degraded`` -- degraded means its
+evidence and embeddings are complete and only optional narrative facts are
+missing, which is a smaller index, not a wrong one.
 """
 
 from __future__ import annotations
@@ -289,7 +292,7 @@ def find_version(
         """
         SELECT * FROM document_version
         WHERE document_id = %s AND fingerprint = %s
-        ORDER BY (status = 'ready') DESC, attempt DESC
+        ORDER BY (status IN ('ready', 'degraded')) DESC, attempt DESC
         LIMIT 1
         """,
         (document_id, fingerprint),
@@ -356,21 +359,149 @@ def start_version(
     return int(row["id"])
 
 
-def activate_version(conn: psycopg.Connection, version_id: int) -> None:
-    """Flip one version to ready and retire the others in the same transaction."""
+def activate_version(
+    conn: psycopg.Connection, version_id: int, status: str = "ready"
+) -> None:
+    """Flip one version to a queryable status and retire the others.
+
+    One transaction, so there is never a moment with two queryable versions of
+    a document or none. ``degraded`` activates exactly like ``ready``: its
+    evidence and embeddings are complete, so it must answer queries -- refusing
+    to activate it would lose a usable index over missing optional enrichment.
+    """
+    if status not in QUERYABLE_STATUSES:
+        raise ValueError(f"cannot activate a version as {status!r}")
     with conn.transaction():
         conn.execute(
             """
             UPDATE document_version SET status = 'inactive'
             WHERE document_id = (SELECT document_id FROM document_version WHERE id = %s)
-              AND id <> %s AND status = 'ready'
+              AND id <> %s AND status IN ('ready', 'degraded')
             """,
             (version_id, version_id),
         )
         conn.execute(
-            "UPDATE document_version SET status = 'ready', ready_at = now() WHERE id = %s",
-            (version_id,),
+            "UPDATE document_version SET status = %s, ready_at = now() WHERE id = %s",
+            (status, version_id),
         )
+
+
+# --- fact coverage and targeted retry ---------------------------------------
+
+
+def set_fact_coverage(
+    conn: psycopg.Connection, version_id: int, *, total: int, succeeded: int
+) -> None:
+    """Record how much of the optional narrative enrichment landed."""
+    conn.execute(
+        """
+        UPDATE document_version
+           SET fact_candidates_total = %s, fact_candidates_succeeded = %s
+         WHERE id = %s
+        """,
+        (int(total), int(succeeded), version_id),
+    )
+
+
+def record_fact_failure(
+    conn: psycopg.Connection, version_id: int, unit_key: str, reason_code: str
+) -> None:
+    """Remember which candidate failed, and why, in codes only.
+
+    The passage is not stored and neither is the model's error text: a retry
+    needs the key to re-read the unit from the index, and a person needs a
+    category. Anything more would be source text and vendor output sitting in
+    a table that public surfaces read.
+    """
+    conn.execute(
+        """
+        INSERT INTO fact_candidate_failure (version_id, unit_key, reason_code)
+        VALUES (%s, %s, %s)
+        ON CONFLICT (version_id, unit_key) DO UPDATE
+            SET reason_code = EXCLUDED.reason_code, recorded_at = now()
+        """,
+        (version_id, unit_key, reason_code),
+    )
+
+
+def clear_fact_failures(
+    conn: psycopg.Connection, version_id: int, unit_keys: Sequence[str] = ()
+) -> int:
+    """Forget failures for these candidates, or for all of them."""
+    if unit_keys:
+        return conn.execute(
+            "DELETE FROM fact_candidate_failure WHERE version_id = %s"
+            " AND unit_key = ANY(%s)",
+            (version_id, list(unit_keys)),
+        ).rowcount
+    return conn.execute(
+        "DELETE FROM fact_candidate_failure WHERE version_id = %s", (version_id,)
+    ).rowcount
+
+
+def failed_fact_candidates(
+    conn: psycopg.Connection, version_id: int
+) -> list[dict[str, Any]]:
+    """The evidence units whose fact extraction failed, ready to retry."""
+    return conn.execute(
+        """
+        SELECT f.unit_key, f.reason_code, e.id AS evidence_id
+        FROM fact_candidate_failure f
+        LEFT JOIN evidence_unit e
+               ON e.version_id = f.version_id AND e.unit_key = f.unit_key
+        WHERE f.version_id = %s
+        ORDER BY f.unit_key
+        """,
+        (version_id,),
+    ).fetchall()
+
+
+def queryable_version(
+    conn: psycopg.Connection, document_id: int
+) -> dict[str, Any] | None:
+    return conn.execute(
+        f"""
+        SELECT * FROM document_version
+        WHERE document_id = %s AND status IN ({_QUERYABLE_LIST})
+        ORDER BY id DESC LIMIT 1
+        """,
+        (document_id,),
+    ).fetchone()
+
+
+# --- honest reconciliation --------------------------------------------------
+
+
+def reconcile_interrupted(conn: psycopg.Connection) -> dict[str, int]:
+    """Mark work that was still running when the process died as interrupted.
+
+    Called once at startup, when nothing of ours is running by definition, so
+    anything still ``building`` or ``running`` belongs to a process that is
+    gone. It becomes ``interrupted`` -- never ``failed``, which would claim an
+    outcome nobody observed, and never ``completed``, which would be a lie.
+
+    Ready and degraded versions are untouched: an interrupted *replacement*
+    must not disturb the version that is still serving queries.
+    """
+    with conn.transaction():
+        builds = conn.execute(
+            """
+            UPDATE document_version
+               SET status = 'interrupted', failed_at = now(),
+                   failure_code = 'interrupted', failure_phase = 'unknown'
+             WHERE status = 'building'
+            """
+        ).rowcount
+        audits = conn.execute(
+            """
+            UPDATE audit_run
+               SET status = 'interrupted', failed_at = now(),
+                   failure_code = 'interrupted', failure_phase = 'unknown',
+                   retryable = true
+             WHERE status = 'running'
+            """
+        ).rowcount
+    return {"builds": int(builds), "audits": int(audits)}
 
 
 def version_status(conn: psycopg.Connection, version_id: int) -> VersionStatus:
@@ -659,7 +790,11 @@ _EVIDENCE_FROM = """
 
 _EVIDENCE_SELECT = f"SELECT {_EVIDENCE_COLUMNS} {_EVIDENCE_FROM}"
 
-_READY = "v.status = 'ready'"
+# Evidence and embeddings are complete in both; only optional narrative fact
+# coverage separates them, so both answer queries.
+QUERYABLE_STATUSES = ("ready", "degraded")
+_QUERYABLE_LIST = ", ".join(f"'{s}'" for s in QUERYABLE_STATUSES)
+_READY = f"v.status IN ({_QUERYABLE_LIST})"
 
 
 def _document_filter(document_ids: Sequence[int] | None) -> tuple[str, list[Any]]:
@@ -855,7 +990,7 @@ def document_scope(
     """
     version = """
         SELECT id, embed_model, embed_dim FROM document_version
-        WHERE document_id = d.id AND status = 'ready'
+        WHERE document_id = d.id AND status IN ('ready', 'degraded')
         ORDER BY id DESC LIMIT 1
     """
     if document_ids is None:
@@ -884,7 +1019,7 @@ def ready_documents(conn: psycopg.Connection) -> list[dict[str, Any]]:
         """
         SELECT d.id, d.name, d.sha256, v.id AS version_id, v.ready_at
         FROM document d JOIN document_version v ON v.document_id = d.id
-        WHERE v.status = 'ready' ORDER BY d.id
+        WHERE v.status IN ('ready', 'degraded') ORDER BY d.id
         """
     ).fetchall()
 
@@ -1038,8 +1173,11 @@ def _default(value: Any) -> Any:
 
 
 __all__ = [
+    "QUERYABLE_STATUSES",
     "activate_version",
     "add_alias",
+    "clear_fact_failures",
+    "failed_fact_candidates",
     "connect",
     "create_audit",
     "delete_facts",
@@ -1057,10 +1195,14 @@ __all__ = [
     "neighbours",
     "normalize_embedding",
     "note_progress",
+    "queryable_version",
     "ready_documents",
+    "reconcile_interrupted",
     "record_candidates",
+    "record_fact_failure",
     "regions_for",
     "set_embeddings",
+    "set_fact_coverage",
     "start_version",
     "units_missing_embeddings",
     "upsert_document",
@@ -1094,30 +1236,35 @@ def schema_state(conn: psycopg.Connection) -> tuple[int | None, str | None]:
 def index_counts(conn: psycopg.Connection, stale_minutes: float) -> dict[str, int]:
     """Version states and the totals retrieval can actually reach.
 
-    Evidence, embedding and fact counts are restricted to ready versions: every
-    read path filters on ``status = 'ready'``, so a total that included a failed
-    or superseded version would describe storage rather than the index, and
-    would go up when a build broke. ``stored_evidence_units`` keeps the
-    historical figure for diagnostics.
+    Evidence, embedding and fact counts are restricted to queryable versions:
+    every read path filters on those, so a total that included a failed or
+    superseded version would describe storage rather than the index, and would
+    go up when a build broke. ``stored_evidence_units`` keeps the historical
+    figure for diagnostics.
 
-    A stale build is reported, never rewritten -- ``health()`` is a read.
+    A build still marked ``building`` with no recent progress is reported as
+    interrupted, never rewritten -- ``health()`` is a read, and the write is
+    ``reconcile_interrupted`` at startup.
     """
     row = conn.execute(
-        """
+        f"""
         SELECT
             (SELECT count(*) FROM document_version WHERE status = 'ready')    AS ready,
+            (SELECT count(*) FROM document_version WHERE status = 'degraded') AS degraded,
             (SELECT count(*) FROM document_version
               WHERE status = 'building' AND last_progress_at >= %(cutoff)s)   AS building,
             (SELECT count(*) FROM document_version
-              WHERE status = 'building' AND last_progress_at < %(cutoff)s)    AS interrupted,
+              WHERE status = 'interrupted'
+                 OR (status = 'building' AND last_progress_at < %(cutoff)s))  AS interrupted,
             (SELECT count(*) FROM document_version WHERE status = 'failed')   AS failed,
             (SELECT count(*) FROM document_version WHERE status = 'inactive') AS inactive,
             (SELECT count(*) FROM evidence_unit e JOIN document_version v ON v.id = e.version_id
-              WHERE v.status = 'ready')                                       AS evidence,
+              WHERE v.status IN ({_QUERYABLE_LIST}))                          AS evidence,
             (SELECT count(*) FROM evidence_unit e JOIN document_version v ON v.id = e.version_id
-              WHERE v.status = 'ready' AND e.embedding IS NOT NULL)           AS embeddings,
+              WHERE v.status IN ({_QUERYABLE_LIST}) AND e.embedding IS NOT NULL) AS embeddings,
             (SELECT count(*) FROM fact f JOIN document_version v ON v.id = f.version_id
-              WHERE v.status = 'ready')                                       AS facts,
+              WHERE v.status IN ({_QUERYABLE_LIST}))                          AS facts,
+            (SELECT count(*) FROM audit_run WHERE status = 'interrupted')     AS interrupted_audits,
             (SELECT count(*) FROM evidence_unit)                              AS stored_evidence
         """,
         {"cutoff": datetime.now(timezone.utc) - timedelta(minutes=stale_minutes)},
@@ -1199,7 +1346,7 @@ def document_summaries(
     return conn.execute(
         f"""
         SELECT DISTINCT ON (document_id) * FROM ({_DOCUMENT_SUMMARY}{clause}) s
-        ORDER BY document_id, (status = 'ready') DESC, version_id DESC
+        ORDER BY document_id, (status IN ('ready', 'degraded')) DESC, version_id DESC
         """,
         params,
     ).fetchall()
