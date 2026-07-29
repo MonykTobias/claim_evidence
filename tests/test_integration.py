@@ -988,6 +988,218 @@ def check_explanation_carries_no_model_text(tmp: Path) -> None:
             check(secret not in blob, f"persisted explanation omits {secret[:32]!r}")
 
 
+# --- M-2: a failed build says so; health counts what can be queried ---------
+
+
+def check_failed_build_is_recorded_and_isolated(tmp: Path) -> None:
+    root = build_root(tmp / "failing")
+    with make_client(default_session()) as client:
+        ready = client.ingest_document(root, source_uri="urn:failing")
+        check(ready.status is VersionStatus.READY, "the first build is ready")
+
+    import claim_evidence.ingest as ingest_module
+
+    original = ingest_module._verify
+    ingest_module._verify = lambda *a, **k: (_ for _ in ()).throw(
+        ingest_module.IngestionError("simulated failure")
+    )
+    try:
+        with make_client(default_session()) as client:
+            try:
+                client.ingest_document(root, source_uri="urn:failing", force=True)
+            except ingest_module.IngestionError:
+                pass
+            else:
+                raise AssertionError("the forced rebuild should have failed")
+    finally:
+        ingest_module._verify = original
+
+    with make_client(default_session()) as client:
+        rows = client.conn.execute(
+            "SELECT id, status, failure_code, failure_phase, failed_at"
+            " FROM document_version WHERE document_id = %s ORDER BY id",
+            (ready.document_id,),
+        ).fetchall()
+        failed = [r for r in rows if r["status"] == "failed"]
+        check(len(failed) == 1, f"exactly one version is marked failed ({len(failed)})")
+        check(failed[0]["failure_code"] == "internal_error", "a safe failure code is stored")
+        check(bool(failed[0]["failure_phase"]), "the failing phase is stored")
+        check(failed[0]["failed_at"] is not None, "the failure is timestamped")
+        check(
+            "simulated failure" not in json.dumps(dict(failed[0]), default=str),
+            "the raw exception text is not stored",
+        )
+
+        still = client.conn.execute(
+            "SELECT status FROM document_version WHERE id = %s", (ready.version_id,)
+        ).fetchone()["status"]
+        check(still == "ready", "the previous ready version is untouched")
+        hits = client.search_evidence(SUPPORTED, document_ids=[ready.document_id])
+        check(bool(hits), "and still answers queries")
+        check(
+            all(m.citation.document_id == ready.document_id for m in hits),
+            "a failed version contributes no evidence to retrieval",
+        )
+
+        # The document is still ready, so a plain re-run is a no-op and the
+        # failed forced attempt stays on the record as what it was.
+        again = client.ingest_document(root, source_uri="urn:failing", force=False)
+        check(again.reused_existing, "a ready document is still a no-op after a failed rebuild")
+
+
+def check_retrying_a_failed_first_build_clears_its_failure(tmp: Path) -> None:
+    """No ready version to fall back on: the retry reopens the failed attempt."""
+    root = build_root(tmp / "retry")
+    import claim_evidence.ingest as ingest_module
+
+    original = ingest_module._verify
+    ingest_module._verify = lambda *a, **k: (_ for _ in ()).throw(
+        ingest_module.IngestionError("simulated failure")
+    )
+    try:
+        with make_client(default_session()) as client:
+            try:
+                client.ingest_document(root, source_uri="urn:retry")
+            except ingest_module.IngestionError:
+                pass
+            else:
+                raise AssertionError("the first build should have failed")
+    finally:
+        ingest_module._verify = original
+
+    with make_client(default_session()) as client:
+        before = client.conn.execute(
+            "SELECT id, status, failure_code FROM document_version"
+            " WHERE fingerprint IN (SELECT fingerprint FROM document_version"
+            "   WHERE output_root = %s) ORDER BY id DESC LIMIT 1",
+            (str(Path(root).resolve()),),
+        ).fetchone()
+        check(before["status"] == "failed", "the first attempt is marked failed")
+
+        report = client.ingest_document(root, source_uri="urn:retry")
+        check(report.status is VersionStatus.READY, "the retry reaches ready")
+        check(
+            report.version_id == int(before["id"]),
+            "the retry reopens the same attempt rather than orphaning it",
+        )
+        after = client.conn.execute(
+            "SELECT status, failure_code, failure_phase, failed_at"
+            " FROM document_version WHERE id = %s",
+            (before["id"],),
+        ).fetchone()
+        check(after["status"] == "ready", "and it is ready")
+        check(
+            after["failure_code"] is None
+            and after["failure_phase"] is None
+            and after["failed_at"] is None,
+            "the previous failure metadata was cleared, not left to contradict it",
+        )
+
+
+def check_health_counts_only_the_queryable_index(tmp: Path) -> None:
+    with make_client(default_session()) as client:
+        report = client.health()
+        check(report.database_reachable, "database reachable")
+        check(report.schema_current, f"schema is current ({report.problems})")
+        check(
+            report.schema_embedding_dimensions == report.configured_embedding_dimensions
+            == DIMENSIONS,
+            "health reports both embedding dimensions",
+        )
+
+        ready_units = client.conn.execute(
+            "SELECT count(*) AS n FROM evidence_unit e"
+            " JOIN document_version v ON v.id = e.version_id WHERE v.status = 'ready'"
+        ).fetchone()["n"]
+        stored = client.conn.execute(
+            "SELECT count(*) AS n FROM evidence_unit"
+        ).fetchone()["n"]
+        check(report.evidence_units == ready_units, "evidence total is the ready total")
+        check(report.stored_evidence_units == stored, "stored total is reported separately")
+        check(
+            stored > ready_units,
+            f"the two differ once a build failed ({stored} stored, {ready_units} ready)",
+        )
+
+
+def check_stale_build_reports_as_interrupted(tmp: Path) -> None:
+    root = build_root(tmp / "stale")
+    with make_client(default_session()) as client:
+        document_id = client.conn.execute(
+            "INSERT INTO document (name, identity_key) VALUES ('stale', 'k-stale')"
+            " RETURNING id"
+        ).fetchone()["id"]
+        version_id = client.conn.execute(
+            "INSERT INTO document_version"
+            " (document_id, fingerprint, embed_model, embed_dim, output_root)"
+            " VALUES (%s, 'fp-stale', 'fake', %s, %s) RETURNING id",
+            (document_id, DIMENSIONS, str(root)),
+        ).fetchone()["id"]
+        client.conn.commit()
+
+        fresh = client.health()
+        check(fresh.documents_building >= 1, "a just-started build counts as building")
+        check(fresh.documents_interrupted == 0, "and is not called interrupted")
+
+        client.conn.execute(
+            "UPDATE document_version SET last_progress_at = now() - interval '2 hours'"
+            " WHERE id = %s",
+            (version_id,),
+        )
+        client.conn.commit()
+
+        stale = client.health()
+        check(stale.documents_interrupted >= 1, "a silent build counts as interrupted")
+        check(
+            stale.documents_building == fresh.documents_building - 1,
+            "and no longer counts as actively building",
+        )
+        status = client.conn.execute(
+            "SELECT status FROM document_version WHERE id = %s", (version_id,)
+        ).fetchone()["status"]
+        check(status == "building", "health classified it without mutating the row")
+
+        client.conn.execute("DELETE FROM document WHERE id = %s", (document_id,))
+        client.conn.commit()
+
+
+# --- M-5: a mismatched vector column is not a healthy database --------------
+
+
+def check_embedding_dimension_mismatch_is_detected(tmp: Path) -> None:
+    from dataclasses import replace
+
+    config = settings()
+    widened = replace(config, embed_dimensions=DIMENSIONS + 4)
+    with ClaimEvidence(widened, connect(config.database_url), OllamaClient(widened, default_session())) as client:
+        try:
+            client.init_db()
+        except IndexNotReadyError as exc:
+            message = str(exc)
+            check(str(DIMENSIONS) in message and str(DIMENSIONS + 4) in message,
+                  f"both dimensions are named ({message})")
+            check("postgresql://" not in message, "no connection string is exposed")
+        else:
+            raise AssertionError("a dimension mismatch was accepted")
+
+        report = client.health()
+        check(report.database_reachable, "the database is still reported reachable")
+        check(not report.schema_current, "but the schema is not current")
+        check(
+            report.schema_embedding_dimensions == DIMENSIONS
+            and report.configured_embedding_dimensions == DIMENSIONS + 4,
+            "health reports the declared and configured dimensions",
+        )
+        check(
+            any("does not match configured" in p for p in report.problems),
+            f"and explains the mismatch ({report.problems})",
+        )
+
+    with make_client(default_session()) as client:
+        client.init_db()
+        check(client.health().schema_current, "the configured dimension still initializes")
+
+
 def _visual_ids(payload: dict[str, Any]) -> list[int]:
     import re
 
@@ -1028,6 +1240,11 @@ def main() -> int:
         check_vague_claim_explains_the_scope_gap,
         check_explanation_round_trips_through_the_trace,
         check_explanation_carries_no_model_text,
+        check_failed_build_is_recorded_and_isolated,
+        check_retrying_a_failed_first_build_clears_its_failure,
+        check_health_counts_only_the_queryable_index,
+        check_stale_build_reports_as_interrupted,
+        check_embedding_dimension_mismatch_is_detected,
         check_document_scope_is_validated,
         check_invalid_scope_costs_nothing,
         # Last: it empties the index the checks above rely on.

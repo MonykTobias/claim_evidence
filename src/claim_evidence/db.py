@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import json
 import math
+import re
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Iterable, Sequence
@@ -147,9 +149,13 @@ def start_version(
         ).fetchone()
         attempt = int(row["a"] or 0) + 1
     else:
+        # A failed attempt is resumable: retrying it is the documented recovery
+        # path, and reusing the row keeps its half-built evidence for H-4
+        # reconciliation instead of orphaning it under a new attempt number.
         row = conn.execute(
             "SELECT attempt FROM document_version"
-            " WHERE document_id = %s AND fingerprint = %s AND status = 'building'"
+            " WHERE document_id = %s AND fingerprint = %s"
+            "   AND status IN ('building', 'failed')"
             " ORDER BY attempt DESC LIMIT 1",
             (document_id, fingerprint),
         ).fetchone()
@@ -163,7 +169,11 @@ def start_version(
              source_pdf, attempt)
         VALUES (%s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (document_id, fingerprint, attempt) DO UPDATE
-            SET status = 'building', ready_at = NULL
+            SET status = 'building', ready_at = NULL,
+                -- A retry is building again, so last time's verdict on it is
+                -- stale; leaving it would report a live build as failed.
+                failed_at = NULL, failure_code = NULL, failure_phase = NULL,
+                last_progress_at = now()
         RETURNING id
         """,
         (document_id, fingerprint, embed_model, embed_dim, output_root,
@@ -800,8 +810,10 @@ __all__ = [
     "graph_search",
     "init_schema",
     "lexical_search",
+    "mark_version_failed",
     "neighbours",
     "normalize_embedding",
+    "note_progress",
     "ready_documents",
     "record_candidates",
     "regions_for",
@@ -813,6 +825,7 @@ __all__ = [
     "upsert_evidence",
     "upsert_fact",
     "upsert_page",
+    "vector_dimension",
     "vector_search",
     "version_status",
 ]
@@ -835,19 +848,89 @@ def schema_state(conn: psycopg.Connection) -> tuple[int | None, str | None]:
     return version, (extension["extversion"] if extension else None)
 
 
-def index_counts(conn: psycopg.Connection) -> dict[str, int]:
+def index_counts(conn: psycopg.Connection, stale_minutes: float) -> dict[str, int]:
+    """Version states and the totals retrieval can actually reach.
+
+    Evidence, embedding and fact counts are restricted to ready versions: every
+    read path filters on ``status = 'ready'``, so a total that included a failed
+    or superseded version would describe storage rather than the index, and
+    would go up when a build broke. ``stored_evidence_units`` keeps the
+    historical figure for diagnostics.
+
+    A stale build is reported, never rewritten -- ``health()`` is a read.
+    """
     row = conn.execute(
         """
         SELECT
             (SELECT count(*) FROM document_version WHERE status = 'ready')    AS ready,
-            (SELECT count(*) FROM document_version WHERE status = 'building') AS building,
+            (SELECT count(*) FROM document_version
+              WHERE status = 'building' AND last_progress_at >= %(cutoff)s)   AS building,
+            (SELECT count(*) FROM document_version
+              WHERE status = 'building' AND last_progress_at < %(cutoff)s)    AS interrupted,
+            (SELECT count(*) FROM document_version WHERE status = 'failed')   AS failed,
             (SELECT count(*) FROM document_version WHERE status = 'inactive') AS inactive,
-            (SELECT count(*) FROM evidence_unit)                              AS evidence,
-            (SELECT count(*) FROM evidence_unit WHERE embedding IS NOT NULL)  AS embeddings,
-            (SELECT count(*) FROM fact)                                       AS facts
-        """
+            (SELECT count(*) FROM evidence_unit e JOIN document_version v ON v.id = e.version_id
+              WHERE v.status = 'ready')                                       AS evidence,
+            (SELECT count(*) FROM evidence_unit e JOIN document_version v ON v.id = e.version_id
+              WHERE v.status = 'ready' AND e.embedding IS NOT NULL)           AS embeddings,
+            (SELECT count(*) FROM fact f JOIN document_version v ON v.id = f.version_id
+              WHERE v.status = 'ready')                                       AS facts,
+            (SELECT count(*) FROM evidence_unit)                              AS stored_evidence
+        """,
+        {"cutoff": datetime.now(timezone.utc) - timedelta(minutes=stale_minutes)},
     ).fetchone()
     return {k: int(v) for k, v in row.items()}
+
+
+def mark_version_failed(
+    conn: psycopg.Connection, version_id: int, code: str, phase: str
+) -> None:
+    """Record why a build stopped, on that building version only.
+
+    Never touches a ready or inactive version: a replacement that fails must
+    leave whatever is serving exactly as it was. The stored values are the
+    progress reporter's own safe code and phase names -- no driver text, no
+    model reply, no ``str(exc)``.
+    """
+    with conn.transaction():
+        conn.execute(
+            """
+            UPDATE document_version
+               SET status = 'failed', failed_at = now(),
+                   failure_code = %s, failure_phase = %s
+             WHERE id = %s AND status = 'building'
+            """,
+            (code, phase, version_id),
+        )
+
+
+def note_progress(conn: psycopg.Connection, version_id: int) -> None:
+    """Stamp a durable milestone so silence can be told from slowness."""
+    conn.execute(
+        "UPDATE document_version SET last_progress_at = now()"
+        " WHERE id = %s AND status = 'building'",
+        (version_id,),
+    )
+
+
+def vector_dimension(conn: psycopg.Connection) -> int | None:
+    """The dimension ``evidence_unit.embedding`` is actually declared with.
+
+    Read from the catalog, not from a stored vector: an empty database has no
+    vector to sample and still has to be checkable before the first write.
+    """
+    row = conn.execute(
+        """
+        SELECT format_type(a.atttypid, a.atttypmod) AS declared
+        FROM pg_attribute a
+        WHERE a.attrelid = to_regclass('evidence_unit')
+          AND a.attname = 'embedding' AND NOT a.attisdropped
+        """
+    ).fetchone()
+    if not row or not row["declared"]:
+        return None
+    match = re.search(r"\((\d+)\)", row["declared"])
+    return int(match.group(1)) if match else None
 
 
 _DOCUMENT_SUMMARY = """

@@ -24,6 +24,7 @@ from .db import (
     index_counts,
     regions_for,
     schema_state,
+    vector_dimension,
 )
 from .errors import IndexNotReadyError, NotFoundError, ValidationError
 from .models import (
@@ -82,13 +83,29 @@ def health(
                 report.problems.append(
                     f"schema version {version} is older than {SCHEMA_VERSION}; run db init"
                 )
-            counts = index_counts(conn)
+            report.configured_embedding_dimensions = settings.embed_dimensions
+            declared = vector_dimension(conn)
+            report.schema_embedding_dimensions = declared
+            if declared is not None and declared != settings.embed_dimensions:
+                # Reachable, initialized, and unusable: every embedding written
+                # from here would be the wrong width, so this is a readiness
+                # failure rather than a warning.
+                report.schema_current = False
+                report.problems.append(
+                    f"database vector dimension {declared} does not match configured "
+                    f"dimension {settings.embed_dimensions}; use a fresh database or "
+                    f"an explicit full reindex migration"
+                )
+            counts = index_counts(conn, settings.build_stale_minutes)
             report.documents_ready = counts["ready"]
             report.documents_building = counts["building"]
+            report.documents_failed = counts["failed"]
+            report.documents_interrupted = counts["interrupted"]
             report.documents_inactive = counts["inactive"]
             report.evidence_units = counts["evidence"]
             report.embeddings = counts["embeddings"]
             report.facts = counts["facts"]
+            report.stored_evidence_units = counts["stored_evidence"]
         except psycopg.Error:
             conn.rollback()
             # The driver message can carry the host and user; report the class.
@@ -284,7 +301,10 @@ def _existing(path: Path) -> str | None:
 
 def require_ready(conn: psycopg.Connection) -> None:
     """Fail with a typed error rather than returning a confidently empty result."""
-    if not index_counts(conn)["ready"]:
+    ready = conn.execute(
+        "SELECT count(*) AS n FROM document_version WHERE status = 'ready'"
+    ).fetchone()["n"]
+    if not ready:
         raise IndexNotReadyError("no ready document version; ingest a document first")
 
 

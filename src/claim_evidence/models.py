@@ -321,14 +321,23 @@ class HealthReport(BaseModel):
     pgvector_version: str | None = None
     ollama_reachable: bool = False
     models: list[ModelHealth] = Field(default_factory=list)
+    schema_embedding_dimensions: int | None = None
+    configured_embedding_dimensions: int | None = None
     documents_ready: int = 0
-    # A build that failed or was interrupted stays 'building'; there is no
-    # separate failed state, because nothing is alive to write one.
+    # Recently active builds only. A build whose process died cannot write its
+    # own failure, so it is classified by silence instead: still 'building'
+    # with no progress for longer than the stale threshold is 'interrupted'.
     documents_building: int = 0
+    documents_failed: int = 0
+    documents_interrupted: int = 0
     documents_inactive: int = 0
+    # The queryable index: rows belonging to a ready version, which is exactly
+    # what retrieval can reach. Historical rows from failed, superseded and
+    # half-built versions are counted separately.
     evidence_units: int = 0
     embeddings: int = 0
     facts: int = 0
+    stored_evidence_units: int = 0
     problems: list[str] = Field(default_factory=list)
 
     @property

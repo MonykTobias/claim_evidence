@@ -37,6 +37,7 @@ ollama pull qwen3-embedding:4b
 |---|---|
 | `CLAIM_EVIDENCE_DATABASE_URL` | `postgresql://claim_evidence:claim_evidence@localhost:5433/claim_evidence` |
 | `CLAIM_EVIDENCE_DATABASE_CONNECT_TIMEOUT` | `10` (seconds) |
+| `CLAIM_EVIDENCE_BUILD_STALE_MINUTES` | `60` |
 | `OLLAMA_BASE_URL` | `http://localhost:11434` |
 | `CLAIM_EVIDENCE_EMBED_MODEL` | `qwen3-embedding:4b` |
 | `CLAIM_EVIDENCE_EMBED_DIMENSIONS` | `1024` |
@@ -278,6 +279,7 @@ rules. Everything it needs is on the client:
 client.initialize_database()          # idempotent schema + health report
 client.health()                       # database, schema, pgvector, models, counts
 
+
 client.list_documents()               # -> list[DocumentSummary]
 client.get_document(document_id)
 client.remove_document(document_id, confirm_document_id=document_id)
@@ -287,6 +289,37 @@ client.get_evidence(evidence_id)      # -> EvidenceDetail
 ```
 
 Ids may be passed as `int` or `str`; anything else raises `ValidationError`.
+
+### Build states and health totals
+
+A version is `building`, `ready`, `inactive`, or `failed`. When ingestion
+raises, that building version is marked `failed` with a safe `failure_code` and
+`failure_phase` — never `str(exc)` — and an older `ready` version is left
+exactly as it was. Retrying reopens the same failed attempt and clears its
+failure metadata first, so a live build is never described by last time's
+verdict.
+
+A killed process cannot write its own failure, so `health()` classifies it by
+silence instead: still `building` with no progress for longer than
+`CLAIM_EVIDENCE_BUILD_STALE_MINUTES` is reported as `documents_interrupted`.
+That is a read — `health()` never mutates a row.
+
+```text
+documents_ready  documents_building  documents_failed
+documents_interrupted  documents_inactive
+```
+
+`evidence_units`, `embeddings`, and `facts` count only rows belonging to a
+`ready` version: that is the queryable index, and a total that grew when a build
+broke would describe storage instead. `stored_evidence_units` keeps the
+historical figure for diagnostics.
+
+`schema_embedding_dimensions` and `configured_embedding_dimensions` are both
+reported. `vector(N)` is templated in only when the table is first created, so
+re-initializing an existing database at a different dimension would otherwise
+leave the old column in place; a mismatch fails `db init` with
+`IndexNotReadyError` before the first embedding write and makes `health()`
+not-current while PostgreSQL stays reachable.
 
 ### Errors
 

@@ -15,6 +15,7 @@ DEFAULT_DATABASE_URL = (
     "postgresql://claim_evidence:claim_evidence@localhost:5433/claim_evidence"
 )
 DEFAULT_DATABASE_CONNECT_TIMEOUT = 10.0
+DEFAULT_BUILD_STALE_MINUTES = 60.0
 DEFAULT_OLLAMA_BASE_URL = "http://localhost:11434"
 DEFAULT_EMBED_MODEL = "qwen3-embedding:4b"
 DEFAULT_EMBED_DIMENSIONS = 1024
@@ -36,16 +37,21 @@ class Settings:
     # unreachable host must fail in seconds rather than on the OS network
     # timeout with the browser spinning.
     database_connect_timeout: float = DEFAULT_DATABASE_CONNECT_TIMEOUT
+    # How long a version may sit in 'building' with no recorded progress before
+    # health calls it interrupted. Conservative on purpose: a 494-page ingest
+    # with narrative facts is legitimately slow, and calling live work dead is
+    # worse than reporting a dead build late.
+    build_stale_minutes: float = DEFAULT_BUILD_STALE_MINUTES
 
     def __post_init__(self) -> None:
         # Validated for every construction path, not just from_env(), and the
         # message names the variable rather than echoing the database URL.
-        timeout = self.database_connect_timeout
-        if not isinstance(timeout, (int, float)) or timeout <= 0:
-            raise ValidationError(
-                "CLAIM_EVIDENCE_DATABASE_CONNECT_TIMEOUT must be a positive "
-                "number of seconds"
-            )
+        for variable, value in (
+            ("CLAIM_EVIDENCE_DATABASE_CONNECT_TIMEOUT", self.database_connect_timeout),
+            ("CLAIM_EVIDENCE_BUILD_STALE_MINUTES", self.build_stale_minutes),
+        ):
+            if not isinstance(value, (int, float)) or value <= 0:
+                raise ValidationError(f"{variable} must be a positive number")
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -56,6 +62,9 @@ class Settings:
             database_connect_timeout=_positive_float(
                 "CLAIM_EVIDENCE_DATABASE_CONNECT_TIMEOUT",
                 DEFAULT_DATABASE_CONNECT_TIMEOUT,
+            ),
+            build_stale_minutes=_positive_float(
+                "CLAIM_EVIDENCE_BUILD_STALE_MINUTES", DEFAULT_BUILD_STALE_MINUTES
             ),
             ollama_base_url=os.environ.get(
                 "OLLAMA_BASE_URL", DEFAULT_OLLAMA_BASE_URL
@@ -95,10 +104,11 @@ def _positive_float(variable: str, default: float) -> float:
     except ValueError:
         # Never echo the value: an operator can paste a URL into the wrong
         # variable, and the error goes to a browser.
-        raise ValidationError(f"{variable} must be a positive number of seconds") from None
+        raise ValidationError(f"{variable} must be a positive number") from None
 
 
 __all__ = [
+    "DEFAULT_BUILD_STALE_MINUTES",
     "DEFAULT_DATABASE_CONNECT_TIMEOUT",
     "DEFAULT_DATABASE_URL",
     "Settings",

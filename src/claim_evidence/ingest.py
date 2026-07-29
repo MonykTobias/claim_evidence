@@ -9,10 +9,13 @@ checks pass, so a half-built index is never visible to a query.
 from __future__ import annotations
 
 import hashlib
+import logging
 from pathlib import Path
 from typing import Any, Sequence
 
 import psycopg
+
+log = logging.getLogger(__name__)
 
 from .config import Settings
 from .db import (
@@ -22,6 +25,8 @@ from .db import (
     delete_stale_pages,
     find_version,
     init_schema,
+    mark_version_failed,
+    note_progress,
     set_embeddings,
     start_version,
     units_missing_embeddings,
@@ -30,6 +35,7 @@ from .db import (
     upsert_evidence,
     upsert_fact,
     upsert_page,
+    vector_dimension,
 )
 from .facts import (
     FACT_EXTRACTION_SYSTEM,
@@ -48,9 +54,9 @@ from .models import (
     IngestReport,
     VersionStatus,
 )
-from .progress import ProgressCallback, ProgressReporter
+from .progress import ProgressCallback, ProgressReporter, classify_error
 from .normalize import normalize_for_match
-from .errors import ClaimEvidenceError
+from .errors import ClaimEvidenceError, IndexNotReadyError
 from .ollama import OllamaClient, OllamaError
 from .source import OutputReader, page_units
 
@@ -125,6 +131,9 @@ def ingest_document(
     progress: ProgressCallback | None = None,
 ) -> IngestReport:
     reporter = ProgressReporter(progress, "ingest")
+    # Set once a version exists, so a failure before that point has nothing to
+    # mark and a failure after it marks exactly one row.
+    building: list[int] = []
     try:
         return _ingest(
             conn,
@@ -136,12 +145,33 @@ def ingest_document(
             force=force,
             extract_narrative_facts=extract_narrative_facts,
             reporter=reporter,
+            building=building,
         )
     except BaseException as exc:
         # One safe terminal event, then the original error reaches the caller
         # unchanged. A failed version is never activated.
         reporter.fail(exc)
+        if building:
+            _record_failure(conn, building[0], exc, reporter.phase)
         raise
+
+
+def _record_failure(
+    conn: psycopg.Connection, version_id: int, exc: BaseException, phase: str
+) -> None:
+    """Persist why the build stopped, without ever masking the original error.
+
+    The exception on its way out is the caller's answer; a database that is
+    itself unhappy must not replace it with a second, less useful one.
+    """
+    code, _retryable, _message = classify_error(exc)
+    try:
+        # The failing statement may have poisoned the transaction; a rollback
+        # is what makes the status write possible at all.
+        conn.rollback()
+        mark_version_failed(conn, version_id, code, phase or "unknown")
+    except Exception:  # noqa: BLE001 - never mask the original failure
+        log.exception("could not record the failure of version %s", version_id)
 
 
 def _ingest(
@@ -155,6 +185,7 @@ def _ingest(
     force: bool,
     extract_narrative_facts: bool,
     reporter: ProgressReporter,
+    building: list[int],
 ) -> IngestReport:
     reader = OutputReader(output_root)
     reporter.start("validating_input", "Validating the extraction output")
@@ -212,6 +243,7 @@ def _ingest(
         source_pdf=str(source_pdf_path) if source_pdf_path else None,
         force=force,
     )
+    building.append(version_id)
 
     subject = organization_name(document_name, source_uri)
     subject_entity = upsert_entity(conn, "organization", subject, normalized_name(subject))
@@ -231,6 +263,7 @@ def _ingest(
             conn, version_id, page.page, page.width, page.height, page.rel
         )
         evidence_ids.update(upsert_evidence(conn, version_id, page_id, units))
+        note_progress(conn, version_id)
         conn.commit()
         all_units.extend(units)
         unit_count += len(units)
@@ -372,6 +405,8 @@ def _embed_pending(
         chunk = pending[start : start + size]
         vectors = client.embed([row["normalized_text"] or " " for row in chunk])
         set_embeddings(conn, [(int(r["id"]), v) for r, v in zip(chunk, vectors)])
+        note_progress(conn, version_id)
+        conn.commit()
         embedded += len(chunk)
         reporter.step(
             "embedding_evidence",
@@ -452,6 +487,7 @@ def _build_facts(
         rejected.extend(dropped)
         for fact in kept:
             stored += _store_fact(conn, version_id, fact, subject_entity, evidence_ids)
+        note_progress(conn, version_id)
         conn.commit()
         reporter.step(
             "extracting_facts",
@@ -608,7 +644,23 @@ def _verify(
 
 
 def ensure_schema(conn: psycopg.Connection, settings: Settings) -> None:
+    """Apply the schema, then refuse to proceed on a dimension mismatch.
+
+    ``vector(N)`` is templated in only when the table is first created, so
+    re-initializing an existing database with a different configured dimension
+    silently leaves the old column in place. Caught here, before the first
+    embedding write, rather than at query time on a half-built index.
+    """
     init_schema(conn, settings.embed_dimensions)
+    declared = vector_dimension(conn)
+    if declared is not None and declared != settings.embed_dimensions:
+        # Not altered automatically: rewriting a populated vector column
+        # discards every embedding in the database.
+        raise IndexNotReadyError(
+            f"database vector dimension {declared} does not match configured "
+            f"dimension {settings.embed_dimensions}; use a fresh database or an "
+            f"explicit full reindex migration"
+        )
 
 
 __all__ = [
