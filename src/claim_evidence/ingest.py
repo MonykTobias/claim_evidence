@@ -58,7 +58,7 @@ from .progress import ProgressCallback, ProgressReporter, classify_error
 from .normalize import normalize_for_match
 from .errors import ClaimEvidenceError, IndexNotReadyError
 from .ollama import OllamaClient, OllamaError
-from .source import OutputReader, page_units
+from .source import OutputReader, page_units, sha256_file
 
 # Table values are reached through their row, their fact, and lexical search.
 # Embedding 11k near-identical "(40.2) %" strings buys nothing semantically and
@@ -91,18 +91,22 @@ VERIFY_STEPS = (
 
 
 def identity_key(
-    root: Path, sha256: str | None, source_uri: str | None
+    root: Path, pdf_token: str | None, source_uri: str | None
 ) -> str:
     """The document's internal identity: hash of a namespace-tagged basis.
 
-    Strongest available source wins -- the PDF's content hash, then a logical
-    source URI, then the canonical output root. The tag is inside the hash so
-    a URI and a path that happen to read the same are still different
-    documents. `root` is already resolved, which on Windows also settles its
-    casing, so there is nothing left to normalize here.
+    Strongest available source wins -- the PDF, then a logical source URI, then
+    the canonical output root. The tag is inside the hash so a URI and a path
+    that happen to read the same are still different documents. `root` is
+    already resolved, which on Windows also settles its casing.
+
+    ``pdf_token`` is `OutputReader.legacy_pdf_token`, not the public source
+    SHA. It is deliberately the pre-M-3 representation: identity has to stay
+    put across that change, or every already-indexed PDF becomes a second
+    document the day its hash is corrected.
     """
-    if sha256 is not None:
-        basis = f"pdf:{sha256}"
+    if pdf_token is not None:
+        basis = f"pdf:{pdf_token}"
     elif source_uri:
         basis = f"uri:{source_uri}"
     else:
@@ -110,9 +114,20 @@ def identity_key(
     return hashlib.sha256(basis.encode("utf-8")).hexdigest()
 
 
-def index_fingerprint(source_fingerprint: str, settings: Settings) -> str:
-    """Bind the index identity to the embedding model as well as the source."""
-    digest = hashlib.sha256(source_fingerprint.encode())
+def index_fingerprint(
+    source_sha256: str | None, extraction_sha256: str, settings: Settings
+) -> str:
+    """What this version was built from, as one value.
+
+    Tagged components, so a PDF hash and an extraction hash cannot be confused
+    for one another: the same bytes in a different role must give a different
+    fingerprint. Changing the source, the extraction output, or the embedding
+    configuration all invalidate the version -- which is the point, because
+    each of them changes what the index would contain.
+    """
+    digest = hashlib.sha256()
+    digest.update(f"pdf:{source_sha256 or ''}".encode())
+    digest.update(f"\x1fextraction:{extraction_sha256}".encode())
     for part in settings.index_fingerprint_parts:
         digest.update(b"\x1f" + part.encode())
     return digest.hexdigest()
@@ -199,15 +214,23 @@ def _ingest(
 
     source_pdf_path = Path(source_pdf) if source_pdf else None
     document_name = (source_pdf_path or reader.root).name
-    sha256 = reader.fingerprint(source_pdf_path) if source_pdf_path else None
-    fingerprint = index_fingerprint(reader.fingerprint(source_pdf_path), settings)
+    # Three identities, deliberately not one value doing three jobs: the public
+    # source hash anyone can verify with `sha256sum`, the private identity token
+    # H-3 keyed documents on, and the fingerprint of everything this version was
+    # built from. Without a PDF the source hash is null rather than quietly
+    # holding an output fingerprint under a field named for the source.
+    source_sha256 = sha256_file(source_pdf_path) if source_pdf_path else None
+    pdf_token = reader.legacy_pdf_token(source_pdf_path) if source_pdf_path else None
+    fingerprint = index_fingerprint(
+        source_sha256, reader.extraction_fingerprint(), settings
+    )
 
     document_id = upsert_document(
         conn,
         document_name,
-        sha256,
+        source_sha256,
         source_uri,
-        identity_key(reader.root, sha256, source_uri),
+        identity_key(reader.root, pdf_token, source_uri),
     )
     reporter.document_id = document_id
     existing = find_version(conn, document_id, fingerprint)

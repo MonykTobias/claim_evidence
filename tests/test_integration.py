@@ -587,7 +587,7 @@ def check_resume_reconciles_the_building_version(tmp: Path) -> None:
         # Seed an attempt that died before activation, holding stale text, a
         # unit the source no longer produces, a page that is gone, and a fact
         # built from all of it.
-        fingerprint = index_fingerprint(reader.fingerprint(None), config)
+        fingerprint = index_fingerprint(None, reader.extraction_fingerprint(), config)
         document_id = upsert_document(
             conn, reader.root.name, None, "urn:resume",
             identity_key(reader.root, None, "urn:resume"),
@@ -988,6 +988,92 @@ def check_explanation_carries_no_model_text(tmp: Path) -> None:
             check(secret not in blob, f"persisted explanation omits {secret[:32]!r}")
 
 
+# --- M-3: three identities, none of them standing in for another ------------
+
+
+def check_source_hash_is_the_real_pdf_digest(tmp: Path) -> None:
+    import hashlib
+
+    from claim_evidence.source import sha256_file
+
+    root = build_root(tmp / "hashed")
+    pdf = tmp / "hashed.pdf"
+    pdf.write_bytes(b"%PDF-1.7 " + b"content" * 100)
+    expected = hashlib.sha256(pdf.read_bytes()).hexdigest()
+
+    with make_client(default_session()) as client:
+        report = client.ingest_document(root, source_pdf=pdf)
+        stored = client.conn.execute(
+            "SELECT sha256, identity_key FROM document WHERE id = %s",
+            (report.document_id,),
+        ).fetchone()
+        check(
+            stored["sha256"] == expected == sha256_file(pdf),
+            "source_sha256 is the digest sha256sum reports",
+        )
+        summary = client.get_document(report.document_id)
+        check(summary.source_sha256 == expected, "and it is what the public API returns")
+
+        # Identity stays on the pre-M-3 token so correcting the hash cannot
+        # split an already-indexed PDF into a second document.
+        from claim_evidence.ingest import identity_key
+        from claim_evidence.source import OutputReader
+
+        token = OutputReader(root).legacy_pdf_token(pdf)
+        check(
+            stored["identity_key"] == identity_key(Path(root), token, None),
+            "identity_key still keys on the legacy token",
+        )
+        again = client.ingest_document(root, source_pdf=pdf)
+        check(
+            again.document_id == report.document_id and again.reused_existing,
+            "re-ingesting the same PDF is the same document and a no-op",
+        )
+
+
+def check_improved_extraction_replaces_the_version(tmp: Path) -> None:
+    """Same PDF, better output: a new version of one document, not a new one."""
+    root = build_root(tmp / "improved")
+    pdf = tmp / "improved.pdf"
+    pdf.write_bytes(b"%PDF-1.7 stable")
+
+    with make_client(default_session()) as client:
+        first = client.ingest_document(root, source_pdf=pdf)
+
+        table = Path(root) / "page_0001" / "table_candidates.json"
+        original = table.read_text(encoding="utf-8")
+        table.write_text(original.replace("(40.2) %", "(41.2) %"), encoding="utf-8")
+        check(len(table.read_text(encoding="utf-8")) == len(original), "same file length")
+
+        second = client.ingest_document(root, source_pdf=pdf)
+        check(
+            second.document_id == first.document_id,
+            "an improved extraction is the same logical document",
+        )
+        check(
+            second.version_id != first.version_id and not second.reused_existing,
+            "but a new version, not silently treated as unchanged",
+        )
+        retired = client.conn.execute(
+            "SELECT status FROM document_version WHERE id = %s", (first.version_id,)
+        ).fetchone()["status"]
+        check(retired == "inactive", "the previous version is retired, not deleted")
+
+
+def check_page_image_change_rebuilds_the_version(tmp: Path) -> None:
+    from PIL import Image
+
+    root = build_root(tmp / "repainted")
+    with make_client(default_session()) as client:
+        first = client.ingest_document(root, source_uri="urn:repainted")
+        Image.new("RGB", (600, 800), "black").save(Path(root) / "page_0001" / "page.png")
+        second = client.ingest_document(root, source_uri="urn:repainted")
+        check(
+            second.version_id != first.version_id,
+            "a redrawn page image invalidates the version that cites crops of it",
+        )
+
+
 # --- M-2: a failed build says so; health counts what can be queried ---------
 
 
@@ -1240,6 +1326,9 @@ def main() -> int:
         check_vague_claim_explains_the_scope_gap,
         check_explanation_round_trips_through_the_trace,
         check_explanation_carries_no_model_text,
+        check_source_hash_is_the_real_pdf_digest,
+        check_improved_extraction_replaces_the_version,
+        check_page_image_change_rebuilds_the_version,
         check_failed_build_is_recorded_and_isolated,
         check_retrying_a_failed_first_build_clears_its_failure,
         check_health_counts_only_the_queryable_index,

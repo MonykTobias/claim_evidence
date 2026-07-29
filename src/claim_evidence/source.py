@@ -41,6 +41,10 @@ REQUIRED_PAGE_ARTIFACTS = (
     "table_candidates.json",
     "page_state.json",
 )
+# Everything a page's evidence, geometry, or visual verification depends on.
+# `image_summaries.jsonl` is optional but authoritative where it exists, so it
+# is absorbed as "absent" rather than skipped when it is not there.
+FINGERPRINTED_ARTIFACTS = (*REQUIRED_PAGE_ARTIFACTS, "image_summaries.jsonl")
 # Block text is capped at 500 characters in older runs; `text_full` is the
 # uncapped field and is preferred whenever the producing run emitted it.
 LEGACY_TEXT_CAP = 500
@@ -212,25 +216,39 @@ class OutputReader:
 
     # --- identity -----------------------------------------------------------
 
-    def fingerprint(self, source_pdf: str | Path | None = None) -> str:
-        """Content identity of this extraction.
+    def extraction_fingerprint(self) -> str:
+        """Content identity of this extraction output.
 
-        A source PDF is the strongest identity; without one, hash the manifest,
-        the block sidecar, and the shape of every page's evidence artifacts.
+        Every authoritative artifact is hashed by *content*, streamed, in
+        manifest page order. Hashing sizes instead -- which is what this used to
+        do -- means a re-run that improves a table reconstruction or redraws a
+        page image without changing its length is indistinguishable from no
+        change at all, and the improved extraction is silently never indexed.
+
+        ``page.png`` counts: it is the image visual re-verification crops from,
+        so a changed page image changes what a verdict can be based on.
+
+        Only manifest-listed pages contribute, so a stale directory the
+        manifest has dropped cannot move the fingerprint.
         """
         digest = hashlib.sha256()
-        if source_pdf is not None:
-            digest.update(sha256_file(Path(source_pdf)).encode())
-            return digest.hexdigest()
-        digest.update(sha256_file(self.root / MANIFEST_NAME).encode())
-        blocks = self.root / BLOCKS_NAME
-        if blocks.is_file():
-            digest.update(sha256_file(blocks).encode())
+        _absorb(digest, self.root / MANIFEST_NAME, MANIFEST_NAME)
+        _absorb(digest, self.root / BLOCKS_NAME, BLOCKS_NAME)
         for page in self.validate():
-            for name in REQUIRED_PAGE_ARTIFACTS:
-                artifact = page.artifact(name)
-                digest.update(f"{page.page}/{name}/{artifact.stat().st_size}".encode())
+            for name in FINGERPRINTED_ARTIFACTS:
+                _absorb(digest, page.artifact(name), f"{page.page}/{name}")
         return digest.hexdigest()
+
+    def legacy_pdf_token(self, source_pdf: str | Path) -> str:
+        """The PDF hash representation this package used before M-3.
+
+        A hash *of the hex digest text*, which was never a useful public value
+        -- but `document.identity_key` was derived from it, so recomputing
+        identity on the real digest would split every already-indexed PDF into
+        a second document. Kept for that one purpose and nothing else; the
+        public source hash is :func:`sha256_file`.
+        """
+        return hashlib.sha256(sha256_file(Path(source_pdf)).encode()).hexdigest()
 
     # --- artifacts ----------------------------------------------------------
 
@@ -272,11 +290,27 @@ class OutputReader:
 
 
 def sha256_file(path: Path) -> str:
+    """The file's actual SHA-256, streamed. Verifiable with any standard tool."""
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(1 << 20), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _absorb(digest: "hashlib._Hash", path: Path, label: str) -> None:
+    """Fold one optional file into a running digest, content and all.
+
+    The label goes in first so the same bytes under a different name -- or an
+    artifact that appears and disappears -- cannot leave the digest unchanged.
+    """
+    digest.update(f"\x1f{label}:".encode())
+    if not path.is_file():
+        digest.update(b"absent")
+        return
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
 
 
 def _load_json(path: Path, default: Any) -> Any:
@@ -670,6 +704,7 @@ def page_units(
 
 
 __all__ = [
+    "FINGERPRINTED_ARTIFACTS",
     "NON_CITABLE_KINDS",
     "OutputReader",
     "OutputValidationError",

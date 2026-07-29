@@ -18,6 +18,7 @@ from claim_evidence.source import (  # noqa: E402
     block_text,
     flatten_header,
     page_units,
+    sha256_file,
 )
 
 REAL_ROOT = Path(
@@ -198,19 +199,82 @@ def test_stale_page_directory_ignored() -> None:
         check("page_0009" in reader.skipped, "stale directory reported as skipped")
 
 
-def test_fingerprint_is_stable_and_content_bound() -> None:
+def test_extraction_fingerprint_is_stable_and_content_bound() -> None:
     with tempfile.TemporaryDirectory() as temp:
         root = write_output_root(Path(temp) / "run", pages=2)
-        first = OutputReader(root).fingerprint()
-        check(first == OutputReader(root).fingerprint(), "fingerprint is stable")
+        first = OutputReader(root).extraction_fingerprint()
+        check(first == OutputReader(root).extraction_fingerprint(), "fingerprint is stable")
         (root / "blocks.jsonl").write_text('{"page": 1}', encoding="utf-8")
-        check(OutputReader(root).fingerprint() != first, "content change moves it")
+        check(
+            OutputReader(root).extraction_fingerprint() != first,
+            "a content change moves it",
+        )
 
+
+def test_same_size_artifact_change_moves_the_fingerprint() -> None:
+    """M-3: hashing sizes made an improved re-extraction look like no change."""
+    with tempfile.TemporaryDirectory() as temp:
+        root = write_output_root(Path(temp) / "run", pages=1, tables={1: [kpi_table()]})
+        before = OutputReader(root).extraction_fingerprint()
+
+        tables = root / "page_0001" / "table_candidates.json"
+        original = tables.read_text(encoding="utf-8")
+        tables.write_text(original.replace("(40.2) %", "(40.3) %"), encoding="utf-8")
+        check(
+            len(tables.read_text(encoding="utf-8")) == len(original),
+            "the rewritten table is exactly the same length",
+        )
+        check(
+            OutputReader(root).extraction_fingerprint() != before,
+            "a same-size table change still moves the fingerprint",
+        )
+
+
+def test_page_image_change_moves_the_fingerprint() -> None:
+    """The crop visual re-verification reads is part of the evidence."""
+    from PIL import Image
+
+    with tempfile.TemporaryDirectory() as temp:
+        root = write_output_root(Path(temp) / "run", pages=1)
+        before = OutputReader(root).extraction_fingerprint()
+        Image.new("RGB", (600, 800), "black").save(root / "page_0001" / "page.png")
+        check(
+            OutputReader(root).extraction_fingerprint() != before,
+            "a redrawn page image moves the fingerprint",
+        )
+
+
+def test_stale_directory_does_not_move_the_fingerprint() -> None:
+    with tempfile.TemporaryDirectory() as temp:
+        root = write_output_root(Path(temp) / "run", pages=2)
+        before = OutputReader(root).extraction_fingerprint()
+        stale = root / "page_0009"
+        stale.mkdir()
+        (stale / "docling_final.md").write_text("orphaned", encoding="utf-8")
+        check(
+            OutputReader(root).extraction_fingerprint() == before,
+            "a directory the manifest does not list is not part of the identity",
+        )
+
+
+def test_source_sha256_is_the_real_pdf_digest() -> None:
+    import hashlib
+
+    with tempfile.TemporaryDirectory() as temp:
         pdf = Path(temp) / "doc.pdf"
-        pdf.write_bytes(b"%PDF-1.7 fixture")
-        by_pdf = OutputReader(root).fingerprint(pdf)
-        check(by_pdf != first, "a source PDF is a different identity")
-        check(by_pdf == OutputReader(root).fingerprint(pdf), "pdf fingerprint stable")
+        payload = b"%PDF-1.7 fixture bytes"
+        pdf.write_bytes(payload)
+        check(
+            sha256_file(pdf) == hashlib.sha256(payload).hexdigest(),
+            "sha256_file is the digest any standard tool reports",
+        )
+        root = write_output_root(Path(temp) / "run", pages=1)
+        token = OutputReader(root).legacy_pdf_token(pdf)
+        check(
+            token == hashlib.sha256(sha256_file(pdf).encode()).hexdigest(),
+            "the legacy identity token is still the hash of the hex digest",
+        )
+        check(token != sha256_file(pdf), "and is not the public source hash")
 
 
 def test_text_full_preferred_over_capped_text() -> None:

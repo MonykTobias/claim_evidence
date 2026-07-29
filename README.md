@@ -290,6 +290,29 @@ client.get_evidence(evidence_id)      # -> EvidenceDetail
 
 Ids may be passed as `int` or `str`; anything else raises `ValidationError`.
 
+### Source identity
+
+Three separate values, because one hash cannot honestly do three jobs:
+
+| Value | What it is |
+|---|---|
+| `source_sha256` | the actual SHA-256 of the PDF bytes, verifiable with `sha256sum`. Null when no PDF was supplied — never an output fingerprint wearing the source's name. |
+| extraction fingerprint | content hash of the manifest, `blocks.jsonl`, and every manifest-listed page's evidence artifacts *including* `page.png`, streamed in page order. |
+| version fingerprint | the tagged combination of source hash, extraction fingerprint, embedding model, and dimensions. |
+
+The extraction fingerprint hashes contents, not file sizes. A re-run that
+improves a table reconstruction or redraws a page image without changing its
+length must not look like no change at all — a same-size edit moves it, and a
+stale directory the manifest no longer lists does not.
+
+A better extraction of the same PDF therefore builds a *new version of the same
+document*; the previous one is retired, not deleted. `identity_key` is
+deliberately still derived from the pre-correction PDF token, so fixing the
+public hash does not split every already-indexed PDF into a second document.
+
+`source_uri` is where the report was published. It stays null unless a caller
+supplies one; an output directory is not a provenance claim.
+
 ### Build states and health totals
 
 A version is `building`, `ready`, `inactive`, or `failed`. When ingestion
