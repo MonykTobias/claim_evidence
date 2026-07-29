@@ -23,6 +23,7 @@ from test_integration import (  # noqa: E402
     reset_database,
 )
 
+from claim_evidence.ingest import VERIFY_STEPS  # noqa: E402
 from claim_evidence.models import ProgressEvent  # noqa: E402
 from claim_evidence.progress import (  # noqa: E402
     DEPENDENCY_ERROR_MESSAGE,
@@ -135,7 +136,10 @@ def check_ingest_phases_and_totals(tmp: Path) -> None:
     )
 
     steps = [e for e in events if e.phase == "building_indexes"]
-    check(steps[-1].total == 4, "index checks report their real step count")
+    check(
+        steps[-1].total == len(VERIFY_STEPS),
+        "index checks report their real step count",
+    )
 
 
 def check_ingest_completion_matches_the_report(tmp: Path) -> None:
@@ -551,6 +555,10 @@ def check_failed_ingest_leaves_the_previous_version_ready(tmp: Path) -> None:
             "SELECT status FROM document_version WHERE id = %s", (good.version_id,)
         ).fetchone()["status"]
         check(status == "ready", "the previous version is still ready")
+        check(
+            bool(client.search_evidence(SUPPORTED, document_ids=[good.document_id])),
+            "and is still queryable",
+        )
 
     failed = [e for e in events if e.status == "failed"]
     check(len(failed) == 1, "a failed event was emitted")

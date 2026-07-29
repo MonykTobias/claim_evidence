@@ -301,8 +301,14 @@ def check_removed_document_leaves_query_scope(tmp: Path) -> None:
             all(m.citation.document_id != report.document_id for m in matches),
             "removed evidence never appears in search",
         )
-        result = client.audit_claim(SUPPORTED, document_ids=[report.document_id])
-        check(not result.citations, "audit scoped to a removed document cites nothing")
+        try:
+            client.audit_claim(SUPPORTED, document_ids=[report.document_id])
+        except NotFoundError as exc:
+            # Not an empty verdict: "no evidence" would read as a statement
+            # about the report rather than about the removed selection.
+            check(str(report.document_id) in str(exc), f"the removed id is named ({exc})")
+        else:
+            raise AssertionError("auditing a removed document returned a verdict")
 
 
 # --- trace and evidence -----------------------------------------------------

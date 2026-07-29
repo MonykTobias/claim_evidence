@@ -18,11 +18,15 @@ CREATE TABLE IF NOT EXISTS document (
     name         text        NOT NULL,
     sha256       text,
     source_uri   text,
-    created_at   timestamptz NOT NULL DEFAULT now(),
-    -- NULLS NOT DISTINCT matters: ingesting without a source PDF leaves sha256
-    -- NULL, and the default NULL-is-distinct rule would make every re-ingest a
-    -- brand new document instead of matching the existing one.
-    UNIQUE NULLS NOT DISTINCT (name, sha256)
+    -- Internal identity only, never a public API field. (name, sha256) was not
+    -- an identity: two unrelated output roots that happen to share a basename
+    -- both key as (same_name, NULL) and collapse into one document. This is
+    -- sha256 of a namespace-tagged basis -- the PDF hash, else the logical
+    -- source URI, else the canonical output root -- so equal text in different
+    -- namespaces cannot collide. Nullable here, made NOT NULL after the
+    -- backfill at the end of this file.
+    identity_key text,
+    created_at   timestamptz NOT NULL DEFAULT now()
 );
 
 -- A version is only visible to queries once it reaches 'ready'. An interrupted
@@ -176,6 +180,12 @@ CREATE TABLE IF NOT EXISTS audit_run (
     chat_model         text,
     embed_model        text,
     error              text,
+    -- Which rule fired and how each qualifier compared, the public phase
+    -- durations, and the exact ready versions searched. Operational metadata
+    -- only: no prompt, no model reply, no hidden reasoning, no local path.
+    decision_explanation jsonb     NOT NULL DEFAULT '{}'::jsonb,
+    timings              jsonb     NOT NULL DEFAULT '{}'::jsonb,
+    index_references     jsonb     NOT NULL DEFAULT '[]'::jsonb,
     created_at         timestamptz NOT NULL DEFAULT now()
 );
 
@@ -227,5 +237,44 @@ END $$;
 CREATE UNIQUE INDEX IF NOT EXISTS document_version_identity_idx
     ON document_version (document_id, fingerprint, attempt);
 
-INSERT INTO schema_meta (id, version) VALUES (1, 2)
+-- Document identity (schema 3). Deterministic backfill: the stored PDF hash if
+-- there is one, else the newest version's output root, else the document id.
+-- Document ids and versions are never rewritten, so existing indexes keep
+-- serving. The bases match `ingest._identity_key`, which is what stops this
+-- migration from splitting a document that is later re-ingested.
+ALTER TABLE document ADD COLUMN IF NOT EXISTS identity_key text;
+
+UPDATE document d SET identity_key = encode(sha256(convert_to(
+    CASE
+        WHEN d.sha256 IS NOT NULL THEN 'pdf:' || d.sha256
+        WHEN COALESCE(d.source_uri, '') <> '' THEN 'uri:' || d.source_uri
+        ELSE COALESCE(
+            (SELECT 'output:' || v.output_root FROM document_version v
+              WHERE v.document_id = d.id ORDER BY v.id DESC LIMIT 1),
+            'legacy:' || d.id::text)
+    END, 'UTF8')), 'hex')
+WHERE d.identity_key IS NULL;
+
+ALTER TABLE document ALTER COLUMN identity_key SET NOT NULL;
+
+DO $$
+BEGIN
+    ALTER TABLE document DROP CONSTRAINT document_name_sha256_key;
+EXCEPTION WHEN undefined_object THEN
+    NULL;
+END $$;
+
+CREATE UNIQUE INDEX IF NOT EXISTS document_identity_idx ON document (identity_key);
+
+-- Structured verdict explanation (schema 4). Defaulted rather than backfilled:
+-- an audit run before this change genuinely has no explanation, and inventing
+-- one would be worse than an empty object a reader can recognize.
+ALTER TABLE audit_run ADD COLUMN IF NOT EXISTS
+    decision_explanation jsonb NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE audit_run ADD COLUMN IF NOT EXISTS
+    timings jsonb NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE audit_run ADD COLUMN IF NOT EXISTS
+    index_references jsonb NOT NULL DEFAULT '[]'::jsonb;
+
+INSERT INTO schema_meta (id, version) VALUES (1, 4)
 ON CONFLICT (id) DO UPDATE SET version = EXCLUDED.version, applied_at = now();

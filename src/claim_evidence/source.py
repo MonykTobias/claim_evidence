@@ -61,6 +61,10 @@ class PageSource:
     page_dir: Path
     width: float
     height: float
+    # The manifest's page directory relative to the output root, as posix. This
+    # is what gets stored and re-joined later; the absolute `page_dir` is only
+    # used to read artifacts during ingestion.
+    rel: str = ""
 
     def artifact(self, name: str) -> Path:
         return self.page_dir / name
@@ -98,8 +102,10 @@ class OutputReader:
         seen: dict[int, dict[str, Any]] = {}
         for entry in self.manifest:
             page = entry.get("page")
-            if not isinstance(page, int):
+            if not isinstance(page, int) or isinstance(page, bool):
                 raise OutputValidationError(f"manifest entry without a page: {entry!r}")
+            if page < 1:
+                raise OutputValidationError(f"manifest page {page} is not a 1-based page")
             if page in seen:
                 raise OutputValidationError(f"duplicate manifest entry for page {page}")
             if entry.get("status") != "completed":
@@ -115,26 +121,43 @@ class OutputReader:
         pages: list[PageSource] = []
         for page in sorted(seen):
             entry = seen[page]
-            page_dir = self.root / str(entry.get("page_dir") or f"page_{page:04d}")
+            page_dir = self._contained_dir(page, entry.get("page_dir"))
             if not page_dir.is_dir():
-                raise OutputValidationError(f"missing page directory {page_dir}")
+                raise OutputValidationError(f"page {page} has no page directory")
             for name in REQUIRED_PAGE_ARTIFACTS:
                 if not (page_dir / name).is_file():
                     raise OutputValidationError(f"page {page} is missing {name}")
             width, height = self._page_size(page_dir)
-            pages.append(PageSource(page, page_dir, width, height))
-
-        total = self._total_pages(pages[0].page_dir)
-        expected = set(range(1, total + 1))
-        missing = sorted(expected - seen.keys())
-        if missing:
-            raise OutputValidationError(
-                f"manifest covers {len(seen)} pages but {total} were extracted; "
-                f"missing {missing[:10]}"
+            pages.append(
+                PageSource(
+                    page,
+                    page_dir,
+                    width,
+                    height,
+                    page_dir.relative_to(self.root).as_posix(),
+                )
             )
+
+        # `total_pages` counts the *selected* pages, not the source PDF's last
+        # page: an extraction of pages 10..20 writes 11. So the manifest must
+        # cover a contiguous run of that length starting at its own first page,
+        # which is one rule for full, prefix, middle, and single-page runs.
+        selected = {self._total_pages(p.page_dir) for p in pages}
+        if len(selected) > 1:
+            raise OutputValidationError(
+                f"page checkpoints disagree on total_pages: {sorted(selected)}"
+            )
+        count = selected.pop()
+        first = pages[0].page
+        expected = set(range(first, first + count))
+        missing = sorted(expected - seen.keys())
         extra = sorted(seen.keys() - expected)
-        if extra:
-            raise OutputValidationError(f"manifest lists pages beyond 1..{total}: {extra}")
+        if missing or extra:
+            raise OutputValidationError(
+                f"manifest covers {len(seen)} pages but {count} were selected; "
+                f"expected {first}..{first + count - 1}, "
+                f"missing {missing[:10]}, unexpected {extra[:10]}"
+            )
 
         stale = sorted(
             p.name
@@ -150,6 +173,24 @@ class OutputReader:
 
         self._pages = pages
         return pages
+
+    def _contained_dir(self, page: int, raw: Any) -> Path:
+        """Resolve a manifest page directory, refusing anything outside the root.
+
+        Runs before any artifact is touched, so an absolute path, a ``..``
+        traversal, or a symlink pointing elsewhere never reaches a file read.
+        The message names the page only: echoing the escaped target back to the
+        caller would hand them the filesystem probe they were attempting.
+        """
+        relative = Path(str(raw or f"page_{page:04d}"))
+        if relative.is_absolute() or relative.anchor:
+            raise OutputValidationError(f"page {page} has an absolute page_dir")
+        resolved = (self.root / relative).resolve()
+        if self.root not in resolved.parents:
+            raise OutputValidationError(
+                f"page {page} has a page_dir outside the output root"
+            )
+        return resolved
 
     @staticmethod
     def _page_size(page_dir: Path) -> tuple[float, float]:
@@ -286,7 +327,7 @@ def narrative_units(page: PageSource, blocks: list[dict[str, Any]]) -> list[Evid
                 normalized_text=normalize_for_match(" > ".join(heading_path + [text])),
                 quality=EvidenceQuality.DIRECT_TEXT,
                 heading_path=heading_path,
-                artifact_path=f"{page.page_dir.name}/{BLOCKS_NAME}",
+                artifact_path=f"{page.rel}/{BLOCKS_NAME}",
                 regions=[region],
                 geometry_precision=GeometryPrecision.BLOCK,
                 truncated_source=truncated,
@@ -361,7 +402,7 @@ def table_units(
         (c for c, h in enumerate(headers) if normalize_for_match(" ".join(h)) == "unit"),
         None,
     )
-    artifact = f"{page.page_dir.name}/table_candidates.json"
+    artifact = f"{page.rel}/table_candidates.json"
     units: list[EvidenceUnit] = []
 
     for r in range(header_rows, len(rows)):
@@ -552,7 +593,7 @@ def visual_units(
                 quality=EvidenceQuality.COARSE_REGION,
                 heading_path=heading_path,
                 table_context={"rel_path": summary.get("rel_path") or ""},
-                artifact_path=f"{page.page_dir.name}/image_summaries.jsonl",
+                artifact_path=f"{page.rel}/image_summaries.jsonl",
                 regions=[
                     region_from(
                         bbox,
@@ -580,7 +621,7 @@ def markdown_unit(page: PageSource, markdown: str) -> EvidenceUnit | None:
         normalized_text=normalize_for_match(text),
         citable=False,
         quality=EvidenceQuality.NONE,
-        artifact_path=f"{page.page_dir.name}/docling_final.md",
+        artifact_path=f"{page.rel}/docling_final.md",
         regions=[
             Region(
                 bbox=(0.0, 0.0, 1.0, 1.0),
@@ -619,7 +660,7 @@ def page_units(
             reader.warnings.append(
                 f"page {page.page} table {candidate.get('candidate_id')} skipped: {exc}"
             )
-            reader.skipped.append(f"{page.page_dir.name}/table_candidates.json")
+            reader.skipped.append(f"{page.rel}/table_candidates.json")
 
     yield from visual_units(page, reader.image_summaries(page), default_heading)
 

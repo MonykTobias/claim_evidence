@@ -28,12 +28,14 @@ from .db import (
 from .errors import IndexNotReadyError, NotFoundError, ValidationError
 from .models import (
     AuditTrace,
+    DecisionExplanation,
     DocumentSummary,
     EvidenceDetail,
     EvidenceKind,
     EvidenceQuality,
     GeometryPrecision,
     HealthReport,
+    IndexReference,
     ModelHealth,
     Region,
     RegionRole,
@@ -169,11 +171,23 @@ def get_audit_trace(conn: psycopg.Connection, audit_id: int | str) -> AuditTrace
         raise NotFoundError(f"no audit with id {identifier}")
 
     citations = run.get("citations") or []
+    references = [IndexReference(**r) for r in run.get("index_references") or []]
+    explanation = run.get("decision_explanation") or {}
     return AuditTrace(
         audit_id=identifier,
         claim=run["claim"],
-        document_ids=sorted({int(c["document_id"]) for c in citations if "document_id" in c}),
+        # The audited corpus, which for an insufficient verdict with no
+        # citations is the only record of what was actually searched.
+        document_ids=sorted(
+            {int(c["document_id"]) for c in citations if "document_id" in c}
+            | {r.document_id for r in references}
+        ),
         created_at=run.get("created_at"),
+        decision_explanation=(
+            DecisionExplanation(**explanation) if explanation.get("decided_by") else None
+        ),
+        timings=run.get("timings") or {},
+        index_references=references,
         parsed_claim=run.get("parsed_claim") or {},
         verdict=run.get("verdict"),
         rationale=run.get("rationale"),

@@ -74,6 +74,112 @@ def test_page_gap_rejected() -> None:
         expect_error(OutputReader(root).validate, "missing", "page coverage gap")
 
 
+def test_selected_middle_range_validates() -> None:
+    """H-1: pages 10..12 of a 494-page PDF, extracted on their own."""
+    with tempfile.TemporaryDirectory() as temp:
+        root = write_output_root(Path(temp) / "run", page_numbers=[10, 11, 12])
+        pages = OutputReader(root).validate()
+        check([p.page for p in pages] == [10, 11, 12], "original pdf pages preserved")
+
+
+def test_single_selected_page_validates() -> None:
+    with tempfile.TemporaryDirectory() as temp:
+        root = write_output_root(Path(temp) / "run", page_numbers=[359])
+        pages = OutputReader(root).validate()
+        check([p.page for p in pages] == [359], "a single page keeps its pdf number")
+
+
+def test_gap_inside_a_selected_range_rejected() -> None:
+    with tempfile.TemporaryDirectory() as temp:
+        # 10 and 12 with total_pages=2: contiguous from 10 would be 10..11.
+        root = write_output_root(Path(temp) / "run", page_numbers=[10, 12])
+        expect_error(OutputReader(root).validate, "missing", "gap inside the range")
+
+
+def test_incomplete_selected_range_rejected() -> None:
+    with tempfile.TemporaryDirectory() as temp:
+        root = write_output_root(
+            Path(temp) / "run", page_numbers=[10, 11, 12], total_pages=4
+        )
+        expect_error(OutputReader(root).validate, "missing", "range stops short")
+
+
+def test_inconsistent_checkpoints_rejected() -> None:
+    with tempfile.TemporaryDirectory() as temp:
+        root = write_output_root(
+            Path(temp) / "run", page_numbers=[10, 11], page_totals={11: 5}
+        )
+        expect_error(OutputReader(root).validate, "disagree", "checkpoints disagree")
+
+
+def test_nonpositive_page_rejected() -> None:
+    with tempfile.TemporaryDirectory() as temp:
+        root = write_output_root(Path(temp) / "run", page_numbers=[0, 1])
+        expect_error(OutputReader(root).validate, "1-based", "page 0 rejected")
+
+
+def test_traversal_page_dir_rejected() -> None:
+    """H-2: a fully-stocked directory outside the root is still off limits."""
+    with tempfile.TemporaryDirectory() as temp:
+        base = Path(temp)
+        write_output_root(base / "outside", pages=1)
+        root = write_output_root(base / "run", pages=1, page_dirs={1: "../outside/page_0001"})
+        reader = OutputReader(root)
+        try:
+            reader.validate()
+        except OutputValidationError as exc:
+            check("outside the output root" in str(exc), f"traversal rejected ({exc})")
+            check(
+                str((base / "outside").resolve()) not in str(exc),
+                "the escaped absolute path is not echoed back",
+            )
+            return
+        raise AssertionError("traversal page_dir was accepted")
+
+
+def test_absolute_page_dir_rejected() -> None:
+    with tempfile.TemporaryDirectory() as temp:
+        base = Path(temp)
+        outside = write_output_root(base / "outside", pages=1)
+        root = write_output_root(
+            base / "run", pages=1, page_dirs={1: str((outside / "page_0001").resolve())}
+        )
+        expect_error(
+            OutputReader(root).validate, "absolute page_dir", "absolute page_dir"
+        )
+
+
+def test_symlinked_page_dir_rejected() -> None:
+    """Skips only the symlink case when this account cannot create links."""
+    with tempfile.TemporaryDirectory() as temp:
+        base = Path(temp)
+        write_output_root(base / "outside", pages=1)
+        root = write_output_root(base / "run", pages=1, page_dirs={1: "linked"})
+        try:
+            (root / "linked").symlink_to(base / "outside" / "page_0001", True)
+        except (OSError, NotImplementedError):
+            print("[skip] symlink creation not permitted here")
+            return
+        expect_error(
+            OutputReader(root).validate, "outside the output root", "symlink escape"
+        )
+
+
+def test_nested_page_dir_still_validates() -> None:
+    with tempfile.TemporaryDirectory() as temp:
+        root = write_output_root(Path(temp) / "run", pages=1)
+        (root / "pages").mkdir()
+        (root / "page_0001").rename(root / "pages" / "page_0001")
+        (root / "manifest.json").write_text(
+            (root / "manifest.json").read_text(encoding="utf-8").replace(
+                '"page_0001"', '"pages/page_0001"'
+            ),
+            encoding="utf-8",
+        )
+        pages = OutputReader(root).validate()
+        check(pages[0].rel == "pages/page_0001", "nested page dir kept as a relative path")
+
+
 def test_missing_artifact_rejected() -> None:
     with tempfile.TemporaryDirectory() as temp:
         root = write_output_root(

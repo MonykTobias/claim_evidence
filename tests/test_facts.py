@@ -15,6 +15,7 @@ from fixtures import block, kpi_table, write_output_root  # noqa: E402
 from claim_evidence.facts import (  # noqa: E402
     accept_llm_facts,
     compare,
+    compare_detailed,
     heuristic_claim,
     is_claim_like,
     merge_claim,
@@ -108,6 +109,73 @@ def test_vague_claim_is_incomparable_not_contradicted() -> None:
     verdict, reason = compare(heuristic_claim(VAGUE), emissions_fact())
     check(verdict == "incomparable", f"vague scope refuses comparison ({reason})")
     check("scope" in reason, "reason names the scope mismatch")
+
+
+def test_detailed_comparison_explains_a_match() -> None:
+    result = compare_detailed(heuristic_claim(SUPPORTED), emissions_fact())
+    check(result.outcome == "match", "the wrapper and the detail agree on the outcome")
+    check(
+        compare(heuristic_claim(SUPPORTED), emissions_fact())
+        == (result.outcome, result.reason),
+        "compare() is exactly this result, narrowed",
+    )
+    status = {q.qualifier: q.status for q in result.qualifiers}
+    for name in ("scope", "unit", "reporting_period", "baseline_period", "metric"):
+        check(status[name] == "match", f"{name} is a match ({status[name]})")
+    check(result.numeric.outcome == "match", "the arithmetic matched")
+    check(result.numeric.source_value == "(40.2) %", "the source keeps its printed form")
+    check(result.numeric.claim_value == "40.2", "the claim value is reported unsigned")
+    check(result.numeric.claim_direction == "decrease", "the claim's direction is reported")
+
+
+def test_detailed_comparison_never_claims_an_unestablished_match() -> None:
+    result = compare_detailed(heuristic_claim(VAGUE), emissions_fact())
+    status = {q.qualifier: q.status for q in result.qualifiers}
+    check(result.outcome == "incomparable", "a vague scope stays incomparable")
+    check(status["scope"] == "mismatch", "the scope is reported as a mismatch")
+    check(
+        result.numeric.outcome == "incomparable",
+        f"and the numbers are not compared ({result.numeric.outcome})",
+    )
+    check(
+        result.numeric.outcome != "conflict",
+        "an incomparable scope is never a numeric contradiction",
+    )
+
+
+def test_detailed_comparison_invents_no_source_values() -> None:
+    """A narrative fact with no number must not grow one in the explanation."""
+    bare = emissions_fact().model_dump()
+    bare.update({"value_decimal": None, "value_text": "improved", "qualifiers": {}})
+    result = compare_detailed(heuristic_claim(SUPPORTED), bare)
+    check(result.numeric.outcome == "not_applicable", "no arithmetic was attempted")
+    check(result.numeric.source_value is None, "no source value was invented")
+
+    missing_scope = emissions_fact().model_dump()
+    missing_scope.update({"scope": None, "metric": ""})
+    status = {
+        q.qualifier: q.status
+        for q in compare_detailed(heuristic_claim(SUPPORTED), missing_scope).qualifiers
+    }
+    check(status["scope"] == "missing", "an omitted source qualifier is missing, not match")
+    check(status["geography"] == "missing", "an unstated geography is missing on both sides")
+
+
+def test_two_facts_produce_two_independent_comparisons() -> None:
+    matching = compare_detailed(heuristic_claim(SUPPORTED), emissions_fact())
+    conflicting = compare_detailed(heuristic_claim(CONTRADICTED), emissions_fact())
+    check(
+        (matching.numeric.outcome, conflicting.numeric.outcome) == ("match", "conflict"),
+        "each comparison keeps its own outcome",
+    )
+    check(
+        matching.numeric.source_value == conflicting.numeric.source_value == "(40.2) %",
+        "both cite the same source value",
+    )
+    check(
+        matching.numeric.claim_value != conflicting.numeric.claim_value,
+        "with the two different claim values",
+    )
 
 
 def test_approximate_claim_uses_tolerance() -> None:

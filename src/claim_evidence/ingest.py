@@ -18,6 +18,8 @@ from .config import Settings
 from .db import (
     activate_version,
     add_alias,
+    delete_facts,
+    delete_stale_pages,
     find_version,
     init_schema,
     set_embeddings,
@@ -71,7 +73,35 @@ class IngestionError(ClaimEvidenceError):
 
 # The integrity gate runs a fixed set of checks, which is what makes
 # `building_indexes` a measurable phase rather than a spinner.
-VERIFY_STEPS = ("evidence count", "page links", "citation paths", "embedding dimension")
+VERIFY_STEPS = (
+    "evidence count",
+    "page coverage",
+    "page links",
+    "citation paths",
+    "embedding coverage",
+    "embedding dimension",
+    "fact links",
+)
+
+
+def identity_key(
+    root: Path, sha256: str | None, source_uri: str | None
+) -> str:
+    """The document's internal identity: hash of a namespace-tagged basis.
+
+    Strongest available source wins -- the PDF's content hash, then a logical
+    source URI, then the canonical output root. The tag is inside the hash so
+    a URI and a path that happen to read the same are still different
+    documents. `root` is already resolved, which on Windows also settles its
+    casing, so there is nothing left to normalize here.
+    """
+    if sha256 is not None:
+        basis = f"pdf:{sha256}"
+    elif source_uri:
+        basis = f"uri:{source_uri}"
+    else:
+        basis = f"output:{root}"
+    return hashlib.sha256(basis.encode("utf-8")).hexdigest()
 
 
 def index_fingerprint(source_fingerprint: str, settings: Settings) -> str:
@@ -141,7 +171,13 @@ def _ingest(
     sha256 = reader.fingerprint(source_pdf_path) if source_pdf_path else None
     fingerprint = index_fingerprint(reader.fingerprint(source_pdf_path), settings)
 
-    document_id = upsert_document(conn, document_name, sha256, source_uri)
+    document_id = upsert_document(
+        conn,
+        document_name,
+        sha256,
+        source_uri,
+        identity_key(reader.root, sha256, source_uri),
+    )
     reporter.document_id = document_id
     existing = find_version(conn, document_id, fingerprint)
     if existing and existing["status"] == VersionStatus.READY and not force:
@@ -192,7 +228,7 @@ def _ingest(
     for index, page in enumerate(pages, start=1):
         units = list(page_units(reader, page, blocks_by_page.get(page.page, [])))
         page_id = upsert_page(
-            conn, version_id, page.page, page.width, page.height, page.page_dir.name
+            conn, version_id, page.page, page.width, page.height, page.rel
         )
         evidence_ids.update(upsert_evidence(conn, version_id, page_id, units))
         conn.commit()
@@ -206,6 +242,9 @@ def _ingest(
             current_item=f"page {page.page}",
         )
         warned = _warn_new(reporter, "building_evidence", reader, warned)
+    # A resumed attempt can still hold pages an earlier manifest listed.
+    delete_stale_pages(conn, version_id, [p.page for p in pages])
+    conn.commit()
     reporter.done(
         "building_evidence",
         f"Built {unit_count} evidence units",
@@ -230,7 +269,7 @@ def _ingest(
         reporter,
     )
 
-    embedded = _verify(conn, version_id, unit_count, settings, reporter)
+    embedded = _verify(conn, version_id, unit_count, len(pages), settings, reporter)
 
     reporter.start("activating_version", "Activating the new version")
     activate_version(conn, version_id)
@@ -365,6 +404,12 @@ def _build_facts(
     stored = 0
     rejected: list[str] = []
 
+    # Rebuild rather than resume: every current unit is reprocessed below, so
+    # keeping an earlier attempt's facts only risks stale values, qualifiers,
+    # and evidence links surviving into a ready version.
+    delete_facts(conn, version_id)
+    conn.commit()
+
     candidates = (
         [
             unit
@@ -454,10 +499,16 @@ def _verify(
     conn: psycopg.Connection,
     version_id: int,
     expected_units: int,
+    expected_pages: int,
     settings: Settings,
     reporter: ProgressReporter,
 ) -> int:
-    """Count, foreign-key, citation-path, and embedding-dimension checks.
+    """The gate between a built version and a queryable one.
+
+    Everything a resumed attempt could leave inconsistent is checked here:
+    counts, stale pages, orphaned links, missing or wrong-width embeddings, and
+    fact links that reach outside this version. Any failure raises, which
+    leaves the version in ``building`` and whatever was ready still serving.
 
     Returns the version's embedding count, taken from the check query it
     already runs: a resumed build only writes the embeddings that were still
@@ -465,6 +516,13 @@ def _verify(
     """
     total = len(VERIFY_STEPS)
     reporter.start("building_indexes", "Checking index integrity", total=total)
+
+    def passed(step: int, message: str) -> None:
+        reporter.step(
+            "building_indexes", message, completed=step, total=total,
+            current_item=VERIFY_STEPS[step - 1],
+        )
+
     counts = conn.execute(
         "SELECT count(*) AS n, count(embedding) AS embedded"
         " FROM evidence_unit WHERE version_id = %s",
@@ -473,10 +531,14 @@ def _verify(
     stored = counts["n"]
     if stored != expected_units:
         raise IngestionError(f"stored {stored} evidence units, expected {expected_units}")
-    reporter.step(
-        "building_indexes", "Evidence count verified", completed=1, total=total,
-        current_item=VERIFY_STEPS[0],
-    )
+    passed(1, "Evidence count verified")
+
+    pages = conn.execute(
+        "SELECT count(*) AS n FROM page WHERE version_id = %s", (version_id,)
+    ).fetchone()["n"]
+    if pages != expected_pages:
+        raise IngestionError(f"stored {pages} pages, expected {expected_pages}")
+    passed(2, "Page coverage verified")
 
     orphans = conn.execute(
         """
@@ -488,10 +550,7 @@ def _verify(
     ).fetchone()["n"]
     if orphans:
         raise IngestionError(f"{orphans} evidence units have no page")
-    reporter.step(
-        "building_indexes", "Page links verified", completed=2, total=total,
-        current_item=VERIFY_STEPS[1],
-    )
+    passed(3, "Page links verified")
 
     uncited = conn.execute(
         """
@@ -503,23 +562,45 @@ def _verify(
     ).fetchone()["n"]
     if uncited:
         raise IngestionError(f"{uncited} citable units have no region to highlight")
-    reporter.step(
-        "building_indexes", "Citation paths verified", completed=3, total=total,
-        current_item=VERIFY_STEPS[2],
-    )
+    passed(4, "Citation paths verified")
 
-    dim = conn.execute(
+    unembedded = conn.execute(
         """
-        SELECT vector_dims(embedding) AS d FROM evidence_unit
-        WHERE version_id = %s AND embedding IS NOT NULL LIMIT 1
+        SELECT count(*) AS n FROM evidence_unit
+        WHERE version_id = %s AND kind = ANY(%s) AND embedding IS NULL
+        """,
+        (version_id, list(EMBEDDED_KINDS)),
+    ).fetchone()["n"]
+    if unembedded:
+        raise IngestionError(f"{unembedded} embeddable units have no embedding")
+    passed(5, "Embedding coverage verified")
+
+    wrong = conn.execute(
+        """
+        SELECT count(*) AS n FROM evidence_unit
+        WHERE version_id = %s AND embedding IS NOT NULL
+          AND vector_dims(embedding) <> %s
+        """,
+        (version_id, settings.embed_dimensions),
+    ).fetchone()["n"]
+    if wrong:
+        raise IngestionError(
+            f"{wrong} stored embeddings are not {settings.embed_dimensions}-dimensional"
+        )
+    passed(6, "Embedding dimension verified")
+
+    crossed = conn.execute(
+        """
+        SELECT count(*) AS n FROM fact f
+        JOIN fact_evidence fe ON fe.fact_id = f.id
+        JOIN evidence_unit e ON e.id = fe.evidence_id
+        WHERE f.version_id = %s AND e.version_id <> f.version_id
         """,
         (version_id,),
-    ).fetchone()
-    if dim and int(dim["d"]) != settings.embed_dimensions:
-        raise IngestionError(
-            f"stored embeddings have dimension {dim['d']}, "
-            f"expected {settings.embed_dimensions}"
-        )
+    ).fetchone()["n"]
+    if crossed:
+        raise IngestionError(f"{crossed} fact links point outside this version")
+
     reporter.done(
         "building_indexes", "Index checks passed", completed=total, total=total
     )
@@ -535,6 +616,7 @@ __all__ = [
     "VERIFY_STEPS",
     "IngestionError",
     "ensure_schema",
+    "identity_key",
     "index_fingerprint",
     "ingest_document",
 ]

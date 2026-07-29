@@ -28,7 +28,7 @@ from .db import (
 from .facts import (
     CLAIM_PARSE_SYSTEM,
     SCOPE_MISMATCH,
-    compare,
+    compare_detailed,
     heuristic_claim,
     merge_claim,
 )
@@ -36,14 +36,17 @@ from .models import (
     Adjudication,
     Citation,
     ClaimResult,
+    DecisionExplanation,
+    EvidenceComparison,
     EvidenceKind,
     EvidenceQuality,
+    IndexReference,
     ParsedClaim,
     Verdict,
 )
 from .errors import ClaimEvidenceError
 from .ollama import OllamaClient, OllamaError
-from .progress import ProgressCallback, ProgressReporter
+from .progress import ProgressCallback, ProgressReporter, audit_timings
 from .retrieve import expand, retrieve, to_citation
 from .vision import verify_visual
 
@@ -107,6 +110,7 @@ def audit_claim(
     claim: str,
     *,
     document_ids: Sequence[int] | None = None,
+    index_references: Sequence[IndexReference] = (),
     limit: int = 20,
     progress: ProgressCallback | None = None,
 ) -> ClaimResult:
@@ -114,7 +118,8 @@ def audit_claim(
     try:
         return _audit(
             conn, client, settings, claim,
-            document_ids=document_ids, limit=limit, reporter=reporter,
+            document_ids=document_ids, index_references=index_references,
+            limit=limit, reporter=reporter,
         )
     except BaseException as exc:
         reporter.fail(exc)
@@ -128,6 +133,7 @@ def _audit(
     claim: str,
     *,
     document_ids: Sequence[int] | None,
+    index_references: Sequence[IndexReference],
     limit: int,
     reporter: ProgressReporter,
 ) -> ClaimResult:
@@ -155,6 +161,10 @@ def _audit(
             "No evidence matched the claim.", EvidenceQuality.NONE, [], ["evidence"],
             reporter=reporter, channels=channels, fused=fused, candidates=[],
             visual_status={},
+            explanation=DecisionExplanation(
+                decided_by="no_evidence", verdict_rule="no_citable_evidence"
+            ),
+            index_references=index_references,
         )
 
     regions = regions_for(conn, [int(c["row"]["id"]) for c in candidates])
@@ -162,13 +172,16 @@ def _audit(
 
     visual_status: dict[int, str] = {}
     reasons: dict[int, str] = {}
-    verdict, rationale, citations, missing, scope_ambiguous = _deterministic(
-        conn, parsed, citable, regions, reasons
+    comparisons: list[EvidenceComparison] = []
+    verdict, rationale, citations, missing, scope_ambiguous, rule = _deterministic(
+        conn, parsed, citable, regions, reasons, comparisons
     )
+    explained_by = "deterministic_comparison"
     decided_by = "comparison"
     if verdict is None:
+        explained_by = "semantic_adjudication"
         decided_by = "adjudicator"
-        verdict, rationale, citations, missing = _adjudicate(
+        verdict, rationale, citations, missing, rule = _adjudicate(
             conn, client, claim, parsed, citable, regions, visual_status,
             scope_ambiguous=scope_ambiguous, reporter=reporter,
         )
@@ -217,6 +230,12 @@ def _audit(
         citations, missing,
         reporter=reporter, channels=channels, fused=fused, candidates=candidates,
         visual_status=visual_status,
+        explanation=DecisionExplanation(
+            decided_by=explained_by,
+            verdict_rule=rule,
+            evidence_comparisons=comparisons,
+        ),
+        index_references=index_references,
     )
 
 
@@ -226,13 +245,18 @@ def _deterministic(
     candidates: Sequence[dict[str, Any]],
     regions: dict[int, list[dict[str, Any]]],
     reasons: dict[int, str],
-) -> tuple[Verdict | None, str, list[Citation], list[str], bool]:
+    comparisons: list[EvidenceComparison],
+) -> tuple[Verdict | None, str, list[Citation], list[str], bool, str]:
     """Arithmetic verdict when every material qualifier aligns.
 
     Returns ``None`` when nothing is comparable, handing the claim to the
     semantic verifier rather than inventing an answer. The trailing flag says
     the only thing standing between the claim and the evidence was scope --
     the claim names a boundary the report never reports on.
+
+    ``comparisons`` is filled with one entry per fact examined, comparable or
+    not, so the caller can show why a candidate was set aside as readily as why
+    one was used. The verdict and that list come from the same result.
     """
     ids = [int(c["row"]["id"]) for c in candidates]
     rows = {int(c["row"]["id"]): c["row"] for c in candidates}
@@ -245,7 +269,17 @@ def _deterministic(
         row = rows.get(evidence_id)
         if row is None:
             continue
-        outcome, reason = compare(parsed, fact)
+        result = compare_detailed(parsed, fact)
+        outcome, reason = result.outcome, result.reason
+        comparisons.append(
+            EvidenceComparison(
+                evidence_id=evidence_id,
+                fact_id=_optional_int(fact.get("id")),
+                pdf_page=_optional_int(row.get("pdf_page")),
+                qualifiers=result.qualifiers,
+                numeric=result.numeric,
+            )
+        )
         reasons.setdefault(evidence_id, f"{outcome}: {reason}")
         if outcome == "incomparable":
             if reason.startswith(SCOPE_MISMATCH):
@@ -264,6 +298,7 @@ def _deterministic(
             [c for c, _ in matches[:2] + conflicts[:2]],
             [],
             False,
+            "mixed_comparable_facts",
         )
     if matches:
         return (
@@ -272,6 +307,9 @@ def _deterministic(
             [c for c, _ in matches[:3]],
             [],
             False,
+            "exact_numeric_match"
+            if parsed.comparison in ("=", "~")
+            else "bounded_numeric_match",
         )
     if conflicts:
         return (
@@ -280,8 +318,13 @@ def _deterministic(
             [c for c, _ in conflicts[:3]],
             [],
             False,
+            "comparable_numeric_conflict",
         )
-    return None, "", [], [], scope_rejections > 0
+    return None, "", [], [], scope_rejections > 0, ""
+
+
+def _optional_int(value: Any) -> int | None:
+    return None if value is None else int(value)
 
 
 def _adjudicate(
@@ -294,7 +337,7 @@ def _adjudicate(
     visual_status: dict[int, str],
     scope_ambiguous: bool = False,
     reporter: ProgressReporter | None = None,
-) -> tuple[Verdict, str, list[Citation], list[str]]:
+) -> tuple[Verdict, str, list[Citation], list[str], str]:
     usable = _verify_visuals(
         conn, client, claim, candidates, regions, visual_status,
         reporter or ProgressReporter(None, "audit"),
@@ -308,6 +351,7 @@ def _adjudicate(
             "No citable source evidence matched the claim's qualifiers.",
             [],
             _missing_qualifiers(parsed),
+            "no_citable_evidence",
         )
 
     # Bounded on purpose: an over-long prompt is silently truncated by the
@@ -344,6 +388,7 @@ def _adjudicate(
             "confirmed nor contradicted.",
             [],
             sorted({*decision.missing_qualifiers, "scope"}),
+            "scope_not_comparable",
         )
 
     by_id = {cid.evidence_id: cid for cid, _, _ in usable[:MAX_PASSAGES]}
@@ -356,8 +401,26 @@ def _adjudicate(
             f"{decision.rationale} (no citable evidence was identified)",
             [],
             decision.missing_qualifiers or _missing_qualifiers(parsed),
+            "no_citable_evidence",
         )
-    return decision.verdict, decision.rationale, cited, decision.missing_qualifiers
+    return (
+        decision.verdict,
+        decision.rationale,
+        cited,
+        decision.missing_qualifiers,
+        _SEMANTIC_RULES.get(decision.verdict, "missing_material_qualifier"),
+    )
+
+
+# The semantic verifier's outcome, named as a rule. `insufficient` here means
+# the model could not line up a material qualifier -- there is no separate
+# "the model was unsure" state to report.
+_SEMANTIC_RULES = {
+    Verdict.SUPPORTED: "semantic_evidence_support",
+    Verdict.CONTRADICTED: "semantic_evidence_conflict",
+    Verdict.MIXED: "mixed_comparable_facts",
+    Verdict.INSUFFICIENT: "missing_material_qualifier",
+}
 
 
 def _verify_visuals(
@@ -489,6 +552,8 @@ def _finish(
     fused: Sequence[dict[str, Any]],
     candidates: Sequence[dict[str, Any]],
     visual_status: dict[int, str],
+    explanation: DecisionExplanation,
+    index_references: Sequence[IndexReference],
 ) -> ClaimResult:
     # A supporting verdict without a direct or re-verified citation is a bug;
     # fail closed rather than emit it.
@@ -499,7 +564,11 @@ def _finish(
         verdict = Verdict.INSUFFICIENT
         rationale = f"{rationale} (no direct or re-verified citation)"
         citations = []
+        explanation = explanation.model_copy(
+            update={"verdict_rule": "no_citable_evidence"}
+        )
 
+    timings = audit_timings(reporter)
     finish_audit(
         conn,
         audit_id,
@@ -508,6 +577,9 @@ def _finish(
         quality=str(quality),
         missing_qualifiers=list(missing),
         citations=[c.model_dump(mode="json") for c in citations],
+        decision_explanation=explanation.model_dump(mode="json"),
+        timings=timings,
+        index_references=[r.model_dump(mode="json") for r in index_references],
     )
     result = ClaimResult(
         claim=claim,
@@ -517,6 +589,9 @@ def _finish(
         citations=list(citations),
         missing_qualifiers=list(missing),
         audit_id=audit_id,
+        decision_explanation=explanation,
+        timings=timings,
+        index_references=list(index_references),
     )
     reporter.done(
         "completed",

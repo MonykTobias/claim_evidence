@@ -12,10 +12,18 @@ a fabricated number is rejected before it can ever be cited.
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, Iterable, Literal
 
-from .models import EvidenceKind, EvidenceUnit, Fact, ParsedClaim
+from .models import (
+    EvidenceKind,
+    EvidenceUnit,
+    Fact,
+    NumericComparison,
+    ParsedClaim,
+    QualifierComparison,
+)
 from .normalize import (
     all_years,
     clean_text,
@@ -286,50 +294,186 @@ def compare(claim: ParsedClaim, fact: dict[str, Any] | Fact) -> tuple[Comparison
     Returns ``incomparable`` -- not ``conflict`` -- whenever a material
     qualifier does not line up. Refusing to compare is what keeps a vague claim
     from being forced into a confident contradiction against the nearest number.
+
+    The verdict path and the public explanation both read one
+    :func:`compare_detailed` result, so the two can never disagree.
+    """
+    detailed = compare_detailed(claim, fact)
+    return detailed.outcome, detailed.reason
+
+
+@dataclass(frozen=True)
+class ComparisonResult:
+    """One claim-versus-fact comparison, verdict and explanation together."""
+
+    outcome: Comparison
+    reason: str
+    qualifiers: list[QualifierComparison]
+    numeric: NumericComparison
+
+
+def compare_detailed(claim: ParsedClaim, fact: dict[str, Any] | Fact) -> ComparisonResult:
+    """The full comparison: the outcome, and why each qualifier said so.
+
+    The checks run in the same order as before and the *first* blocking one
+    still decides ``outcome`` and ``reason`` -- the rest keep running only to
+    fill in the per-qualifier report. A qualifier the source omits is
+    ``missing``; ``mismatch`` needs both sides present and disagreeing.
     """
     row = fact if isinstance(fact, dict) else fact.model_dump()
-    observed = row.get("value_decimal")
-    if claim.value_decimal is None or observed is None:
-        return "incomparable", "claim or fact has no numeric value"
-    observed = Decimal(str(observed))
+    qualifiers: list[QualifierComparison] = []
+    blocked: str | None = None
+
+    def note(
+        name: str,
+        claim_value: Any,
+        source_value: Any,
+        status: str,
+        reason: str | None = None,
+        *,
+        blocking: bool = False,
+    ) -> None:
+        nonlocal blocked
+        qualifiers.append(
+            QualifierComparison(
+                qualifier=name,  # type: ignore[arg-type]
+                claim_value=_text(claim_value),
+                source_value=_text(source_value),
+                status=status,  # type: ignore[arg-type]
+                reason=reason,
+            )
+        )
+        if blocking and blocked is None and reason:
+            blocked = reason
+
+    # subject -- reported, never blocking: a document basename and a claim's
+    # first word are the same company spelled two ways more often than not.
+    claim_subject, fact_subject = claim.subject, row.get("subject")
+    note("subject", claim_subject, fact_subject, _subject_status(claim_subject, fact_subject))
 
     claim_unit = normalize_unit(claim.unit)
     fact_unit = normalize_unit(row.get("unit"))
-    if claim_unit != fact_unit:
-        return "incomparable", f"unit {claim_unit!r} does not match {fact_unit!r}"
+    if not claim_unit or not fact_unit:
+        note("unit", claim_unit, fact_unit, "missing",
+             "unit is not stated on both sides",
+             blocking=claim_unit != fact_unit)
+    elif claim_unit != fact_unit:
+        note("unit", claim_unit, fact_unit, "mismatch",
+             f"unit {claim_unit!r} does not match {fact_unit!r}", blocking=True)
+    else:
+        note("unit", claim_unit, fact_unit, "match")
 
     fact_reporting = row.get("reporting_period")
-    if claim.reporting_period and fact_reporting and claim.reporting_period != fact_reporting:
-        return "incomparable", (
-            f"reporting period {claim.reporting_period} does not match {fact_reporting}"
-        )
-    if claim.reporting_period and not fact_reporting:
-        return "incomparable", "fact states no reporting period"
+    if claim.reporting_period and fact_reporting:
+        same = claim.reporting_period == fact_reporting
+        note("reporting_period", claim.reporting_period, fact_reporting,
+             "match" if same else "mismatch",
+             None if same else
+             f"reporting period {claim.reporting_period} does not match {fact_reporting}",
+             blocking=not same)
+    elif claim.reporting_period and not fact_reporting:
+        note("reporting_period", claim.reporting_period, None, "missing",
+             "fact states no reporting period", blocking=True)
+    else:
+        note("reporting_period", claim.reporting_period, fact_reporting, "missing")
 
     fact_baseline = row.get("baseline_period")
     if claim.baseline_period and claim.baseline_period != fact_baseline:
-        return "incomparable", (
-            f"baseline {claim.baseline_period} does not match {fact_baseline}"
-        )
-    if fact_baseline and not claim.baseline_period:
-        return "incomparable", "fact is measured against a baseline the claim omits"
+        note("baseline_period", claim.baseline_period, fact_baseline,
+             "mismatch" if fact_baseline else "missing",
+             f"baseline {claim.baseline_period} does not match {fact_baseline}",
+             blocking=True)
+    elif fact_baseline and not claim.baseline_period:
+        note("baseline_period", None, fact_baseline, "missing",
+             "fact is measured against a baseline the claim omits", blocking=True)
+    elif claim.baseline_period:
+        note("baseline_period", claim.baseline_period, fact_baseline, "match")
+    else:
+        note("baseline_period", None, None, "missing")
 
     claim_scope = claim.scope or claim.metric
     fact_scope = row.get("scope") or row.get("metric") or ""
     if not scopes_comparable(claim_scope, fact_scope):
-        return "incomparable", (
-            f"{SCOPE_MISMATCH}: {claim_scope!r} is not comparable to {fact_scope!r}"
+        note("scope", claim_scope, fact_scope,
+             "mismatch" if fact_scope else "missing",
+             f"{SCOPE_MISMATCH}: {claim_scope!r} is not comparable to {fact_scope!r}",
+             blocking=True)
+    else:
+        note("scope", claim_scope, fact_scope, "match")
+
+    fact_metric = str(row.get("metric") or "")
+    if metric_containment(claim.metric, fact_metric) < _METRIC_CONTAINMENT:
+        note("metric", claim.metric, fact_metric,
+             "mismatch" if fact_metric else "missing",
+             "metric wording does not overlap enough to compare", blocking=True)
+    else:
+        note("metric", claim.metric, fact_metric, "match")
+
+    fact_geography = row.get("geography")
+    if claim.geography and fact_geography:
+        same = normalize_for_match(claim.geography) == normalize_for_match(fact_geography)
+        note("geography", claim.geography, fact_geography, "match" if same else "mismatch")
+    else:
+        note("geography", claim.geography, fact_geography, "missing")
+
+    # Numeric presence is checked first for the verdict, exactly as before, but
+    # reported last because it reads as the conclusion.
+    observed = row.get("value_decimal")
+    numeric_base = {
+        "claim_value": _text(claim.value_decimal),
+        "claim_operator": claim.comparison,
+        "claim_direction": claim.direction,
+        # The figure as the page printed it -- "(40.2) %" -- falling back to the
+        # parsed decimal when a fact carries no displayed form.
+        "source_value": _text(
+            (row.get("qualifiers") or {}).get("displayed_value") or observed
+        ),
+        "source_operator": row.get("comparison"),
+        "source_unit": fact_unit or None,
+    }
+    if claim.value_decimal is None or observed is None:
+        reason = "claim or fact has no numeric value"
+        return ComparisonResult(
+            "incomparable", reason, qualifiers,
+            NumericComparison(**numeric_base, outcome="not_applicable", reason=reason),
+        )
+    if blocked is not None:
+        return ComparisonResult(
+            "incomparable", blocked, qualifiers,
+            NumericComparison(**numeric_base, outcome="incomparable", reason=blocked),
         )
 
-    if metric_containment(claim.metric, str(row.get("metric") or "")) < _METRIC_CONTAINMENT:
-        return "incomparable", "metric wording does not overlap enough to compare"
-
+    observed = Decimal(str(observed))
     claimed = signed_change(claim.value_decimal, claim.direction)
     fact_direction = row.get("direction") or "unknown"
     direction = claim.direction if claim.direction != "unknown" else fact_direction
     if claim.direction == "unknown" and fact_direction != "unknown":
         claimed = signed_change(claim.value_decimal, fact_direction)
-    return _apply_operator(claim.comparison, claimed, observed, direction, claim.approximate)
+    outcome, reason = _apply_operator(
+        claim.comparison, claimed, observed, direction, claim.approximate
+    )
+    return ComparisonResult(
+        outcome, reason, qualifiers,
+        NumericComparison(**numeric_base, outcome=outcome, reason=reason),
+    )
+
+
+def _text(value: Any) -> str | None:
+    if value is None or value == "":
+        return None
+    return str(value)
+
+
+def _subject_status(claim_subject: str | None, fact_subject: Any) -> str:
+    if not claim_subject or not fact_subject:
+        return "missing"
+    left = normalize_for_match(claim_subject)
+    right = normalize_for_match(str(fact_subject))
+    if not left or not right:
+        return "missing"
+    # Containment either way: "Danone" and "danoneurdaccessible" name one
+    # reporting entity, and calling that a mismatch would be noise.
+    return "match" if left in right or right in left else "mismatch"
 
 
 def _apply_operator(
@@ -393,7 +537,9 @@ __all__ = [
     "FACT_EXTRACTION_SYSTEM",
     "accept_llm_facts",
     "SCOPE_MISMATCH",
+    "ComparisonResult",
     "compare",
+    "compare_detailed",
     "fact_extraction_prompt",
     "heuristic_claim",
     "is_claim_like",

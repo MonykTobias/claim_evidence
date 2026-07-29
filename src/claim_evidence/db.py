@@ -19,15 +19,34 @@ from pgvector.psycopg import register_vector
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
+from .config import DEFAULT_DATABASE_CONNECT_TIMEOUT
+from .errors import DependencyUnavailableError
 from .models import EvidenceUnit, Fact, VersionStatus
 
 SQL_DIR = Path(__file__).parent / "sql"
 EMBED_DIM_TOKEN = "EMBED_DIM"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 4
 
 
-def connect(database_url: str) -> psycopg.Connection:
-    conn = psycopg.connect(database_url, row_factory=dict_row, autocommit=False)
+def connect(
+    database_url: str, connect_timeout: float = DEFAULT_DATABASE_CONNECT_TIMEOUT
+) -> psycopg.Connection:
+    """Open a bounded connection, or fail with a safe typed error.
+
+    libpq takes whole seconds and treats anything under 2 as 2, so the
+    configured value is rounded up rather than passed through verbatim. The
+    driver's own message names the host, user, and sometimes the password, so
+    it is kept as ``__cause__`` for the server log and never surfaced.
+    """
+    try:
+        conn = psycopg.connect(
+            database_url,
+            row_factory=dict_row,
+            autocommit=False,
+            connect_timeout=max(1, int(connect_timeout)),
+        )
+    except psycopg.OperationalError as exc:
+        raise DependencyUnavailableError("PostgreSQL is unavailable.") from exc
     try:
         register_vector(conn)
     except psycopg.ProgrammingError:
@@ -61,17 +80,28 @@ def normalize_embedding(vector: Sequence[float]) -> Vector:
 
 
 def upsert_document(
-    conn: psycopg.Connection, name: str, sha256: str | None, source_uri: str | None
+    conn: psycopg.Connection,
+    name: str,
+    sha256: str | None,
+    source_uri: str | None,
+    identity_key: str,
 ) -> int:
+    """Find or create one document by its internal identity.
+
+    The conflict target is ``identity_key`` alone, never the display name: two
+    reports whose output roots happen to share a basename are two documents,
+    and removing one must not remove the other.
+    """
     row = conn.execute(
         """
-        INSERT INTO document (name, sha256, source_uri)
-        VALUES (%s, %s, %s)
-        ON CONFLICT (name, sha256) DO UPDATE
-            SET source_uri = COALESCE(EXCLUDED.source_uri, document.source_uri)
+        INSERT INTO document (name, sha256, source_uri, identity_key)
+        VALUES (%s, %s, %s, %s)
+        ON CONFLICT (identity_key) DO UPDATE
+            SET source_uri = COALESCE(EXCLUDED.source_uri, document.source_uri),
+                sha256 = COALESCE(EXCLUDED.sha256, document.sha256)
         RETURNING id
         """,
-        (name, sha256, source_uri),
+        (name, sha256, source_uri, identity_key),
     ).fetchone()
     return int(row["id"])
 
@@ -190,13 +220,28 @@ def upsert_page(
 # --- evidence ---------------------------------------------------------------
 
 
+# Reconciliation only ever touches the version currently being built. A ready
+# version keeps serving queries while its replacement is assembled, and an
+# inactive one is somebody's rollback target.
+_ONLY_BUILDING = (
+    " AND version_id IN"
+    " (SELECT id FROM document_version WHERE id = %s AND status = 'building')"
+)
+
+
 def upsert_evidence(
     conn: psycopg.Connection,
     version_id: int,
     page_id: int,
     units: Iterable[EvidenceUnit],
 ) -> dict[str, int]:
-    """Insert or refresh evidence units and their regions; returns key -> id."""
+    """Make this page's stored evidence match the source exactly; key -> id.
+
+    Authoritative, not additive. Every source-derived column is overwritten on
+    conflict, units the source no longer produces are deleted, and an embedding
+    is dropped the moment its normalized text changes -- a resumed build that
+    kept the old vector would pair new text with an embedding of the old.
+    """
     ids: dict[str, int] = {}
     for unit in units:
         row = conn.execute(
@@ -208,14 +253,21 @@ def upsert_evidence(
             )
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (version_id, unit_key) DO UPDATE SET
-                source_text = EXCLUDED.source_text,
-                normalized_text = EXCLUDED.normalized_text,
+                page_id = EXCLUDED.page_id,
+                kind = EXCLUDED.kind,
                 quality = EXCLUDED.quality,
                 citable = EXCLUDED.citable,
+                source_text = EXCLUDED.source_text,
+                normalized_text = EXCLUDED.normalized_text,
                 heading_path = EXCLUDED.heading_path,
                 table_context = EXCLUDED.table_context,
+                artifact_path = EXCLUDED.artifact_path,
                 geometry_precision = EXCLUDED.geometry_precision,
-                truncated_source = EXCLUDED.truncated_source
+                truncated_source = EXCLUDED.truncated_source,
+                embedding = CASE
+                    WHEN evidence_unit.normalized_text
+                         IS DISTINCT FROM EXCLUDED.normalized_text
+                    THEN NULL ELSE evidence_unit.embedding END
             RETURNING id
             """,
             (
@@ -257,7 +309,41 @@ def upsert_evidence(
                     region.source_origin,
                 ),
             )
+    # `= ANY('{}')` is false for every row, so a page that now yields nothing
+    # correctly loses all of its earlier units rather than keeping them.
+    conn.execute(
+        "DELETE FROM evidence_unit WHERE version_id = %s AND page_id = %s"
+        f" AND NOT (unit_key = ANY(%s)){_ONLY_BUILDING}",
+        (version_id, page_id, list(ids), version_id),
+    )
     return ids
+
+
+def delete_stale_pages(
+    conn: psycopg.Connection, version_id: int, pdf_pages: Sequence[int]
+) -> int:
+    """Drop pages an earlier attempt indexed that the manifest no longer lists.
+
+    Their evidence, regions, and fact links go with them through the cascade.
+    """
+    return conn.execute(
+        "DELETE FROM page WHERE version_id = %s AND NOT (pdf_page = ANY(%s))"
+        f"{_ONLY_BUILDING}",
+        (version_id, list(pdf_pages), version_id),
+    ).rowcount
+
+
+def delete_facts(conn: psycopg.Connection, version_id: int) -> int:
+    """Clear a building version's facts so they are rebuilt from current units.
+
+    Fact construction reprocesses every unit anyway, so rebuilding is both
+    cheaper and more exact than diffing: an updated qualifier, a dropped value,
+    and a stale ``fact_evidence`` link all disappear for free via the cascade.
+    """
+    return conn.execute(
+        f"DELETE FROM fact WHERE version_id = %s{_ONLY_BUILDING}",
+        (version_id, version_id),
+    ).rowcount
 
 
 def units_missing_embeddings(
@@ -543,6 +629,43 @@ def neighbours(
     ).fetchall()
 
 
+def document_scope(
+    conn: psycopg.Connection, document_ids: Sequence[int] | None
+) -> list[dict[str, Any]]:
+    """Classify a document selection in one round trip.
+
+    With ``document_ids``, one row per *existing* requested document: an id
+    that is absent from the result does not exist, and a row with a null
+    ``document_version_id`` exists but has nothing ready to query. With
+    ``None``, the ready versions of every document, which is the corpus an
+    unscoped query actually searches.
+    """
+    version = """
+        SELECT id, embed_model, embed_dim FROM document_version
+        WHERE document_id = d.id AND status = 'ready'
+        ORDER BY id DESC LIMIT 1
+    """
+    if document_ids is None:
+        return conn.execute(
+            f"""
+            SELECT d.id AS document_id, d.name,
+                   v.id AS document_version_id, v.embed_model, v.embed_dim
+            FROM document d JOIN LATERAL ({version}) v ON true
+            ORDER BY d.id
+            """
+        ).fetchall()
+    return conn.execute(
+        f"""
+        SELECT d.id AS document_id, d.name,
+               v.id AS document_version_id, v.embed_model, v.embed_dim
+        FROM document d LEFT JOIN LATERAL ({version}) v ON true
+        WHERE d.id = ANY(%s)
+        ORDER BY d.id
+        """,
+        (list(document_ids),),
+    ).fetchall()
+
+
 def ready_documents(conn: psycopg.Connection) -> list[dict[str, Any]]:
     return conn.execute(
         """
@@ -625,11 +748,15 @@ def finish_audit(
     missing_qualifiers: Sequence[str],
     citations: Sequence[dict[str, Any]],
     error: str | None = None,
+    decision_explanation: dict[str, Any] | None = None,
+    timings: dict[str, Any] | None = None,
+    index_references: Sequence[dict[str, Any]] = (),
 ) -> None:
     conn.execute(
         """
         UPDATE audit_run SET verdict = %s, rationale = %s, evidence_quality = %s,
-            missing_qualifiers = %s, citations = %s, error = %s
+            missing_qualifiers = %s, citations = %s, error = %s,
+            decision_explanation = %s, timings = %s, index_references = %s
         WHERE id = %s
         """,
         (
@@ -639,6 +766,9 @@ def finish_audit(
             Jsonb(list(missing_qualifiers)),
             Jsonb(_jsonable(list(citations))),
             error,
+            Jsonb(_jsonable(decision_explanation or {})),
+            Jsonb(_jsonable(timings or {})),
+            Jsonb(_jsonable(list(index_references))),
             audit_id,
         ),
     )
@@ -660,6 +790,9 @@ __all__ = [
     "add_alias",
     "connect",
     "create_audit",
+    "delete_facts",
+    "delete_stale_pages",
+    "document_scope",
     "exact_vector_search",
     "facts_for_evidence",
     "find_version",

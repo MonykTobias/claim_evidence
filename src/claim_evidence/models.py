@@ -154,6 +154,78 @@ class EvidenceMatch(BaseModel):
     combined_score: float = 0.0
 
 
+QualifierName = Literal[
+    "subject", "metric", "scope", "unit",
+    "reporting_period", "baseline_period", "geography",
+]
+
+
+class QualifierComparison(BaseModel):
+    """How one material qualifier of the claim lined up with one stored fact.
+
+    ``match`` means the package's own comparison established comparability --
+    never that a value was merely parsed. A qualifier the source omits is
+    ``missing``, and ``mismatch`` requires both sides present and disagreeing.
+    """
+
+    qualifier: QualifierName
+    claim_value: str | None = None
+    source_value: str | None = None
+    status: Literal["match", "mismatch", "missing"]
+    reason: str | None = None
+
+
+class NumericComparison(BaseModel):
+    """The arithmetic, in the terms the page and the claim each stated it."""
+
+    claim_value: str | None = None
+    claim_operator: str | None = None
+    claim_direction: str | None = None
+    source_value: str | None = None
+    source_operator: str | None = None
+    source_unit: str | None = None
+    outcome: Literal["match", "conflict", "incomparable", "not_applicable"]
+    reason: str | None = None
+
+
+class EvidenceComparison(BaseModel):
+    """One claim-versus-fact comparison, bound to the evidence it came from."""
+
+    evidence_id: int
+    fact_id: int | None = None
+    pdf_page: int | None = None
+    qualifiers: list[QualifierComparison] = Field(default_factory=list)
+    numeric: NumericComparison
+
+
+class DecisionExplanation(BaseModel):
+    """Why this verdict, in operational terms.
+
+    ``verdict_rule`` is a stable machine-readable name for the rule that fired,
+    not model reasoning: the user-facing prose stays in ``rationale``. Nothing
+    here is a prompt, a raw model reply, or hidden chain-of-thought.
+    """
+
+    decided_by: Literal[
+        "deterministic_comparison", "semantic_adjudication", "no_evidence"
+    ]
+    verdict_rule: str
+    evidence_comparisons: list[EvidenceComparison] = Field(default_factory=list)
+
+
+class IndexReference(BaseModel):
+    """Exactly which ready version answered one audit.
+
+    Pinned before retrieval, so a trace read back later says what was searched
+    rather than what happens to be ready now.
+    """
+
+    document_id: int
+    document_version_id: int
+    embedding_model: str
+    embedding_dimensions: int
+
+
 class ClaimResult(BaseModel):
     claim: str
     verdict: Verdict
@@ -162,6 +234,11 @@ class ClaimResult(BaseModel):
     citations: list[Citation] = Field(default_factory=list)
     missing_qualifiers: list[str] = Field(default_factory=list)
     audit_id: int | None = None
+    decision_explanation: DecisionExplanation | None = None
+    # Elapsed seconds per public phase group; a phase that did not run is null
+    # rather than zero.
+    timings: dict[str, float | None] = Field(default_factory=dict)
+    index_references: list[IndexReference] = Field(default_factory=list)
 
 
 class IngestReport(BaseModel):
@@ -325,6 +402,9 @@ class AuditTrace(BaseModel):
     missing_qualifiers: list[str] = Field(default_factory=list)
     citation_ids: list[int] = Field(default_factory=list)
     candidates: list[TraceCandidate] = Field(default_factory=list)
+    decision_explanation: DecisionExplanation | None = None
+    timings: dict[str, float | None] = Field(default_factory=dict)
+    index_references: list[IndexReference] = Field(default_factory=list)
     error: str | None = None
 
     @property

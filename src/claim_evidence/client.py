@@ -14,8 +14,8 @@ import psycopg
 
 from .audit import audit_claim as _audit_claim
 from .config import Settings
-from .db import connect, delete_document, ready_documents
-from .errors import ValidationError
+from .db import connect, delete_document, document_scope, ready_documents
+from .errors import IndexNotReadyError, NotFoundError, ValidationError
 from .facts import heuristic_claim
 from .frontend import (
     as_id,
@@ -33,6 +33,7 @@ from .models import (
     EvidenceDetail,
     EvidenceMatch,
     HealthReport,
+    IndexReference,
     IngestReport,
     RemovalReport,
 )
@@ -49,7 +50,9 @@ class ClaimEvidence:
         client: OllamaClient | None = None,
     ) -> None:
         self.settings = settings
-        self.conn = conn or connect(settings.database_url)
+        self.conn = conn or connect(
+            settings.database_url, settings.database_connect_timeout
+        )
         self.ollama = client or OllamaClient(settings)
 
     @classmethod
@@ -147,6 +150,51 @@ class ClaimEvidence:
 
     # --- query --------------------------------------------------------------
 
+    def _resolve_scope(
+        self, document_ids: Sequence[int] | None
+    ) -> tuple[list[int] | None, list[IndexReference]]:
+        """Turn a requested document selection into a real, ready corpus.
+
+        Runs before anything expensive or persistent. An unknown or unindexed
+        document must be an error the caller can act on -- passing it straight
+        to SQL retrieves nothing, and "nothing retrieved" reads as `insufficient`,
+        which is a factual statement about the report rather than about the
+        request. ``None`` and ``[]`` both mean every ready document.
+        """
+        if not document_ids:
+            rows = document_scope(self.conn, None)
+            if not rows:
+                raise IndexNotReadyError(
+                    "no ready document version; ingest a document first"
+                )
+            return None, [_reference(row) for row in rows]
+
+        wanted: list[int] = []
+        for value in document_ids:
+            # bool is an int in Python; True is not document 1.
+            if isinstance(value, bool):
+                raise ValidationError(
+                    f"document_ids must be integer ids, got {value!r}"
+                )
+            wanted.append(as_id(value, "document_ids"))
+        unique = sorted(set(wanted))
+
+        rows = document_scope(self.conn, unique)
+        found = {int(row["document_id"]) for row in rows}
+        missing = [i for i in unique if i not in found]
+        if missing:
+            raise NotFoundError(f"no document with id {missing[0]}")
+        unready = [
+            int(row["document_id"])
+            for row in rows
+            if row["document_version_id"] is None
+        ]
+        if unready:
+            raise IndexNotReadyError(
+                f"document {unready[0]} has no ready version to query"
+            )
+        return unique, [_reference(row) for row in rows]
+
     def search_evidence(
         self,
         query: str,
@@ -154,13 +202,14 @@ class ClaimEvidence:
         document_ids: Sequence[int] | None = None,
         limit: int = 20,
     ) -> list[EvidenceMatch]:
+        scope, _references = self._resolve_scope(document_ids)
         parsed = heuristic_claim(query)
         try:
             embedding = self.ollama.embed([query])[0]
         except OllamaError:
             embedding = None
         candidates, _channels = retrieve(
-            self.conn, embedding, parsed, query, document_ids=document_ids, limit=limit
+            self.conn, embedding, parsed, query, document_ids=scope, limit=limit
         )
         return to_matches(self.conn, candidates)
 
@@ -172,15 +221,26 @@ class ClaimEvidence:
         limit: int = 20,
         progress: ProgressCallback | None = None,
     ) -> ClaimResult:
+        scope, references = self._resolve_scope(document_ids)
         return _audit_claim(
             self.conn,
             self.ollama,
             self.settings,
             claim,
-            document_ids=document_ids,
+            document_ids=scope,
+            index_references=references,
             limit=limit,
             progress=progress,
         )
+
+
+def _reference(row: dict) -> IndexReference:
+    return IndexReference(
+        document_id=int(row["document_id"]),
+        document_version_id=int(row["document_version_id"]),
+        embedding_model=row["embed_model"],
+        embedding_dimensions=int(row["embed_dim"]),
+    )
 
 
 __all__ = ["ClaimEvidence"]

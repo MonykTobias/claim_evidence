@@ -22,12 +22,22 @@ def write_output_root(
     drop_artifact: tuple[int, str] | None = None,
     duplicate_page: int | None = None,
     stale_page_dir: str | None = None,
+    page_numbers: list[int] | None = None,
+    page_dirs: dict[int, str] | None = None,
+    page_totals: dict[int, int] | None = None,
 ) -> Path:
-    """Build a minimal but structurally valid output root."""
+    """Build a minimal but structurally valid output root.
+
+    ``page_numbers`` writes an arbitrary selected range (``[10, 11, 12]``)
+    instead of ``1..pages``; ``page_dirs`` overrides the manifest's page_dir
+    value without moving the directory it was written to, which is how the
+    containment tests point a manifest entry outside the root.
+    """
+    numbers = page_numbers or list(range(1, pages + 1))
     root.mkdir(parents=True, exist_ok=True)
     statuses = statuses or {}
     manifest = []
-    for page in range(1, pages + 1):
+    for page in numbers:
         name = f"page_{page:04d}"
         page_dir = root / name
         page_dir.mkdir(exist_ok=True)
@@ -39,7 +49,14 @@ def write_output_root(
         )
         _write_page_png(page_dir / "page.png")
         (page_dir / "page_state.json").write_text(
-            json.dumps({"page": page, "total_pages": total_pages or pages}),
+            json.dumps(
+                {
+                    "page": page,
+                    "total_pages": (page_totals or {}).get(
+                        page, total_pages or len(numbers)
+                    ),
+                }
+            ),
             encoding="utf-8",
         )
         (page_dir / "table_candidates.json").write_text(
@@ -55,13 +72,13 @@ def write_output_root(
         manifest.append(
             {
                 "page": page,
-                "page_dir": name,
+                "page_dir": (page_dirs or {}).get(page, name),
                 "status": statuses.get(page, "completed"),
                 "failure": None,
             }
         )
     if duplicate_page is not None:
-        manifest.append(dict(manifest[duplicate_page - 1]))
+        manifest.append(dict(manifest[numbers.index(duplicate_page)]))
     (root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
     (root / "blocks.jsonl").write_text(
         "\n".join(json.dumps(b) for b in (blocks or [])), encoding="utf-8"

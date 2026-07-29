@@ -36,6 +36,7 @@ ollama pull qwen3-embedding:4b
 | Variable | Default |
 |---|---|
 | `CLAIM_EVIDENCE_DATABASE_URL` | `postgresql://claim_evidence:claim_evidence@localhost:5433/claim_evidence` |
+| `CLAIM_EVIDENCE_DATABASE_CONNECT_TIMEOUT` | `10` (seconds) |
 | `OLLAMA_BASE_URL` | `http://localhost:11434` |
 | `CLAIM_EVIDENCE_EMBED_MODEL` | `qwen3-embedding:4b` |
 | `CLAIM_EVIDENCE_EMBED_DIMENSIONS` | `1024` |
@@ -47,6 +48,12 @@ ollama pull qwen3-embedding:4b
 Point `CLAIM_EVIDENCE_DATABASE_URL` at a managed instance to skip Compose
 entirely. The embedding dimension is templated into the schema at `db init`, so
 changing the model means re-running `db init` on a fresh database.
+
+An unreachable database raises `DependencyUnavailableError` after
+`CLAIM_EVIDENCE_DATABASE_CONNECT_TIMEOUT` rather than blocking on the operating
+system's network timeout. libpq takes whole seconds and treats anything below 2
+as 2. A nonpositive or unparseable value is a `ValidationError` at startup, and
+neither error quotes the connection string.
 
 **On the 1024 default:** `qwen3-embedding:4b` natively returns 2560 dimensions
 and Ollama's `/api/embed` exposes no output-dimension parameter. Qwen3-Embedding
@@ -120,10 +127,57 @@ result = client.audit_claim(
 matches = client.search_evidence("Scope 1 and 2 emissions versus 2020", limit=20)
 ```
 
+`document_ids` is validated before anything is embedded, parsed, or persisted.
+`None` and `[]` both mean every ready document; an unknown id raises
+`NotFoundError`, an id with no ready version raises `IndexNotReadyError`, and a
+malformed one raises `ValidationError`. A mixed selection fails as a whole
+rather than quietly searching the valid part, and an empty index raises rather
+than returning an `insufficient` verdict — "nothing was retrieved" is a
+statement about the request, not about the report.
+
 `ClaimResult.evidence_quality` is one of `direct_text`, `direct_table`,
 `verified_visual`, `coarse_region`, `none`. There is deliberately no numeric
 model confidence: an uncalibrated number reads as precision the system does not
 have.
+
+### Why a verdict came out that way
+
+`ClaimResult` and `AuditTrace` both carry `decision_explanation`, `timings`, and
+`index_references`. The explanation is produced by the same comparison that
+decided the verdict, so the two can never disagree, and a caller never has to
+re-derive whether a qualifier matched.
+
+```text
+decision_explanation.decided_by    deterministic_comparison | semantic_adjudication | no_evidence
+decision_explanation.verdict_rule  exact_numeric_match | bounded_numeric_match
+                                   | comparable_numeric_conflict | mixed_comparable_facts
+                                   | semantic_evidence_support | semantic_evidence_conflict
+                                   | scope_not_comparable | no_citable_evidence
+                                   | missing_material_qualifier
+decision_explanation.evidence_comparisons[]
+    evidence_id  fact_id  pdf_page
+    qualifiers[] qualifier claim_value source_value status reason
+    numeric      claim_value claim_operator claim_direction
+                 source_value source_operator source_unit outcome reason
+```
+
+A qualifier is `match` only where the comparison actually established
+comparability; a qualifier the source omits is `missing`, and `mismatch` needs
+both sides present and disagreeing. `numeric.outcome` is `incomparable` when a
+qualifier blocked the arithmetic and `not_applicable` when either side states no
+number — a broad claim is never turned into a numeric conflict against narrower
+evidence. There is one entry per fact examined, so multiple or disagreeing facts
+keep their own comparisons.
+
+`verdict_rule` is operational metadata, not model reasoning; the user-facing
+prose stays in `rationale`. Nothing in the explanation is a prompt, a raw model
+reply, or a local path.
+
+`timings` reports elapsed seconds for `parsing`, `retrieval`, `fusion_context`,
+`visual_verification`, `verdict`, `persistence`, and `total`. A group whose
+phases never ran is `null` rather than `0.0`. `index_references` pins the exact
+ready `document_version_id`, embedding model, and dimension that answered the
+audit, and is recorded even for an `insufficient` verdict with no citations.
 
 Each `Citation` carries the document identity, `pdf_page` (always the 1-based
 PDF index, never a printed footer number), the quote or table cells, the
@@ -137,6 +191,18 @@ The run-level `manifest.json` is the authoritative page list. Stale `page_*`
 directories are reported and ignored; any page that is not `completed`, any
 duplicate or missing page, and any missing artifact aborts ingestion rather than
 producing an index with quiet holes in it.
+
+A run does not have to start at page 1. `page_state.total_pages` is the count of
+*selected* pages, so the manifest must cover a contiguous run of that length
+starting at its own first page — `1..494`, `1..20`, `10..20`, and a lone `359`
+are all valid, and a hole inside the range still fails closed. Page numbers are
+never renumbered: PDF page 359 is `359` in evidence, search results, and
+citations. Every selected page's checkpoint must agree on the count.
+
+Each manifest `page_dir` is resolved and required to stay strictly inside the
+registered output root before any artifact is opened. An absolute path, a `..`
+traversal, or a symlink pointing elsewhere is rejected, and the error names the
+page rather than the path it tried to reach.
 
 | Artifact | Used for | Citable |
 |---|---|---|
@@ -236,6 +302,19 @@ because a driver message can carry the host and user.
 version keeps serving queries throughout and is only retired once the
 replacement passes its integrity checks; if the rebuild fails, the previous
 version is still `ready`.
+
+Documents are identified internally by the strongest identity available — the
+source PDF's content hash, else `source_uri`, else the canonical output root —
+so two unrelated reports whose directories happen to share a basename are two
+documents, and removing one cannot remove the other. Registering two copies
+under one explicit `source_uri` still makes them versions of one document. The
+key is internal: no public result field exposes it.
+
+Resuming an interrupted build reconciles the half-finished version against the
+source rather than adding to it. Changed text is overwritten and its embedding
+is discarded and recomputed; units, pages, facts, and fact-evidence links the
+source no longer produces are deleted. Only the `building` version is ever
+touched — a `ready` or `inactive` one is left exactly as it is.
 
 `remove_document()` requires the id twice and deletes only index rows,
 returning per-table counts. It never touches the source PDF, the

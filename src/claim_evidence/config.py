@@ -9,9 +9,12 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
+from .errors import ValidationError
+
 DEFAULT_DATABASE_URL = (
     "postgresql://claim_evidence:claim_evidence@localhost:5433/claim_evidence"
 )
+DEFAULT_DATABASE_CONNECT_TIMEOUT = 10.0
 DEFAULT_OLLAMA_BASE_URL = "http://localhost:11434"
 DEFAULT_EMBED_MODEL = "qwen3-embedding:4b"
 DEFAULT_EMBED_DIMENSIONS = 1024
@@ -29,12 +32,30 @@ class Settings:
     vision_model: str = DEFAULT_VISION_MODEL
     embed_batch_size: int = 32
     request_timeout: float = 600.0
+    # Bounded on purpose: every frontend call opens its own connection, so an
+    # unreachable host must fail in seconds rather than on the OS network
+    # timeout with the browser spinning.
+    database_connect_timeout: float = DEFAULT_DATABASE_CONNECT_TIMEOUT
+
+    def __post_init__(self) -> None:
+        # Validated for every construction path, not just from_env(), and the
+        # message names the variable rather than echoing the database URL.
+        timeout = self.database_connect_timeout
+        if not isinstance(timeout, (int, float)) or timeout <= 0:
+            raise ValidationError(
+                "CLAIM_EVIDENCE_DATABASE_CONNECT_TIMEOUT must be a positive "
+                "number of seconds"
+            )
 
     @classmethod
     def from_env(cls) -> "Settings":
         return cls(
             database_url=os.environ.get(
                 "CLAIM_EVIDENCE_DATABASE_URL", DEFAULT_DATABASE_URL
+            ),
+            database_connect_timeout=_positive_float(
+                "CLAIM_EVIDENCE_DATABASE_CONNECT_TIMEOUT",
+                DEFAULT_DATABASE_CONNECT_TIMEOUT,
             ),
             ollama_base_url=os.environ.get(
                 "OLLAMA_BASE_URL", DEFAULT_OLLAMA_BASE_URL
@@ -65,4 +86,20 @@ class Settings:
         return (self.embed_model, str(self.embed_dimensions))
 
 
-__all__ = ["Settings", "DEFAULT_DATABASE_URL"]
+def _positive_float(variable: str, default: float) -> float:
+    raw = os.environ.get(variable)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        # Never echo the value: an operator can paste a URL into the wrong
+        # variable, and the error goes to a browser.
+        raise ValidationError(f"{variable} must be a positive number of seconds") from None
+
+
+__all__ = [
+    "DEFAULT_DATABASE_CONNECT_TIMEOUT",
+    "DEFAULT_DATABASE_URL",
+    "Settings",
+]
