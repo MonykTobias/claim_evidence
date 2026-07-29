@@ -372,7 +372,11 @@ def check_visual_counts(tmp: Path) -> None:
 
     charts = build_root(tmp / "withvisual", with_visual=True)
     accepting = default_session(
-        VisualVerification=lambda _: {"supports_claim": True, "visible_text": "40.2%"},
+        VisualVerification=lambda _: {
+            "result": "support",
+            "visible_text": "40.2%",
+            "reason_code": "value_and_metric_visible",
+        },
         Adjudication=lambda _: {
             "verdict": "insufficient",
             "rationale": "not comparable",

@@ -129,7 +129,7 @@ def test_displayed_values_coerce_to_decimal() -> None:
 
 def test_vision_sends_the_image_and_vision_model() -> None:
     session = FakeSession(
-        chat_replies=[reply({"supports_claim": True, "visible_text": "40.2%"})]
+        chat_replies=[reply({"result": "support", "visible_text": "40.2%", "reason_code": "value_and_metric_visible"})]
     )
     settings = Settings(embed_dimensions=8, vision_model="vision-model")
     result = OllamaClient(settings, session).vision(
@@ -158,7 +158,7 @@ def test_configured_context_reaches_the_request() -> None:
 
 def test_vision_uses_the_same_configured_context() -> None:
     session = FakeSession(
-        chat_replies=[reply({"supports_claim": False, "reason": "unreadable"})]
+        chat_replies=[reply({"result": "illegible", "reason_code": "figures_not_legible", "reason": "unreadable"})]
     )
     settings = Settings(embed_dimensions=8, vision_model="vision-model", num_ctx=8192)
     OllamaClient(settings, session).vision(

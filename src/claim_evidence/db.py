@@ -1083,6 +1083,47 @@ def fail_audit(
         )
 
 
+def record_visual_verification(
+    conn: psycopg.Connection,
+    audit_id: int,
+    evidence_id: int,
+    *,
+    result: str,
+    reason_code: str,
+    visible_text: str,
+) -> None:
+    """Persist one crop re-verification: what was visible, and the outcome.
+
+    The model's prose explanation is deliberately not a parameter. It is free
+    text about source content written by a model, and the two things a reader
+    actually needs -- what the crop showed and how it was graded -- are both
+    here without it.
+    """
+    conn.execute(
+        """
+        INSERT INTO visual_verification
+            (audit_id, evidence_id, result, reason_code, visible_text)
+        VALUES (%s, %s, %s, %s, %s)
+        ON CONFLICT (audit_id, evidence_id) DO UPDATE
+            SET result = EXCLUDED.result,
+                reason_code = EXCLUDED.reason_code,
+                visible_text = EXCLUDED.visible_text,
+                checked_at = now()
+        """,
+        (audit_id, evidence_id, result, reason_code, visible_text[:2000]),
+    )
+
+
+def visual_verifications(
+    conn: psycopg.Connection, audit_id: int
+) -> list[dict[str, Any]]:
+    return conn.execute(
+        "SELECT evidence_id, result, reason_code, visible_text"
+        " FROM visual_verification WHERE audit_id = %s ORDER BY evidence_id",
+        (audit_id,),
+    ).fetchall()
+
+
 def record_candidates(
     conn: psycopg.Connection, audit_id: int, candidates: Sequence[dict[str, Any]]
 ) -> None:
@@ -1199,6 +1240,7 @@ __all__ = [
     "ready_documents",
     "reconcile_interrupted",
     "record_candidates",
+    "record_visual_verification",
     "record_fact_failure",
     "regions_for",
     "set_embeddings",
@@ -1213,6 +1255,7 @@ __all__ = [
     "vector_dimension",
     "vector_search",
     "version_status",
+    "visual_verifications",
 ]
 
 

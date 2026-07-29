@@ -132,7 +132,18 @@ def test_missing_page_image_verifies_as_unsupported() -> None:
     result = verify_visual(None, Path("does-not-exist.png"), [region], CLAIM)
     check(isinstance(result, VisualVerification), "a missing crop still returns a verdict")
     check(not result.supports_claim, "an unreadable crop never supports a claim")
-    check("crop unavailable" in result.reason, "reason explains the failure")
+    check(
+        result.result.value == "illegible",
+        f"a missing crop is illegible, not merely unsupported ({result.result})",
+    )
+    check(
+        result.reason_code == "crop_unavailable",
+        "the reason is a stable code a caller can branch on",
+    )
+    check(
+        "does-not-exist.png" not in result.reason_code + result.reason,
+        "and it never echoes the server path it tried to open",
+    )
 
 
 def test_claim_without_a_number_has_no_value_tokens() -> None:

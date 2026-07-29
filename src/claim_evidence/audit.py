@@ -27,6 +27,7 @@ from .db import (
     fail_audit,
     finish_audit,
     record_candidates,
+    record_visual_verification,
     regions_for,
 )
 from .facts import (
@@ -47,6 +48,8 @@ from .models import (
     IndexReference,
     ParsedClaim,
     Verdict,
+    VisualResult,
+    VisualVerification,
 )
 from .errors import ClaimEvidenceError
 from .ollama import OllamaClient, OllamaError
@@ -225,7 +228,7 @@ def _audit(
         decided_by = "adjudicator"
         verdict, rationale, citations, missing, rule = _adjudicate(
             conn, client, claim, parsed, citable, regions, visual_status,
-            scope_ambiguous=scope_ambiguous, reporter=reporter,
+            scope_ambiguous=scope_ambiguous, reporter=reporter, audit_id=audit_id,
         )
     else:
         # Arithmetic decided, so no crop was ever inspected.
@@ -411,10 +414,13 @@ def _adjudicate(
     visual_status: dict[int, str],
     scope_ambiguous: bool = False,
     reporter: ProgressReporter | None = None,
+    audit_id: int | None = None,
 ) -> tuple[Verdict, str, list[Citation], list[str], str]:
+    visual_results: dict[int, VisualVerification] = {}
     usable = _verify_visuals(
         conn, client, claim, candidates, regions, visual_status,
         reporter or ProgressReporter(None, "audit"),
+        parsed, visual_results, audit_id,
     )
     (reporter or ProgressReporter(None, "audit")).start(
         "deciding_verdict", "Judging the evidence"
@@ -505,12 +511,17 @@ def _verify_visuals(
     regions: dict[int, list[dict[str, Any]]],
     visual_status: dict[int, str],
     reporter: ProgressReporter,
+    parsed: ParsedClaim,
+    visual_results: dict[int, VisualVerification],
+    audit_id: int | None = None,
 ) -> list[tuple[Citation, str, dict[str, Any]]]:
     """Citations the adjudicator may use.
 
-    Visual candidates are cropped and re-checked; one that fails verification
-    is dropped entirely rather than offered as weak support. The outcome is
-    recorded per candidate so the trace shows why a chart was not used.
+    Visual candidates are cropped and re-checked. An illegible or unrelated
+    crop is dropped rather than offered as weak support; a crop showing a
+    different figure goes forward, because that is evidence against the claim.
+    Every outcome is recorded per candidate so the trace shows why a chart was
+    or was not used.
     """
     usable: list[tuple[Citation, str, dict[str, Any]]] = []
     visuals = sum(
@@ -544,16 +555,35 @@ def _verify_visuals(
                 completed=checked, total=visuals,
             )
             continue
-        result = verify_visual(client, page_png, citation.regions, claim)
+        result = verify_visual(
+            client,
+            page_png,
+            citation.regions,
+            claim,
+            claim_value=str(parsed.value_decimal) if parsed.value_decimal is not None else "",
+            claim_unit=parsed.unit or "",
+        )
         reporter.step(
             "verifying_visuals",
             f"Checked crop {checked} of {visuals}",
             completed=checked,
             total=visuals,
         )
-        if not result.supports_claim:
+        visual_results[evidence_id] = result
+        if audit_id is not None:
+            record_visual_verification(
+                conn, audit_id, evidence_id,
+                result=str(result.result),
+                reason_code=result.reason_code,
+                visible_text=result.visible_text,
+            )
+        if result.result in (VisualResult.ILLEGIBLE, VisualResult.UNRELATED):
             visual_status[evidence_id] = "rejected"
             continue
+        # A crop showing a *different* figure is evidence against the claim, so
+        # it goes forward as usable evidence exactly like a supporting one. The
+        # comparison downstream is what decides which way it counts; dropping it
+        # here would silently discard the strongest kind of contradiction.
         visual_status[evidence_id] = "verified"
         usable.append(
             (

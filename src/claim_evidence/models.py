@@ -704,12 +704,41 @@ class FactExtraction(BaseModel):
     facts: list[Fact] = Field(default_factory=list)
 
 
-class VisualVerification(BaseModel):
-    """Vision model response for one evidence crop."""
+class VisualResult(StrEnum):
+    """What one re-verified crop turned out to be (PD-09).
 
-    supports_claim: bool
+    ``conflict`` is deliberately not "does not support": a crop showing a
+    different figure is evidence *against* the claim, and folding it in with an
+    unreadable one loses that.
+    """
+
+    SUPPORT = "support"
+    CONFLICT = "conflict"
+    ILLEGIBLE = "illegible"
+    UNRELATED = "unrelated"
+
+
+class VisualVerification(BaseModel):
+    """Vision model response for one evidence crop.
+
+    ``visible_text`` is what the model reports it can read, and is checked
+    against the claim before a support or conflict is allowed to stand.
+    ``reason`` is the model's own prose: kept for the local debug log, never
+    persisted and never published -- ``reason_code`` is what a caller sees.
+    """
+
+    result: VisualResult
     visible_text: str = ""
+    reason_code: str = ""
     reason: str = ""
+
+    @property
+    def supports_claim(self) -> bool:
+        return self.result is VisualResult.SUPPORT
+
+    @property
+    def conflicts_with_claim(self) -> bool:
+        return self.result is VisualResult.CONFLICT
 
 
 class Adjudication(BaseModel):
@@ -749,6 +778,7 @@ __all__ = [
     "RemovalReport",
     "TraceCandidate",
     "Verdict",
+    "VisualResult",
     "VersionStatus",
     "VisualVerification",
 ]

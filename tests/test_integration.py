@@ -249,7 +249,10 @@ def default_session(**router: Any) -> FakeSession:
             "ParsedClaim": parsed_claim_reply,
             "FactExtraction": lambda _: {"facts": []},
             "Adjudication": adjudication_reply,
-            "VisualVerification": lambda _: {"supports_claim": False, "reason": "unreadable"},
+            "VisualVerification": lambda _: {
+                "result": "illegible",
+                "reason_code": "figures_not_legible",
+            },
             **router,
         },
     )
@@ -527,9 +530,9 @@ def check_visual_evidence_needs_crop_verification(tmp: Path) -> None:
 
     accepting = default_session(
         VisualVerification=lambda _: {
-            "supports_claim": True,
+            "result": "support",
             "visible_text": "-40.2% vs 2020",
-            "reason": "the figure is legible",
+            "reason_code": "value_and_metric_visible",
         },
         Adjudication=lambda payload: {
             "verdict": "supported",
