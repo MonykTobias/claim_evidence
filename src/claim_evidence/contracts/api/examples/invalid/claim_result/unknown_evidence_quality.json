@@ -1,0 +1,110 @@
+{
+  "claim": "Danone reduced Scope 1 and 2 energy and industry emissions by 40.2% in 2025 versus 2020.",
+  "verdict": "supported",
+  "rationale": "Supported by indexed sources: page 359 states -40.2% for the same metric, unit, and periods.",
+  "evidence_quality": "pretty_good",
+  "citations": [
+    {
+      "evidence_id": 4821,
+      "document_id": 3,
+      "document_name": "sustainability_report.pdf",
+      "document_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "source_uri": null,
+      "pdf_page": 359,
+      "printed_page_label": "357",
+      "source_kind": "table_value",
+      "quality": "direct_table",
+      "quote": "(40.2) %",
+      "table_cells": [
+        "Scope 1 & 2 energy and industry emissions",
+        "2025",
+        "(40.2) %"
+      ],
+      "heading_path": [
+        "Environment",
+        "Climate"
+      ],
+      "artifact_path": "page_0359/table_candidates.json",
+      "regions": [
+        {
+          "bbox": [
+            0.12,
+            0.41,
+            0.58,
+            0.44
+          ],
+          "role": "value",
+          "precision": "cell",
+          "source_bbox": [
+            72.0,
+            344.4,
+            348.0,
+            369.6
+          ],
+          "source_origin": "TOPLEFT",
+          "coordinate_space": "normalized_top_left"
+        }
+      ],
+      "geometry_precision": "cell"
+    }
+  ],
+  "missing_qualifiers": [],
+  "audit_id": 118,
+  "decision_explanation": {
+    "decided_by": "deterministic_comparison",
+    "verdict_rule": "exact_match_no_conflict",
+    "evidence_comparisons": [
+      {
+        "evidence_id": 4821,
+        "fact_id": 902,
+        "pdf_page": 359,
+        "qualifiers": [
+          {
+            "qualifier": "metric",
+            "claim_value": "scope 1 and 2 energy and industry emissions",
+            "source_value": "scope 1 & 2 energy and industry emissions",
+            "status": "match",
+            "reason": null
+          },
+          {
+            "qualifier": "reporting_period",
+            "claim_value": "2025",
+            "source_value": "2025",
+            "status": "match",
+            "reason": null
+          },
+          {
+            "qualifier": "baseline_period",
+            "claim_value": "2020",
+            "source_value": "2020",
+            "status": "match",
+            "reason": null
+          }
+        ],
+        "numeric": {
+          "claim_value": "-40.2",
+          "claim_operator": "=",
+          "claim_direction": "decrease",
+          "source_value": "-40.2",
+          "source_operator": "=",
+          "source_unit": "%",
+          "outcome": "match",
+          "reason": null
+        }
+      }
+    ]
+  },
+  "timings": {
+    "retrieval": 0.84,
+    "verdict": 0.01,
+    "visual_verification": null
+  },
+  "index_references": [
+    {
+      "document_id": 3,
+      "document_version_id": 11,
+      "embedding_model": "qwen3-embedding:4b",
+      "embedding_dimensions": 1024
+    }
+  ]
+}

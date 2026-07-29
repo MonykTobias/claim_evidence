@@ -2,12 +2,82 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from document_extract.contracts import (
+    COORDINATE_CONVENTION,
+    EVIDENCE_BEARING_ROLES,
+    PAGE_ARTIFACT_ROLES,
+    ROOT_ARTIFACT_ROLES,
+    RUN_CONTRACT,
+    RUN_CONTRACT_VERSION,
+)
+
 PAGE_W = 600.0
 PAGE_H = 800.0
+
+
+def run_contract(
+    *,
+    numbers: list[int],
+    selected_count: int | None = None,
+    source_page_count: int | None = None,
+    source_sha256: str | None = None,
+    **overrides: Any,
+) -> dict[str, Any]:
+    """A valid ``run.json`` payload for a synthetic output root.
+
+    ``selected_count`` is how many pages the run *selected*, which is not
+    always how many the manifest ended up listing -- that difference is what
+    the incomplete-range tests are about.
+    """
+    start = numbers[0]
+    count = selected_count or len(numbers)
+    end = start + count - 1
+    total = max(source_page_count or end, end)
+    payload: dict[str, Any] = {
+        "contract": RUN_CONTRACT,
+        "contract_version": RUN_CONTRACT_VERSION,
+        "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "source": {
+            "filename": "fixture.pdf",
+            "sha256": source_sha256
+            or hashlib.sha256(str(numbers).encode()).hexdigest(),
+            "page_count": total,
+        },
+        "selection": {
+            "start_page": start,
+            "end_page": end,
+            "page_count": count,
+            "complete_document": start == 1 and end == total,
+        },
+        "coordinate_convention": COORDINATE_CONVENTION,
+        "artifacts": {
+            "root": dict(ROOT_ARTIFACT_ROLES),
+            "page": dict(PAGE_ARTIFACT_ROLES),
+        },
+        "evidence_bearing_roles": list(EVIDENCE_BEARING_ROLES),
+        "settings": {
+            "dpi": 200,
+            "refine_mode": "auto",
+            "visual_values_mode": "enforce",
+            "vlm_model": "fixture-vlm",
+            "num_ctx": 16384,
+        },
+        "pages": {"completed": len(numbers), "failed": 0},
+        "warnings": {"total": 0, "categories": {}, "stale_page_dirs": []},
+    }
+    for path, value in overrides.items():
+        target = payload
+        parts = path.split(".")
+        for part in parts[:-1]:
+            target = target[part]
+        target[parts[-1]] = value
+    return payload
 
 
 def write_output_root(
@@ -25,6 +95,8 @@ def write_output_root(
     page_numbers: list[int] | None = None,
     page_dirs: dict[int, str] | None = None,
     page_totals: dict[int, int] | None = None,
+    run: dict[str, Any] | None = None,
+    drop_run: bool = False,
 ) -> Path:
     """Build a minimal but structurally valid output root.
 
@@ -83,6 +155,13 @@ def write_output_root(
     (root / "blocks.jsonl").write_text(
         "\n".join(json.dumps(b) for b in (blocks or [])), encoding="utf-8"
     )
+    if not drop_run:
+        payload = run if run is not None else run_contract(
+            numbers=numbers, selected_count=total_pages or len(numbers)
+        )
+        (root / "run.json").write_text(
+            json.dumps(payload, indent=2), encoding="utf-8"
+        )
     if stale_page_dir:
         (root / stale_page_dir).mkdir(exist_ok=True)
     return root

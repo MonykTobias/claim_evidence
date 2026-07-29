@@ -15,6 +15,25 @@ from typing import Any, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from .errors import ValidationError
+
+
+class PublicModel(BaseModel):
+    """Base for every type that crosses the package boundary.
+
+    ``extra="forbid"`` is the contract rule, not a style choice: a caller that
+    sends a key this package does not know about has misunderstood the request,
+    and quietly dropping it means answering a question nobody asked. The same
+    strictness catches a producer and a consumer drifting apart while both
+    still report success.
+
+    LLM response models deliberately do *not* inherit this: a chatty model
+    adding a field is handled by the quote gate and the evidence-id allowlist,
+    not by refusing to parse the reply at all.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
 
 def _coerce_displayed_value(value: Any) -> Any:
     """Read a displayed value string into a Decimal.
@@ -107,7 +126,7 @@ class VersionStatus(StrEnum):
     INACTIVE = "inactive"
 
 
-class Region(BaseModel):
+class Region(PublicModel):
     """One highlightable rectangle on a page.
 
     ``bbox`` is always ``[left, top, right, bottom]`` normalized to 0-1 with a
@@ -127,7 +146,7 @@ class Region(BaseModel):
     _coerce_role = field_validator("role", mode="before")(_coerce_role)
 
 
-class Citation(BaseModel):
+class Citation(PublicModel):
     evidence_id: int
     document_id: int
     document_name: str
@@ -145,7 +164,7 @@ class Citation(BaseModel):
     geometry_precision: GeometryPrecision = GeometryPrecision.BLOCK
 
 
-class EvidenceMatch(BaseModel):
+class EvidenceMatch(PublicModel):
     citation: Citation
     text: str
     lexical_rank: int | None = None
@@ -160,7 +179,7 @@ QualifierName = Literal[
 ]
 
 
-class QualifierComparison(BaseModel):
+class QualifierComparison(PublicModel):
     """How one material qualifier of the claim lined up with one stored fact.
 
     ``match`` means the package's own comparison established comparability --
@@ -175,7 +194,7 @@ class QualifierComparison(BaseModel):
     reason: str | None = None
 
 
-class NumericComparison(BaseModel):
+class NumericComparison(PublicModel):
     """The arithmetic, in the terms the page and the claim each stated it."""
 
     claim_value: str | None = None
@@ -188,7 +207,7 @@ class NumericComparison(BaseModel):
     reason: str | None = None
 
 
-class EvidenceComparison(BaseModel):
+class EvidenceComparison(PublicModel):
     """One claim-versus-fact comparison, bound to the evidence it came from."""
 
     evidence_id: int
@@ -198,7 +217,7 @@ class EvidenceComparison(BaseModel):
     numeric: NumericComparison
 
 
-class DecisionExplanation(BaseModel):
+class DecisionExplanation(PublicModel):
     """Why this verdict, in operational terms.
 
     ``verdict_rule`` is a stable machine-readable name for the rule that fired,
@@ -213,7 +232,7 @@ class DecisionExplanation(BaseModel):
     evidence_comparisons: list[EvidenceComparison] = Field(default_factory=list)
 
 
-class IndexReference(BaseModel):
+class IndexReference(PublicModel):
     """Exactly which ready version answered one audit.
 
     Pinned before retrieval, so a trace read back later says what was searched
@@ -226,7 +245,7 @@ class IndexReference(BaseModel):
     embedding_dimensions: int
 
 
-class ClaimResult(BaseModel):
+class ClaimResult(PublicModel):
     claim: str
     verdict: Verdict
     rationale: str
@@ -241,7 +260,89 @@ class ClaimResult(BaseModel):
     index_references: list[IndexReference] = Field(default_factory=list)
 
 
-class IngestReport(BaseModel):
+class AuditRequest(PublicModel):
+    """One audit request, with its corpus stated rather than inferred.
+
+    Scope is explicit on purpose. An omitted, null, or empty selection used to
+    mean "search everything", which turns a frontend bug — a document list that
+    had not loaded yet — into a silently much larger query whose answer looks
+    perfectly normal. There is no value that means "whatever you think best".
+    """
+
+    claim: str
+    scope: Literal["all"] | list[int]
+    limit: int = 20
+
+    @model_validator(mode="before")
+    @classmethod
+    def _explicit_scope(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        if "scope" not in data or data["scope"] is None:
+            raise ValidationError(
+                "scope is required: pass 'all' or a non-empty list of document ids"
+            )
+        scope = data["scope"]
+        if isinstance(scope, str):
+            if scope != "all":
+                raise ValidationError("scope must be 'all' or a list of document ids")
+            return data
+        if isinstance(scope, (list, tuple)):
+            if not scope:
+                raise ValidationError(
+                    "scope is an empty list; pass 'all' to search every document"
+                )
+            for value in scope:
+                # bool is an int in Python; True is not document 1.
+                if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                    raise ValidationError("scope must contain positive document ids")
+            return data
+        raise ValidationError("scope must be 'all' or a list of document ids")
+
+    @field_validator("claim")
+    @classmethod
+    def _non_empty_claim(cls, value: str) -> str:
+        text = value.strip()
+        if not text:
+            raise ValidationError("claim is required")
+        if len(text) > 10_000:
+            raise ValidationError("claim must be at most 10000 characters")
+        return text
+
+    @field_validator("limit")
+    @classmethod
+    def _bounded_limit(cls, value: int) -> int:
+        if isinstance(value, bool) or not 1 <= value <= 50:
+            raise ValidationError("limit must be between 1 and 50")
+        return value
+
+    @property
+    def document_ids(self) -> list[int] | None:
+        """The selection as retrieval wants it: ``None`` means every document."""
+        return None if self.scope == "all" else sorted(set(self.scope))
+
+
+class PublicError(PublicModel):
+    """The one error shape every public surface returns.
+
+    A stable code the caller branches on and a sentence written for a person.
+    Never a driver message, a model reply, a prompt, a stack trace, or a path:
+    those are local debug-log data and reach nobody through this type.
+    """
+
+    error_code: Literal[
+        "validation_error",
+        "unsupported_claim",
+        "not_found",
+        "index_not_ready",
+        "dependency_unavailable",
+        "internal_error",
+    ]
+    message: str
+    retryable: bool = False
+
+
+class IngestReport(PublicModel):
     document_id: int
     version_id: int
     status: VersionStatus
@@ -270,7 +371,7 @@ def phase_percent(completed: int | None, total: int | None) -> float | None:
     return round(min(100.0, max(0.0, 100.0 * completed / total)), 2)
 
 
-class ProgressEvent(BaseModel):
+class ProgressEvent(PublicModel):
     """One phase update from a running ingestion or audit.
 
     Carries counts and identifiers only. Never a prompt, a model response,
@@ -305,13 +406,13 @@ class ProgressEvent(BaseModel):
 # --- Frontend-support types -------------------------------------------------
 
 
-class ModelHealth(BaseModel):
+class ModelHealth(PublicModel):
     role: Literal["embed", "chat", "vision"]
     name: str
     available: bool
 
 
-class HealthReport(BaseModel):
+class HealthReport(PublicModel):
     """System diagnostics. Carries no credentials, connection strings, raw
     driver exceptions, or prompts -- only categories and safe sentences."""
 
@@ -345,7 +446,7 @@ class HealthReport(BaseModel):
         return self.database_reachable and self.schema_current and not self.problems
 
 
-class DocumentSummary(BaseModel):
+class DocumentSummary(PublicModel):
     document_id: int
     document_version_id: int
     name: str
@@ -365,13 +466,13 @@ class DocumentSummary(BaseModel):
     source_pdf: str | None = None
 
 
-class RemovalReport(BaseModel):
+class RemovalReport(PublicModel):
     document_id: int
     name: str
     deleted: dict[str, int] = Field(default_factory=dict)
 
 
-class TraceCandidate(BaseModel):
+class TraceCandidate(PublicModel):
     evidence_id: int
     pdf_page: int
     source_kind: EvidenceKind
@@ -392,7 +493,7 @@ class TraceCandidate(BaseModel):
     reason: str | None = None
 
 
-class AuditTrace(BaseModel):
+class AuditTrace(PublicModel):
     """Operational retrieval metadata for one audit.
 
     How candidates were found and ranked -- not model reasoning. Only the
@@ -438,7 +539,7 @@ class AuditTrace(BaseModel):
         return [c for c in self.candidates if c.vector_rank is not None]
 
 
-class EvidenceDetail(BaseModel):
+class EvidenceDetail(PublicModel):
     """Everything needed to render a cited region over its page image.
 
     The package renders nothing itself: it publishes one authoritative
@@ -592,6 +693,7 @@ class Adjudication(BaseModel):
 
 __all__ = [
     "Adjudication",
+    "AuditRequest",
     "AuditTrace",
     "Citation",
     "ClaimResult",
@@ -609,6 +711,8 @@ __all__ = [
     "ModelHealth",
     "ParsedClaim",
     "ProgressEvent",
+    "PublicError",
+    "PublicModel",
     "phase_percent",
     "Region",
     "RegionRole",

@@ -1,0 +1,14 @@
+{
+  "operation": "evaluate",
+  "phase": "retrieving_vectors",
+  "status": "progress",
+  "message": "Retrieved 20 vector candidates",
+  "completed": 20,
+  "total": 20,
+  "percent": 100.0,
+  "document_id": null,
+  "audit_id": 118,
+  "current_item": null,
+  "details": {},
+  "timestamp": "2026-07-29T12:00:00Z"
+}

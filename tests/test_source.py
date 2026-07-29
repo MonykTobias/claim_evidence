@@ -368,9 +368,14 @@ def test_page_markdown_is_not_citable() -> None:
 
 
 def test_real_danone_page_359() -> None:
-    """Skips cleanly when the completed run is not on this machine."""
-    if not (REAL_ROOT / "manifest.json").is_file():
-        print("[skip] danone output root not present")
+    """Skips cleanly when a current-contract run is not on this machine.
+
+    ``run.json`` is the marker, not ``manifest.json``: an output root written
+    before the run contract existed is deliberately not indexable, so its
+    presence is not evidence that this check can run.
+    """
+    if not (REAL_ROOT / "run.json").is_file():
+        print("[skip] no current-contract danone output root present")
         return
     reader = OutputReader(REAL_ROOT)
     page = next(p for p in reader.validate() if p.page == 359)

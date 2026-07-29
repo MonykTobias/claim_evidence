@@ -1,0 +1,5 @@
+{
+  "error_code": "unsupported_claim",
+  "message": "Version 1 accepts one entity, one metric, and one exact value; this claim compares two metrics.",
+  "retryable": false
+}

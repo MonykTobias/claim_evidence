@@ -9,6 +9,9 @@ description = "Evidence-first claim auditing over completed document_extract out
 requires-python = ">=3.12"
 dependencies = [
     "pydantic>=2.7,<3",
+    # The extraction contract lives with its producer; importing it is what
+    # keeps one vocabulary instead of two that drift.
+    "document_extract",
     "psycopg[binary]>=3.2,<4",
     "pgvector>=0.3,<0.5",
     "requests>=2.31,<3",
@@ -22,7 +25,7 @@ claim-evidence = "claim_evidence.cli:cli"
 where = ["src"]
 
 [tool.setuptools.package-data]
-claim_evidence = ["sql/*.sql"]
+claim_evidence = ["sql/*.sql", "contracts/*/*.json", "contracts/*/examples/*/*/*.json"]
 
 [tool.mypy]
 python_version = "3.12"

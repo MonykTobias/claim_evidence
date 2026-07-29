@@ -15,6 +15,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
 
+from document_extract.contracts import (
+    OPTIONAL_PAGE_ROLES,
+    PAGE_ARTIFACT_ROLES,
+    ROOT_ARTIFACT_ROLES,
+    ContractError,
+    validate_run,
+)
+
 from .errors import ValidationError
 from .models import (
     EvidenceKind,
@@ -32,19 +40,19 @@ from .normalize import (
     union_bbox,
 )
 
-MANIFEST_NAME = "manifest.json"
-BLOCKS_NAME = "blocks.jsonl"
-REQUIRED_PAGE_ARTIFACTS = (
-    "docling_final.md",
-    "layout_prompt_map.json",
-    "page.png",
-    "table_candidates.json",
-    "page_state.json",
+RUN_NAME = ROOT_ARTIFACT_ROLES["run"]
+MANIFEST_NAME = ROOT_ARTIFACT_ROLES["manifest"]
+BLOCKS_NAME = ROOT_ARTIFACT_ROLES["blocks"]
+# Taken from the extraction contract rather than restated here: the producer
+# declares which roles exist and what each is called, and a second copy of that
+# list in the consumer is exactly how the two drift apart.
+REQUIRED_PAGE_ARTIFACTS = tuple(
+    name for role, name in PAGE_ARTIFACT_ROLES.items() if role not in OPTIONAL_PAGE_ROLES
 )
 # Everything a page's evidence, geometry, or visual verification depends on.
-# `image_summaries.jsonl` is optional but authoritative where it exists, so it
-# is absorbed as "absent" rather than skipped when it is not there.
-FINGERPRINTED_ARTIFACTS = (*REQUIRED_PAGE_ARTIFACTS, "image_summaries.jsonl")
+# An optional artifact is absorbed as "absent" rather than skipped, so a page
+# that gains or loses one still changes the fingerprint.
+FINGERPRINTED_ARTIFACTS = tuple(PAGE_ARTIFACT_ROLES.values())
 # Block text is capped at 500 characters in older runs; `text_full` is the
 # uncapped field and is preferred whenever the producing run emitted it.
 LEGACY_TEXT_CAP = 500
@@ -83,8 +91,37 @@ class OutputReader:
         self.skipped: list[str] = []
         self._manifest: list[dict[str, Any]] | None = None
         self._pages: list[PageSource] | None = None
+        self._run: dict[str, Any] | None = None
 
     # --- validation ---------------------------------------------------------
+
+    @property
+    def run(self) -> dict[str, Any]:
+        """The extraction's own statement of what it produced.
+
+        Required, and required to be the current contract version. There is no
+        reader for output written before the contract existed: an old root's
+        artifacts may be laid out differently, and guessing is how an index
+        ends up citing the wrong page with complete confidence. The answer is
+        always to re-extract, and the message says so.
+        """
+        if self._run is None:
+            path = self.root / RUN_NAME
+            if not path.is_file():
+                raise OutputValidationError(
+                    f"{RUN_NAME} is missing from the output root: this extraction "
+                    f"predates the current run contract and cannot be indexed. "
+                    f"Re-extract the document."
+                )
+            try:
+                self._run = validate_run(json.loads(path.read_text(encoding="utf-8")))
+            except json.JSONDecodeError:
+                raise OutputValidationError(f"{RUN_NAME} is not valid JSON") from None
+            except ContractError as exc:
+                # The contract's own message names the offending key or version
+                # and never echoes a value, so it is safe to pass through.
+                raise OutputValidationError(f"{RUN_NAME} is not usable: {exc}") from None
+        return self._run
 
     @property
     def manifest(self) -> list[dict[str, Any]]:
@@ -142,25 +179,28 @@ class OutputReader:
                 )
             )
 
-        # `total_pages` counts the *selected* pages, not the source PDF's last
-        # page: an extraction of pages 10..20 writes 11. So the manifest must
-        # cover a contiguous run of that length starting at its own first page,
-        # which is one rule for full, prefix, middle, and single-page runs.
-        selected = {self._total_pages(p.page_dir) for p in pages}
-        if len(selected) > 1:
-            raise OutputValidationError(
-                f"page checkpoints disagree on total_pages: {sorted(selected)}"
-            )
-        count = selected.pop()
-        first = pages[0].page
-        expected = set(range(first, first + count))
+        # The run contract states which pages were selected. The manifest must
+        # cover exactly that range: a partial extraction is legitimate, but an
+        # extraction that silently lost pages out of the middle of its own
+        # selection is an index with invisible holes in it.
+        selection = self.run["selection"]
+        expected = set(range(selection["start_page"], selection["end_page"] + 1))
         missing = sorted(expected - seen.keys())
         extra = sorted(seen.keys() - expected)
         if missing or extra:
             raise OutputValidationError(
-                f"manifest covers {len(seen)} pages but {count} were selected; "
-                f"expected {first}..{first + count - 1}, "
+                f"manifest covers {len(seen)} pages but the run selected "
+                f"{selection['page_count']} "
+                f"({selection['start_page']}..{selection['end_page']}); "
                 f"missing {missing[:10]}, unexpected {extra[:10]}"
+            )
+        # Page checkpoints carry the same count; a disagreement means the
+        # directory mixes two runs.
+        counts = {self._total_pages(p.page_dir) for p in pages}
+        if counts != {selection["page_count"]}:
+            raise OutputValidationError(
+                f"page checkpoints disagree with the run selection: "
+                f"{sorted(counts)} against {selection['page_count']}"
             )
 
         stale = sorted(
