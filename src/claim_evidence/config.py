@@ -7,7 +7,9 @@ managed PostgreSQL and a remote Ollama without a config file.
 from __future__ import annotations
 
 import os
+import tempfile
 from dataclasses import dataclass
+from pathlib import Path
 
 from .errors import ValidationError
 
@@ -26,6 +28,12 @@ DEFAULT_EMBED_MODEL = "qwen3-embedding:4b"
 DEFAULT_EMBED_DIMENSIONS = 1024
 DEFAULT_CHAT_MODEL = "hf.co/unsloth/Qwen3-VL-4B-Instruct-GGUF:UD-Q8_K_XL"
 DEFAULT_VISION_MODEL = DEFAULT_CHAT_MODEL
+
+# One shared file that says "the local application is running". The frontend
+# creates it at startup and removes it on exit; the destructive reset refuses
+# while it exists. A fixed temp-directory path rather than something derived
+# from a checkout, so the CLI and the app agree without being configured to.
+DEFAULT_APP_MARKER = str(Path(tempfile.gettempdir()) / "claim_evidence_app.running")
 
 
 @dataclass(frozen=True)
@@ -49,6 +57,11 @@ class Settings:
     build_stale_minutes: float = DEFAULT_BUILD_STALE_MINUTES
     # Context window for chat and vision requests. Embeddings are unaffected.
     num_ctx: int = DEFAULT_NUM_CTX
+    # Empty unless CE_ENVIRONMENT is set. Destructive operations require the
+    # exact value "development", so an unset environment is never a development
+    # one by accident.
+    environment: str = ""
+    app_marker: str = DEFAULT_APP_MARKER
 
     def __post_init__(self) -> None:
         # Validated for every construction path, not just from_env(), and the
@@ -76,6 +89,8 @@ class Settings:
                 "CLAIM_EVIDENCE_BUILD_STALE_MINUTES", DEFAULT_BUILD_STALE_MINUTES
             ),
             num_ctx=_positive_int("CLAIM_EVIDENCE_NUM_CTX", DEFAULT_NUM_CTX),
+            environment=os.environ.get("CE_ENVIRONMENT", "").strip(),
+            app_marker=os.environ.get("CLAIM_EVIDENCE_APP_MARKER", DEFAULT_APP_MARKER),
             ollama_base_url=os.environ.get(
                 "OLLAMA_BASE_URL", DEFAULT_OLLAMA_BASE_URL
             ).rstrip("/"),

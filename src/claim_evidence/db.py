@@ -7,6 +7,7 @@ keeps an interrupted build invisible to queries rather than partially visible.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import re
@@ -26,8 +27,66 @@ from .errors import DependencyUnavailableError
 from .models import EvidenceUnit, Fact, VersionStatus
 
 SQL_DIR = Path(__file__).parent / "sql"
+SCHEMA_PATH = SQL_DIR / "schema.sql"
 EMBED_DIM_TOKEN = "EMBED_DIM"
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
+
+# A small sanity list, not a catalogue signature. It answers "is this database
+# the one this package installed?" -- enough to refuse a mismatched target, and
+# deliberately not an exhaustive physical-schema comparison, which belongs with
+# a stable schema and an upgrade path (DG-01).
+REQUIRED_TABLES = (
+    "schema_meta",
+    "document",
+    "document_version",
+    "fact_candidate_failure",
+    "page",
+    "evidence_unit",
+    "evidence_region",
+    "entity",
+    "entity_alias",
+    "fact",
+    "fact_evidence",
+    "audit_run",
+    "audit_candidate",
+    "visual_verification",
+)
+REQUIRED_COLUMNS = (
+    ("schema_meta", "schema_sql_sha256"),
+    ("schema_meta", "initialized_at"),
+    ("document", "identity_key"),
+    ("document_version", "fact_candidates_total"),
+    ("document_version", "last_progress_at"),
+    ("evidence_unit", "source_order"),
+    ("evidence_unit", "context_key"),
+    ("audit_run", "requested_document_ids"),
+    ("audit_run", "status"),
+)
+
+
+class SchemaMismatchError(DependencyUnavailableError):
+    """The database is not the one this package's schema file describes.
+
+    Raised instead of altering anything. Development data is disposable, so the
+    supported answer is a guarded reset and a re-index -- an in-place upgrade
+    path is deferred until a schema is declared stable.
+    """
+
+
+def schema_sql(embed_dim: int) -> str:
+    return SCHEMA_PATH.read_text(encoding="utf-8").replace(
+        EMBED_DIM_TOKEN, str(int(embed_dim))
+    )
+
+
+def schema_sql_sha256() -> str:
+    """Digest of the schema asset itself, before dimension substitution.
+
+    The configured dimension is checked separately, by reading the column's
+    declared type: folding it in here would report "your schema file changed"
+    for what is really a configuration difference.
+    """
+    return hashlib.sha256(SCHEMA_PATH.read_bytes()).hexdigest()
 
 
 def connect(
@@ -58,12 +117,126 @@ def connect(
     return conn
 
 
-def init_schema(conn: psycopg.Connection, embed_dim: int) -> None:
-    for path in sorted(SQL_DIR.glob("*.sql")):
-        sql = path.read_text(encoding="utf-8").replace(EMBED_DIM_TOKEN, str(int(embed_dim)))
-        conn.execute(sql)
+def schema_marker(conn: psycopg.Connection) -> dict[str, Any] | None:
+    """What this database says installed it, or ``None`` if it says nothing."""
+    try:
+        return conn.execute(
+            "SELECT version, schema_sql_sha256, initialized_at FROM schema_meta"
+            " WHERE id = 1"
+        ).fetchone()
+    except psycopg.errors.UndefinedTable:
+        conn.rollback()
+        return None
+    except psycopg.errors.UndefinedColumn:
+        # A schema_meta from before the marker existed: present, but it cannot
+        # say what installed it, which is the same answer as "not current".
+        conn.rollback()
+        return {"version": None, "schema_sql_sha256": None, "initialized_at": None}
+
+
+def missing_objects(conn: psycopg.Connection) -> list[str]:
+    """Required tables and columns this database does not have."""
+    rows = conn.execute(
+        """
+        SELECT table_name, column_name FROM information_schema.columns
+        WHERE table_schema = current_schema()
+        """
+    ).fetchall()
+    tables = {row["table_name"] for row in rows}
+    columns = {(row["table_name"], row["column_name"]) for row in rows}
+    missing = [f"table {name}" for name in REQUIRED_TABLES if name not in tables]
+    missing += [
+        f"column {table}.{column}"
+        for table, column in REQUIRED_COLUMNS
+        if table in tables and (table, column) not in columns
+    ]
+    return missing
+
+
+def is_empty(conn: psycopg.Connection) -> bool:
+    """True when the target schema holds no tables at all."""
+    row = conn.execute(
+        "SELECT count(*) AS n FROM information_schema.tables"
+        " WHERE table_schema = current_schema()"
+    ).fetchone()
+    return int(row["n"]) == 0
+
+
+def init_schema(conn: psycopg.Connection, embed_dim: int) -> str:
+    """Install the current schema, or confirm the database already has it.
+
+    Three outcomes and no fourth: an empty database is initialized, a database
+    this same schema file installed is left untouched, and anything else is
+    refused read-only with reset guidance. Nothing is altered, backfilled, or
+    repaired -- a database that does not match is rebuilt, which is cheap
+    because the data in it is rebuildable by definition.
+    """
+    digest = schema_sql_sha256()
+    marker = schema_marker(conn)
+
+    if marker is not None:
+        problems = missing_objects(conn)
+        if (
+            marker["version"] == SCHEMA_VERSION
+            and marker["schema_sql_sha256"] == digest
+            and not problems
+        ):
+            register_vector(conn)
+            return "unchanged"
+        raise SchemaMismatchError(
+            _mismatch_message(marker, digest, problems)
+        )
+
+    if not is_empty(conn):
+        raise SchemaMismatchError(
+            "the target database contains tables but no claim_evidence schema "
+            "marker, so it is not a database this package installed. Point "
+            "CLAIM_EVIDENCE_DATABASE_URL at an empty database, or reset a "
+            "disposable one with `claim-evidence db reset-dev`."
+        )
+
+    conn.execute(schema_sql(embed_dim))
+    conn.execute(
+        """
+        INSERT INTO schema_meta (id, version, schema_sql_sha256)
+        VALUES (1, %s, %s)
+        ON CONFLICT (id) DO UPDATE
+            SET version = EXCLUDED.version,
+                schema_sql_sha256 = EXCLUDED.schema_sql_sha256,
+                applied_at = now()
+        """,
+        (SCHEMA_VERSION, digest),
+    )
     conn.commit()
     register_vector(conn)
+    return "initialized"
+
+
+def _mismatch_message(
+    marker: dict[str, Any], digest: str, problems: list[str]
+) -> str:
+    """Why this database was refused, without naming the database.
+
+    The connection string is the caller's; it is not repeated into an error
+    that may end up in a browser or a bug report.
+    """
+    reasons = []
+    if marker["version"] != SCHEMA_VERSION:
+        reasons.append(
+            f"it records schema version {marker['version']!r}, not {SCHEMA_VERSION}"
+        )
+    elif marker["schema_sql_sha256"] != digest:
+        reasons.append("it was installed from a different version of the schema file")
+    if problems:
+        reasons.append(f"it is missing {', '.join(problems[:5])}")
+    return (
+        "the target database does not match the current schema ("
+        + "; ".join(reasons or ["its shape could not be confirmed"])
+        + "). This schema has no in-place upgrade path: index data is "
+        "rebuildable, so reset the development database with "
+        "`claim-evidence db reset-dev` and re-index, or point "
+        "CLAIM_EVIDENCE_DATABASE_URL at an empty database."
+    )
 
 
 def normalize_embedding(vector: Sequence[float]) -> Vector:

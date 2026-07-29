@@ -666,7 +666,7 @@ def _verify(
     return int(counts["embedded"])
 
 
-def ensure_schema(conn: psycopg.Connection, settings: Settings) -> None:
+def ensure_schema(conn: psycopg.Connection, settings: Settings) -> str:
     """Apply the schema, then refuse to proceed on a dimension mismatch.
 
     ``vector(N)`` is templated in only when the table is first created, so
@@ -674,16 +674,17 @@ def ensure_schema(conn: psycopg.Connection, settings: Settings) -> None:
     silently leaves the old column in place. Caught here, before the first
     embedding write, rather than at query time on a half-built index.
     """
-    init_schema(conn, settings.embed_dimensions)
+    outcome = init_schema(conn, settings.embed_dimensions)
     declared = vector_dimension(conn)
     if declared is not None and declared != settings.embed_dimensions:
         # Not altered automatically: rewriting a populated vector column
         # discards every embedding in the database.
         raise IndexNotReadyError(
             f"database vector dimension {declared} does not match configured "
-            f"dimension {settings.embed_dimensions}; use a fresh database or an "
-            f"explicit full reindex migration"
+            f"dimension {settings.embed_dimensions}; use a fresh database or "
+            f"reset the development one with `claim-evidence db reset-dev`"
         )
+    return outcome
 
 
 __all__ = [

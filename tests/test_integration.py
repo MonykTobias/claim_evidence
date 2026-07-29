@@ -517,8 +517,16 @@ def check_shared_source_uri_is_one_document(tmp: Path) -> None:
         check(len(ids) == 1, "an explicit logical source_uri makes them one document")
 
 
-def check_schema_migrates_a_legacy_document(tmp: Path) -> None:
-    """A pre-identity row keeps its id and gets a deterministic key."""
+def check_a_legacy_schema_is_refused_not_migrated(tmp: Path) -> None:
+    """PD-03: a mismatched database is rebuilt, never upgraded in place.
+
+    The old behaviour here was a backfill that gave pre-identity rows a
+    deterministic key. It is gone on purpose: index data is disposable, and a
+    half-migrated database that still answers queries is a worse outcome than
+    one that refuses and says how to rebuild.
+    """
+    from claim_evidence.db import SchemaMismatchError
+
     with make_client(default_session()) as client:
         conn = client.conn
         conn.execute("DROP INDEX IF EXISTS document_identity_idx")
@@ -531,23 +539,43 @@ def check_schema_migrates_a_legacy_document(tmp: Path) -> None:
         )
         conn.commit()
 
-        client.init_db()
-        client.init_db()
+        try:
+            client.init_db()
+        except SchemaMismatchError as exc:
+            check(
+                "document.identity_key" in str(exc),
+                "the refusal names the column the database is missing",
+            )
+            check(
+                "reset-dev" in str(exc),
+                "the refusal points at the guarded reset, not at a migration",
+            )
+        else:
+            raise AssertionError("a legacy schema must be refused, not migrated")
 
         row = conn.execute(
-            "SELECT id, identity_key FROM document WHERE id = %s", (legacy,)
+            "SELECT id FROM document WHERE id = %s", (legacy,)
         ).fetchone()
-        check(int(row["id"]) == legacy, "migration does not rewrite document ids")
-        check(
-            row["identity_key"] == identity_key(tmp, "cafe1234", None),
-            "a stored pdf hash backfills to the same key ingestion would compute",
-        )
-        nulls = conn.execute(
-            "SELECT count(*) AS n FROM document WHERE identity_key IS NULL"
-        ).fetchone()["n"]
-        check(nulls == 0, "every document row is backfilled")
+        check(row is not None, "the refused init left the existing row alone")
+        # Put the schema back for the checks that follow. This is test-harness
+        # repair, not a migration path: the product's answer to a mismatched
+        # database is `db reset-dev`, which is what the check above proves.
         conn.execute("DELETE FROM document WHERE id = %s", (legacy,))
+        conn.execute("ALTER TABLE document ADD COLUMN identity_key text")
+        conn.execute(
+            "UPDATE document SET identity_key ="
+            " encode(sha256(convert_to('restored:' || id::text, 'UTF8')), 'hex')"
+        )
+        conn.execute("ALTER TABLE document ALTER COLUMN identity_key SET NOT NULL")
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS document_identity_idx"
+            " ON document (identity_key)"
+        )
         conn.commit()
+        check(
+            client.init_db() == "unchanged",
+            "the restored database is recognized as current again",
+        )
 
 
 # --- H-4: an interrupted attempt is reconciled, not merged into ------------
@@ -1561,7 +1589,7 @@ def main() -> int:
         check_middle_range_keeps_pdf_pages,
         check_source_less_documents_stay_separate,
         check_shared_source_uri_is_one_document,
-        check_schema_migrates_a_legacy_document,
+        check_a_legacy_schema_is_refused_not_migrated,
         check_resume_reconciles_the_building_version,
         check_supported_claim_explains_itself,
         check_contradicted_claim_explains_the_conflict,

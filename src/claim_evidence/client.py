@@ -70,8 +70,9 @@ class ClaimEvidence:
 
     # --- setup --------------------------------------------------------------
 
-    def init_db(self) -> None:
-        ensure_schema(self.conn, self.settings)
+    def init_db(self) -> str:
+        """``"initialized"`` or ``"unchanged"``; a mismatch raises instead."""
+        return ensure_schema(self.conn, self.settings)
 
     def initialize_database(self) -> HealthReport:
         """Apply the idempotent schema, then report the same diagnostics as

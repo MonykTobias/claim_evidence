@@ -13,6 +13,7 @@ from .errors import ClaimEvidenceError
 from .ingest import IngestionError
 from .models import ClaimResult, EvidenceMatch, HealthReport, IngestReport
 from .ollama import OllamaError
+from .reset import CONFIRM_PHRASE, reset_dev
 from .source import OutputValidationError
 
 USER_ERRORS = (
@@ -34,8 +35,35 @@ def build_parser() -> argparse.ArgumentParser:
     db = sub.add_parser("db", help="database maintenance").add_subparsers(
         dest="db_command", required=True
     )
-    db.add_parser("init", help="create or update the schema")
+    db.add_parser("init", help="install the current schema, or confirm it is current")
     db.add_parser("documents", help="list ready documents")
+
+    reset = db.add_parser(
+        "reset-dev",
+        help="drop and reinstall the schema of a disposable _dev/_test database",
+        description=(
+            "Destroys this database's index rows, citations, and audit history. "
+            "Source PDFs, extraction output, archives, and configuration are "
+            "never touched. Requires CE_ENVIRONMENT=development, a database name "
+            "ending in _dev or _test, and both confirmations. Shows what would "
+            "be lost and changes nothing unless --execute is given."
+        ),
+    )
+    reset.add_argument(
+        "--confirm-database",
+        default="",
+        help="the exact database name from the configured URL",
+    )
+    reset.add_argument(
+        "--confirm-phrase",
+        default="",
+        help=f"exactly {CONFIRM_PHRASE}",
+    )
+    reset.add_argument(
+        "--execute",
+        action="store_true",
+        help="actually reset; without it this is a dry run",
+    )
 
     ingest = sub.add_parser("ingest", help="index a completed output root")
     ingest.add_argument("output_root")
@@ -91,8 +119,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     with ClaimEvidence.from_env() as client:
         if args.command == "db":
             if args.db_command == "init":
-                client.init_db()
-                print("schema ready")
+                print(f"schema {client.init_db()}")
+            elif args.db_command == "reset-dev":
+                plan = reset_dev(
+                    client.settings,
+                    confirm_database=args.confirm_database,
+                    confirm_phrase=args.confirm_phrase,
+                    dry_run=not args.execute,
+                    conn=client.conn,
+                )
+                print(plan.describe())
+                print(
+                    "reset complete; run `claim-evidence db init` is not needed, "
+                    "the current schema was reinstalled"
+                    if plan.performed
+                    else "dry run: nothing was changed. Re-run with --execute to reset."
+                )
             else:
                 for row in client.documents():
                     print(f"{row['id']}\t{row['name']}\tversion {row['version_id']}")
