@@ -135,13 +135,18 @@ class ClaimEvidence:
         self,
         output_root: str | Path,
         *,
+        reporting_entity: str,
         source_pdf: str | Path | None = None,
         source_uri: str | None = None,
         force: bool = False,
         extract_narrative_facts: bool = True,
         progress: ProgressCallback | None = None,
     ) -> IngestReport:
-        """Index a completed output root.
+        """Index a completed output root, attributed to one reporting entity.
+
+        ``reporting_entity`` is required and is what every stored fact is
+        attributed to. It is not the document's filename: deriving it from
+        one turned "danoneurdaccessible.pdf" into a company.
 
         Unchanged sources are a no-op. ``force=True`` rebuilds anyway, keeping
         the current version queryable until the replacement passes its checks.
@@ -151,6 +156,7 @@ class ClaimEvidence:
             self.ollama,
             self.settings,
             output_root,
+            reporting_entity=reporting_entity,
             source_pdf=source_pdf,
             source_uri=source_uri,
             force=force,

@@ -331,11 +331,19 @@ def _deterministic(
         citation = to_citation(row, regions.get(evidence_id, []))
         (matches if outcome == "match" else conflicts).append((citation, reason))
 
+    # Repeated identical evidence counts once (PD-08): the same figure printed
+    # in a summary and again in a table is one source saying one thing, and
+    # letting it vote twice would turn formatting into weight of evidence.
+    matches = _collapse_duplicates(matches)
+    conflicts = _collapse_duplicates(conflicts)
+
+    # PD-08's set rules, stated once. Every verdict below is qualified by the
+    # corpus: this package reports what the selected indexed sources say, which
+    # is not the same as whether the claim is true in the world.
     if matches and conflicts:
-        # Comparable, authoritative evidence that disagrees with itself.
         return (
             Verdict.MIXED,
-            "Comparable evidence disagrees: "
+            "The indexed sources disagree with each other: "
             + "; ".join(reason for _, reason in (matches[:1] + conflicts[:1])),
             [c for c, _ in matches[:2] + conflicts[:2]],
             [],
@@ -345,24 +353,48 @@ def _deterministic(
     if matches:
         return (
             Verdict.SUPPORTED,
-            f"Source evidence agrees: {matches[0][1]}.",
+            f"Supported by the indexed sources: {matches[0][1]}.",
             [c for c, _ in matches[:3]],
             [],
             False,
-            "exact_numeric_match"
-            if parsed.comparison in ("=", "~")
-            else "bounded_numeric_match",
+            "exact_numeric_match",
         )
     if conflicts:
         return (
             Verdict.CONTRADICTED,
-            f"Source evidence disagrees: {conflicts[0][1]}.",
+            f"Contradicted by the indexed sources: {conflicts[0][1]}.",
             [c for c, _ in conflicts[:3]],
             [],
             False,
             "comparable_numeric_conflict",
         )
     return None, "", [], [], scope_rejections > 0, ""
+
+
+def _collapse_duplicates(
+    entries: list[tuple[Citation, str]]
+) -> list[tuple[Citation, str]]:
+    """One vote per distinct place in a document, in first-seen order.
+
+    Two citations are the same evidence when they name the same document
+    version, page, geometry, and quote. Evidence ids do not settle it: the same
+    figure can be indexed as a table row and as the value cell inside it, and
+    counting both would make a repeated number look like corroboration.
+    """
+    seen: set[tuple] = set()
+    unique: list[tuple[Citation, str]] = []
+    for citation, reason in entries:
+        key = (
+            citation.document_id,
+            citation.pdf_page,
+            tuple(region.bbox for region in citation.regions),
+            (citation.quote or "").strip(),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append((citation, reason))
+    return unique
 
 
 def _optional_int(value: Any) -> int | None:

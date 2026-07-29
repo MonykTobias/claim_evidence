@@ -124,7 +124,7 @@ def check_health_survives_a_missing_schema(tmp: Path) -> None:
 def check_document_listing(tmp: Path) -> None:
     root = build_root(tmp / "listing")
     with make_client(default_session()) as client:
-        report = client.ingest_document(root, source_uri="urn:listing")
+        report = client.ingest_document(root, source_uri="urn:listing", reporting_entity=ENTITY)
         docs = client.list_documents()
         check(len(docs) == 1, "one document listed")
         doc = docs[0]
@@ -148,7 +148,7 @@ def check_document_listing(tmp: Path) -> None:
 def check_visual_count_is_reported(tmp: Path) -> None:
     root = build_root(tmp / "visuals", with_visual=True)
     with make_client(default_session()) as client:
-        client.ingest_document(root, source_uri="urn:visuals")
+        client.ingest_document(root, source_uri="urn:visuals", reporting_entity=ENTITY)
         doc = next(d for d in client.list_documents() if d.source_uri == "urn:visuals")
         check(doc.visual_evidence_count == 1, "visual evidence counted separately")
 
@@ -159,11 +159,11 @@ def check_visual_count_is_reported(tmp: Path) -> None:
 def check_force_keeps_the_old_version_until_replacement(tmp: Path) -> None:
     root = build_root(tmp / "forced")
     with make_client(default_session()) as client:
-        first = client.ingest_document(root, source_uri="urn:forced")
-        plain = client.ingest_document(root, source_uri="urn:forced")
+        first = client.ingest_document(root, source_uri="urn:forced", reporting_entity=ENTITY)
+        plain = client.ingest_document(root, source_uri="urn:forced", reporting_entity=ENTITY)
         check(plain.reused_existing, "an unchanged re-ingest is still a no-op")
 
-        rebuilt = client.ingest_document(root, source_uri="urn:forced", force=True)
+        rebuilt = client.ingest_document(root, source_uri="urn:forced", force=True, reporting_entity=ENTITY)
         check(not rebuilt.reused_existing, "force rebuilds an unchanged source")
         check(rebuilt.version_id != first.version_id, "a new version was built")
         check(rebuilt.status is VersionStatus.READY, "the replacement is ready")
@@ -186,7 +186,7 @@ def check_force_keeps_the_old_version_until_replacement(tmp: Path) -> None:
 def check_failed_rebuild_leaves_the_old_version_ready(tmp: Path) -> None:
     root = build_root(tmp / "failing")
     with make_client(default_session()) as client:
-        good = client.ingest_document(root, source_uri="urn:failing")
+        good = client.ingest_document(root, source_uri="urn:failing", reporting_entity=ENTITY)
 
         # Break the integrity check the way a partial write would.
         import claim_evidence.ingest as ingest_module
@@ -196,7 +196,7 @@ def check_failed_rebuild_leaves_the_old_version_ready(tmp: Path) -> None:
             ingest_module.IngestionError("simulated integrity failure")
         )
         try:
-            client.ingest_document(root, source_uri="urn:failing", force=True)
+            client.ingest_document(root, source_uri="urn:failing", force=True, reporting_entity=ENTITY)
         except ingest_module.IngestionError:
             pass
         else:
@@ -222,7 +222,7 @@ def check_failed_rebuild_leaves_the_old_version_ready(tmp: Path) -> None:
 def check_removal_requires_exact_confirmation(tmp: Path) -> None:
     root = build_root(tmp / "confirm")
     with make_client(default_session()) as client:
-        report = client.ingest_document(root, source_uri="urn:confirm")
+        report = client.ingest_document(root, source_uri="urn:confirm", reporting_entity=ENTITY)
         before = client.conn.execute(
             "SELECT count(*) AS n FROM evidence_unit WHERE version_id = %s",
             (report.version_id,),
@@ -247,8 +247,8 @@ def check_removal_deletes_only_its_own_rows(tmp: Path) -> None:
     keep_root = build_root(tmp / "keep")
     drop_root = build_root(tmp / "drop")
     with make_client(default_session()) as client:
-        keep = client.ingest_document(keep_root, source_uri="urn:keep")
-        drop = client.ingest_document(drop_root, source_uri="urn:drop")
+        keep = client.ingest_document(keep_root, source_uri="urn:keep", reporting_entity=ENTITY)
+        drop = client.ingest_document(drop_root, source_uri="urn:drop", reporting_entity=ENTITY)
         client.audit_claim(SUPPORTED, scope=[drop.document_id], reporting_entity=ENTITY)
 
         report = client.remove_document(
@@ -281,7 +281,7 @@ def check_removal_leaves_source_files_alone(tmp: Path) -> None:
     root = build_root(tmp / "sources")
     before = sorted(p.relative_to(root).as_posix() for p in Path(root).rglob("*"))
     with make_client(default_session()) as client:
-        report = client.ingest_document(root, source_uri="urn:sources")
+        report = client.ingest_document(root, source_uri="urn:sources", reporting_entity=ENTITY)
         client.remove_document(report.document_id, confirm_document_id=report.document_id)
     after = sorted(p.relative_to(root).as_posix() for p in Path(root).rglob("*"))
     check(before == after, "every output file survives removal")
@@ -292,7 +292,7 @@ def check_removal_leaves_source_files_alone(tmp: Path) -> None:
 def check_removed_document_leaves_query_scope(tmp: Path) -> None:
     root = build_root(tmp / "scope")
     with make_client(default_session()) as client:
-        report = client.ingest_document(root, source_uri="urn:scope")
+        report = client.ingest_document(root, source_uri="urn:scope", reporting_entity=ENTITY)
         check(bool(client.search_evidence("renewable electricity", limit=5)),
               "evidence is searchable before removal")
         client.remove_document(report.document_id, confirm_document_id=report.document_id)
@@ -317,7 +317,7 @@ def check_removed_document_leaves_query_scope(tmp: Path) -> None:
 def check_trace_reports_every_channel(tmp: Path) -> None:
     root = build_root(tmp / "trace")
     with make_client(default_session()) as client:
-        client.ingest_document(root, source_uri="urn:trace")
+        client.ingest_document(root, source_uri="urn:trace", reporting_entity=ENTITY)
         result = client.audit_claim(SUPPORTED, scope="all", reporting_entity=ENTITY)
         trace = client.get_audit_trace(result.audit_id)
 
@@ -354,7 +354,7 @@ def check_trace_reports_every_channel(tmp: Path) -> None:
 def check_trace_carries_no_prompt_text(tmp: Path) -> None:
     root = build_root(tmp / "noprompt")
     with make_client(default_session()) as client:
-        client.ingest_document(root, source_uri="urn:noprompt")
+        client.ingest_document(root, source_uri="urn:noprompt", reporting_entity=ENTITY)
         result = client.audit_claim(VAGUE, scope="all", reporting_entity=ENTITY)
         blob = client.get_audit_trace(result.audit_id).model_dump_json()
         for leak in (
@@ -369,7 +369,7 @@ def check_trace_carries_no_prompt_text(tmp: Path) -> None:
 def check_expansion_relationships_are_recorded(tmp: Path) -> None:
     root = build_root(tmp / "expansion")
     with make_client(default_session()) as client:
-        client.ingest_document(root, source_uri="urn:expansion")
+        client.ingest_document(root, source_uri="urn:expansion", reporting_entity=ENTITY)
         result = client.audit_claim(SUPPORTED, scope="all", reporting_entity=ENTITY)
         trace = client.get_audit_trace(result.audit_id)
         expanded = [c for c in trace.candidates if c.expanded_from]
@@ -384,7 +384,7 @@ def check_expansion_relationships_are_recorded(tmp: Path) -> None:
 def check_evidence_detail(tmp: Path) -> None:
     root = build_root(tmp / "detail")
     with make_client(default_session()) as client:
-        client.ingest_document(root, source_uri="urn:detail")
+        client.ingest_document(root, source_uri="urn:detail", reporting_entity=ENTITY)
         result = client.audit_claim(SUPPORTED, scope="all", reporting_entity=ENTITY)
         cited = result.citations[0].evidence_id
 
@@ -430,7 +430,7 @@ def check_evidence_detail(tmp: Path) -> None:
 def check_missing_cell_geometry_reports_fallback_precision(tmp: Path) -> None:
     root = build_root(tmp / "fallback")
     with make_client(default_session()) as client:
-        report = client.ingest_document(root, source_uri="urn:fallback")
+        report = client.ingest_document(root, source_uri="urn:fallback", reporting_entity=ENTITY)
         row = client.conn.execute(
             """
             SELECT id FROM evidence_unit

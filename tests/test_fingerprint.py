@@ -55,6 +55,7 @@ def build_root(root: Path, **kwargs) -> Path:
 def fingerprint_of(root: Path, *, config: Settings | None = None,
                    session: FakeSession | None = None,
                    source_sha256: str | None = "a" * 64,
+                   entity: str = "Danone S.A.",
                    narrative: bool = True) -> str:
     config = config or settings()
     return build_fingerprint(
@@ -62,6 +63,7 @@ def fingerprint_of(root: Path, *, config: Settings | None = None,
         config,
         client(session, config),
         source_sha256=source_sha256,
+        reporting_entity=entity,
         extract_narrative_facts=narrative,
     )
 
@@ -169,6 +171,17 @@ def test_the_embedding_configuration_changes_it() -> None:
         check(
             fingerprint_of(root, config=settings(embed_dimensions=16)) != before,
             "a different embedding dimension invalidates the build",
+        )
+
+
+def test_the_reporting_entity_changes_it() -> None:
+    """Every stored fact is attributed to it, so it decides what gets stored."""
+    with tempfile.TemporaryDirectory() as temp:
+        root = build_root(Path(temp) / "run")
+        check(
+            fingerprint_of(root, entity="Danone S.A.")
+            != fingerprint_of(root, entity="Nestle S.A."),
+            "a different reporting entity is a different build",
         )
 
 

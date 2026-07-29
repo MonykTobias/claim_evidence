@@ -38,10 +38,10 @@ SOURCE_PDF = Path(
 )
 EXPECTED_PAGE = 359
 
-SUPPORTED = (
-# The reporting entity is stated explicitly: version 1 never infers it
-# from a filename.
+# The reporting entity is stated explicitly: version 1 never infers it from a
+# filename.
 ENTITY = "Danone S.A."
+SUPPORTED = (
     "Danone reduced Scope 1 and 2 energy and industry emissions by 40.2% in 2025 versus 2020."
 )
 CONTRADICTED = SUPPORTED.replace("40.2%", "90%")
@@ -100,6 +100,7 @@ def main() -> int:
             # The acceptance claims are table-backed; narrative extraction is
             # one LLM call per claim-like block and is exercised separately.
             extract_narrative_facts=False,
+            reporting_entity=ENTITY,
         )
         print(
             f"ingested {report.pages} pages, {report.evidence_units} units, "

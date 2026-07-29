@@ -175,34 +175,69 @@ def test_two_facts_produce_two_independent_comparisons() -> None:
     )
 
 
-def test_approximate_claim_uses_tolerance() -> None:
-    hedged = "Danone reduced Scope 1 and 2 energy and industry emissions by roughly 40% in 2025 versus 2020."
+def test_an_approximate_claim_is_never_compared() -> None:
+    """The tolerance is gone: version 1 compares values exactly or not at all.
+
+    A hedged claim is refused by `claims.validate_claim` before an audit opens.
+    If one reaches the comparator anyway, the answer is `incomparable` -- never
+    a match won by a tolerance nobody asked for, and never a `conflict`, which
+    would report a disagreement that was really a rounding rule.
+    """
+    hedged = (
+        "Danone reduced Scope 1 and 2 energy and industry emissions by roughly "
+        "40% in 2025 versus 2020."
+    )
     parsed = heuristic_claim(hedged)
-    check(parsed.approximate, "hedged wording detected")
-    verdict, _ = compare(parsed, emissions_fact())
-    check(verdict == "match", "40% within 5% of 40.2%")
+    check(parsed.approximate, "hedged wording is still detected")
+    verdict, reason = compare(parsed, emissions_fact())
+    check(verdict == "incomparable", f"an approximate claim is incomparable ({verdict})")
+    check("exactly" in reason, f"and the reason says why ({reason})")
 
     exact = hedged.replace("roughly 40%", "40%")
-    check(compare(heuristic_claim(exact), emissions_fact())[0] == "conflict",
-          "the same number without hedging is exact and fails")
+    check(
+        compare(heuristic_claim(exact), emissions_fact())[0] == "conflict",
+        "the same number stated exactly is compared, and 40 is not 40.2",
+    )
 
 
-def test_bounded_claims_use_their_operator() -> None:
+def test_bounded_claims_are_not_compared_either() -> None:
     fact = emissions_fact()  # a 40.2% reduction
+    for wording, operator in (
+        ("by at least 40%", ">="),
+        ("by at least 50%", ">="),
+        ("by no more than 50%", "<="),
+        ("by no more than 30%", "<="),
+    ):
+        parsed = heuristic_claim(SUPPORTED.replace("by 40.2%", wording))
+        check(parsed.comparison == operator, f"{wording!r} still parses as {operator}")
+        verdict, _ = compare(parsed, fact)
+        check(
+            verdict == "incomparable",
+            f"{wording!r} is incomparable, not silently satisfied ({verdict})",
+        )
 
-    at_least = heuristic_claim(SUPPORTED.replace("by 40.2%", "by at least 40%"))
-    check(at_least.comparison == ">=", "'at least' parsed as a lower bound")
-    check(compare(at_least, fact)[0] == "match", "a 40.2% drop satisfies 'at least 40%'")
 
-    too_high = heuristic_claim(SUPPORTED.replace("by 40.2%", "by at least 50%"))
-    check(compare(too_high, fact)[0] == "conflict", "'at least 50%' is not met by 40.2%")
+def test_an_exact_value_match_is_the_only_match() -> None:
+    fact = emissions_fact()  # a 40.2% reduction
+    check(
+        compare(heuristic_claim(SUPPORTED), fact)[0] == "match",
+        "the stated figure matches the reported one",
+    )
+    for wrong in ("40.3%", "40%", "41%", "402%"):
+        parsed = heuristic_claim(SUPPORTED.replace("40.2%", wrong))
+        check(
+            compare(parsed, fact)[0] == "conflict",
+            f"{wrong} is a conflict, not a near-enough match",
+        )
 
-    at_most = heuristic_claim(SUPPORTED.replace("by 40.2%", "by no more than 50%"))
-    check(at_most.comparison == "<=", "'no more than' parsed as an upper bound")
-    check(compare(at_most, fact)[0] == "match", "40.2% is within 'no more than 50%'")
 
-    at_most_small = heuristic_claim(SUPPORTED.replace("by 40.2%", "by no more than 30%"))
-    check(compare(at_most_small, fact)[0] == "conflict", "40.2% exceeds 'no more than 30%'")
+def test_a_different_reporting_entity_blocks_the_comparison() -> None:
+    """Two figures about two companies are not evidence for each other."""
+    fact = emissions_fact()
+    parsed = heuristic_claim(SUPPORTED).model_copy(update={"subject": "Nestle S.A."})
+    verdict, reason = compare(parsed, fact)
+    check(verdict == "incomparable", f"a different entity is incomparable ({verdict})")
+    check("Nestle" in reason, f"and the reason names both sides ({reason})")
 
 
 def test_mismatched_qualifiers_are_incomparable() -> None:

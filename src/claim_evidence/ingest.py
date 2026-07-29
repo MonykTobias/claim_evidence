@@ -185,6 +185,7 @@ def index_fingerprint(
     *,
     extraction_contract_version: str,
     extraction_settings: dict[str, Any],
+    reporting_entity: str,
     fact_mode: str,
     embed_model_identity: dict[str, Any],
     fact_model_identity: dict[str, Any],
@@ -212,6 +213,9 @@ def index_fingerprint(
             "artifacts_sha256": artifacts_sha256,
         },
         "evidence_normalization_version": NORMALIZATION_VERSION,
+        # Every stored fact is attributed to it, so a different entity is a
+        # different build.
+        "reporting_entity": reporting_entity,
         "embedding": {
             **embed_model_identity,
             "dimensions": settings.embed_dimensions,
@@ -236,6 +240,7 @@ def build_fingerprint(
     client: OllamaClient,
     *,
     source_sha256: str | None,
+    reporting_entity: str,
     extract_narrative_facts: bool,
 ) -> str:
     """The fingerprint for the build these inputs describe.
@@ -249,6 +254,7 @@ def build_fingerprint(
         settings,
         extraction_contract_version=reader.run["contract_version"],
         extraction_settings=reader.run["settings"],
+        reporting_entity=reporting_entity,
         fact_mode="table_and_narrative" if extract_narrative_facts else "table_only",
         embed_model_identity=client.model_identity(settings.embed_model),
         fact_model_identity=(
@@ -268,12 +274,19 @@ def ingest_document(
     settings: Settings,
     output_root: str | Path,
     *,
+    reporting_entity: str,
     source_pdf: str | Path | None = None,
     source_uri: str | None = None,
     force: bool = False,
     extract_narrative_facts: bool = True,
     progress: ProgressCallback | None = None,
 ) -> IngestReport:
+    entity = (reporting_entity or "").strip()
+    if not entity:
+        raise ValidationError(
+            "reporting_entity is required: the facts this build stores are"
+            " attributed to it, and a document's filename is not an entity"
+        )
     reporter = ProgressReporter(progress, "ingest")
     # Set once a version exists, so a failure before that point has nothing to
     # mark and a failure after it marks exactly one row.
@@ -284,6 +297,7 @@ def ingest_document(
             client,
             settings,
             output_root,
+            reporting_entity=entity,
             source_pdf=source_pdf,
             source_uri=source_uri,
             force=force,
@@ -324,6 +338,7 @@ def _ingest(
     settings: Settings,
     output_root: str | Path,
     *,
+    reporting_entity: str,
     source_pdf: str | Path | None,
     source_uri: str | None,
     force: bool,
@@ -354,6 +369,7 @@ def _ingest(
         settings,
         client,
         source_sha256=source_sha256,
+        reporting_entity=reporting_entity,
         extract_narrative_facts=extract_narrative_facts,
     )
 
@@ -409,8 +425,14 @@ def _ingest(
     )
     building.append(version_id)
 
-    subject = organization_name(document_name, source_uri)
+    # The reporting entity is stated by the caller, not derived from the
+    # document's basename. `organization_name("danoneurdaccessible.pdf")` made a
+    # filename into a company and attributed every figure in the document to
+    # that string; a later audit then compared a real entity against it.
+    subject = reporting_entity
     subject_entity = upsert_entity(conn, "organization", subject, normalized_name(subject))
+    # The filename stays as an alias -- useful for finding the entity, never
+    # used as its name.
     add_alias(conn, subject_entity, document_name, normalized_name(document_name))
     conn.commit()
 

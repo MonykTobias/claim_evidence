@@ -98,7 +98,7 @@ def test_activation_refuses_a_missing_evidence_artifact(tmp_path: Path) -> None:
     root = build_root(tmp_path / "missing-artifact")
     client = _ingest_into_a_fresh_database(root)
     try:
-        report = client.ingest_document(root, source_uri="urn:missing-artifact")
+        report = client.ingest_document(root, source_uri="urn:missing-artifact", reporting_entity=ENTITY)
         assert report.status is VersionStatus.READY
 
         # The artifact a stored unit names disappears -- a partially deleted
@@ -121,7 +121,7 @@ def test_a_document_without_narrative_blocks_cites_no_narrative(tmp_path: Path) 
     )
     client = _ingest_into_a_fresh_database(root)
     try:
-        report = client.ingest_document(root, source_uri="urn:no-blocks")
+        report = client.ingest_document(root, source_uri="urn:no-blocks", reporting_entity=ENTITY)
         assert report.status is VersionStatus.READY
         narrative = client.conn.execute(
             "SELECT count(*) AS n FROM evidence_unit"
@@ -143,7 +143,7 @@ def test_activation_refuses_an_artifact_outside_the_extraction_root(
     root = build_root(tmp_path / "escaping")
     client = _ingest_into_a_fresh_database(root)
     try:
-        report = client.ingest_document(root, source_uri="urn:escaping")
+        report = client.ingest_document(root, source_uri="urn:escaping", reporting_entity=ENTITY)
         assert report.status is VersionStatus.READY
 
         # Point one stored unit at a file outside the root and re-run the gate
@@ -281,14 +281,14 @@ def check_schema_is_repeatable(tmp: Path) -> None:
 def check_ingestion_is_idempotent(tmp: Path) -> None:
     root = build_root(tmp / "run")
     with make_client(default_session()) as client:
-        first = client.ingest_document(root, source_pdf=None, source_uri="urn:test")
+        first = client.ingest_document(root, source_pdf=None, source_uri="urn:test", reporting_entity=ENTITY)
         check(first.status is VersionStatus.READY, "version reaches ready")
         check(first.pages == 2, "both pages indexed")
         check(first.evidence_units > 0, "evidence units stored")
         check(first.embedded_units > 0, "embeddings written")
         check(first.facts >= 4, f"table facts derived ({first.facts})")
 
-        second = client.ingest_document(root, source_pdf=None, source_uri="urn:test")
+        second = client.ingest_document(root, source_pdf=None, source_uri="urn:test", reporting_entity=ENTITY)
         check(second.reused_existing, "re-ingesting the same fingerprint is a no-op")
         check(second.version_id == first.version_id, "the same version is reused")
         check(
@@ -514,7 +514,7 @@ def check_visual_evidence_needs_crop_verification(tmp: Path) -> None:
 
     refusing = default_session()
     with make_client(refusing) as client:
-        client.ingest_document(root, source_uri="urn:visual")
+        client.ingest_document(root, source_uri="urn:visual", reporting_entity=ENTITY)
         result = client.audit_claim(claim, scope="all", reporting_entity=ENTITY)
         check(
             result.evidence_quality is not EvidenceQuality.VERIFIED_VISUAL,
@@ -570,7 +570,7 @@ def check_middle_range_keeps_pdf_pages(tmp: Path) -> None:
         tables={10: [kpi_table()]},
     )
     with make_client(default_session()) as client:
-        report = client.ingest_document(root, source_uri="urn:middle")
+        report = client.ingest_document(root, source_uri="urn:middle", reporting_entity=ENTITY)
         check(report.status is VersionStatus.READY, "a range starting after page 1 indexes")
 
         matches = client.search_evidence(SUPPORTED, document_ids=[report.document_id])
@@ -598,8 +598,8 @@ def check_source_less_documents_stay_separate(tmp: Path) -> None:
     first = build_root(tmp / "left" / "report")
     second = build_root(tmp / "right" / "report")
     with make_client(default_session()) as client:
-        a = client.ingest_document(first)
-        b = client.ingest_document(second)
+        a = client.ingest_document(first, reporting_entity=ENTITY)
+        b = client.ingest_document(second, reporting_entity=ENTITY)
         check(a.document_id != b.document_id, "same basename, different documents")
 
         ready = {int(r["id"]) for r in client.documents()}
@@ -608,7 +608,7 @@ def check_source_less_documents_stay_separate(tmp: Path) -> None:
             hits = client.search_evidence(SUPPORTED, document_ids=[report.document_id])
             check(bool(hits), f"document {report.document_id} is queryable on its own")
 
-        again = client.ingest_document(second)
+        again = client.ingest_document(second, reporting_entity=ENTITY)
         check(
             again.document_id == b.document_id and again.version_id == b.version_id,
             "re-ingesting the same root reuses its document and ready version",
@@ -628,7 +628,7 @@ def check_source_less_documents_stay_separate(tmp: Path) -> None:
 def check_shared_source_uri_is_one_document(tmp: Path) -> None:
     copies = [build_root(tmp / "copy_a" / "run"), build_root(tmp / "copy_b" / "run")]
     with make_client(default_session()) as client:
-        ids = {client.ingest_document(root, source_uri="urn:same").document_id
+        ids = {client.ingest_document(root, source_uri="urn:same", reporting_entity=ENTITY).document_id
                for root in copies}
         check(len(ids) == 1, "an explicit logical source_uri makes them one document")
 
@@ -730,7 +730,8 @@ def check_resume_reconciles_the_building_version(tmp: Path) -> None:
         # built from all of it.
         fingerprint = build_fingerprint(
             reader, config, client.ollama,
-            source_sha256=None, extract_narrative_facts=True,
+            source_sha256=None, reporting_entity=ENTITY,
+            extract_narrative_facts=True,
         )
         document_id = upsert_document(
             conn, reader.root.name, None, "urn:resume",
@@ -779,7 +780,7 @@ def check_resume_reconciles_the_building_version(tmp: Path) -> None:
         ).fetchone()["id"]
 
         embedded_texts.clear()
-        report = client.ingest_document(root, source_uri="urn:resume")
+        report = client.ingest_document(root, source_uri="urn:resume", reporting_entity=ENTITY)
         check(report.version_id == version_id, "the interrupted attempt is resumed")
         check(report.status is VersionStatus.READY, "it activates once checks pass")
 
@@ -860,7 +861,7 @@ def _expect(error: type[Exception], call, message: str) -> None:
 def check_document_scope_is_validated(tmp: Path) -> None:
     root = build_root(tmp / "scoped")
     with make_client(default_session()) as client:
-        indexed = client.ingest_document(root, source_uri="urn:scoped")
+        indexed = client.ingest_document(root, source_uri="urn:scoped", reporting_entity=ENTITY)
         ready = indexed.document_id
 
         check(bool(client.search_evidence(SUPPORTED)), "None searches every ready document")
@@ -919,7 +920,7 @@ def check_document_scope_is_validated(tmp: Path) -> None:
             "and search says so too",
         )
 
-        removed = client.ingest_document(build_root(tmp / "removed"), source_uri="urn:gone")
+        removed = client.ingest_document(build_root(tmp / "removed"), source_uri="urn:gone", reporting_entity=ENTITY)
         client.remove_document(removed.document_id, confirm_document_id=removed.document_id)
         _expect(
             NotFoundError,
@@ -1223,7 +1224,7 @@ def check_narrative_blocks_expand_in_page_order(tmp: Path) -> None:
 
     root = build_root(tmp / "prose")
     with make_client(default_session()) as client:
-        report = client.ingest_document(root, source_uri="urn:prose")
+        report = client.ingest_document(root, source_uri="urn:prose", reporting_entity=ENTITY)
         rows = client.conn.execute(
             "SELECT e.id, e.unit_key, e.source_order, e.context_key FROM evidence_unit e"
             " JOIN page p ON p.id = e.page_id"
@@ -1307,7 +1308,7 @@ def check_audit_persists_its_scope_and_status(tmp: Path) -> None:
 def check_trace_survives_document_removal(tmp: Path) -> None:
     root = build_root(tmp / "doomed")
     with make_client(default_session()) as client:
-        report = client.ingest_document(root, source_uri="urn:doomed")
+        report = client.ingest_document(root, source_uri="urn:doomed", reporting_entity=ENTITY)
         result = client.audit_claim(SUPPORTED, scope=[report.document_id], reporting_entity=ENTITY)
         client.remove_document(report.document_id, confirm_document_id=report.document_id)
 
@@ -1391,7 +1392,7 @@ def check_source_hash_is_the_real_pdf_digest(tmp: Path) -> None:
     expected = hashlib.sha256(pdf.read_bytes()).hexdigest()
 
     with make_client(default_session()) as client:
-        report = client.ingest_document(root, source_pdf=pdf)
+        report = client.ingest_document(root, source_pdf=pdf, reporting_entity=ENTITY)
         stored = client.conn.execute(
             "SELECT sha256, identity_key FROM document WHERE id = %s",
             (report.document_id,),
@@ -1411,7 +1412,7 @@ def check_source_hash_is_the_real_pdf_digest(tmp: Path) -> None:
             stored["identity_key"] == identity_key(Path(root), expected, None),
             "identity_key is derived from the PDF's SHA-256",
         )
-        again = client.ingest_document(root, source_pdf=pdf)
+        again = client.ingest_document(root, source_pdf=pdf, reporting_entity=ENTITY)
         check(
             again.document_id == report.document_id and again.reused_existing,
             "re-ingesting the same PDF is the same document and a no-op",
@@ -1425,14 +1426,14 @@ def check_improved_extraction_replaces_the_version(tmp: Path) -> None:
     pdf.write_bytes(b"%PDF-1.7 stable")
 
     with make_client(default_session()) as client:
-        first = client.ingest_document(root, source_pdf=pdf)
+        first = client.ingest_document(root, source_pdf=pdf, reporting_entity=ENTITY)
 
         table = Path(root) / "page_0001" / "table_candidates.json"
         original = table.read_text(encoding="utf-8")
         table.write_text(original.replace("(40.2) %", "(41.2) %"), encoding="utf-8")
         check(len(table.read_text(encoding="utf-8")) == len(original), "same file length")
 
-        second = client.ingest_document(root, source_pdf=pdf)
+        second = client.ingest_document(root, source_pdf=pdf, reporting_entity=ENTITY)
         check(
             second.document_id == first.document_id,
             "an improved extraction is the same logical document",
@@ -1452,9 +1453,9 @@ def check_page_image_change_rebuilds_the_version(tmp: Path) -> None:
 
     root = build_root(tmp / "repainted")
     with make_client(default_session()) as client:
-        first = client.ingest_document(root, source_uri="urn:repainted")
+        first = client.ingest_document(root, source_uri="urn:repainted", reporting_entity=ENTITY)
         Image.new("RGB", (600, 800), "black").save(Path(root) / "page_0001" / "page.png")
-        second = client.ingest_document(root, source_uri="urn:repainted")
+        second = client.ingest_document(root, source_uri="urn:repainted", reporting_entity=ENTITY)
         check(
             second.version_id != first.version_id,
             "a redrawn page image invalidates the version that cites crops of it",
@@ -1467,7 +1468,7 @@ def check_page_image_change_rebuilds_the_version(tmp: Path) -> None:
 def check_failed_build_is_recorded_and_isolated(tmp: Path) -> None:
     root = build_root(tmp / "failing")
     with make_client(default_session()) as client:
-        ready = client.ingest_document(root, source_uri="urn:failing")
+        ready = client.ingest_document(root, source_uri="urn:failing", reporting_entity=ENTITY)
         check(ready.status is VersionStatus.READY, "the first build is ready")
 
     import claim_evidence.ingest as ingest_module
@@ -1479,7 +1480,7 @@ def check_failed_build_is_recorded_and_isolated(tmp: Path) -> None:
     try:
         with make_client(default_session()) as client:
             try:
-                client.ingest_document(root, source_uri="urn:failing", force=True)
+                client.ingest_document(root, source_uri="urn:failing", force=True, reporting_entity=ENTITY)
             except ingest_module.IngestionError:
                 pass
             else:
@@ -1516,7 +1517,7 @@ def check_failed_build_is_recorded_and_isolated(tmp: Path) -> None:
 
         # The document is still ready, so a plain re-run is a no-op and the
         # failed forced attempt stays on the record as what it was.
-        again = client.ingest_document(root, source_uri="urn:failing", force=False)
+        again = client.ingest_document(root, source_uri="urn:failing", force=False, reporting_entity=ENTITY)
         check(again.reused_existing, "a ready document is still a no-op after a failed rebuild")
 
 
@@ -1532,7 +1533,7 @@ def check_retrying_a_failed_first_build_clears_its_failure(tmp: Path) -> None:
     try:
         with make_client(default_session()) as client:
             try:
-                client.ingest_document(root, source_uri="urn:retry")
+                client.ingest_document(root, source_uri="urn:retry", reporting_entity=ENTITY)
             except ingest_module.IngestionError:
                 pass
             else:
@@ -1549,7 +1550,7 @@ def check_retrying_a_failed_first_build_clears_its_failure(tmp: Path) -> None:
         ).fetchone()
         check(before["status"] == "failed", "the first attempt is marked failed")
 
-        report = client.ingest_document(root, source_uri="urn:retry")
+        report = client.ingest_document(root, source_uri="urn:retry", reporting_entity=ENTITY)
         check(report.status is VersionStatus.READY, "the retry reaches ready")
         check(
             report.version_id == int(before["id"]),

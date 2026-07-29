@@ -352,10 +352,24 @@ def compare_detailed(claim: ParsedClaim, fact: dict[str, Any] | Fact) -> Compari
         if blocking and blocked is None and reason:
             blocked = reason
 
-    # subject -- reported, never blocking: a document basename and a claim's
-    # first word are the same company spelled two ways more often than not.
+    # The reporting entity is stated by the caller now, not guessed from a
+    # filename, so a mismatch is a real one and blocks the comparison. Two
+    # figures about two different companies are not evidence for each other.
     claim_subject, fact_subject = claim.subject, row.get("subject")
-    note("subject", claim_subject, fact_subject, _subject_status(claim_subject, fact_subject))
+    subject_status = _subject_status(claim_subject, fact_subject)
+    note(
+        "subject",
+        claim_subject,
+        fact_subject,
+        subject_status,
+        (
+            f"the claim is about {claim_subject!r} and the source states "
+            f"{fact_subject!r}"
+            if subject_status == "mismatch"
+            else None
+        ),
+        blocking=subject_status == "mismatch",
+    )
 
     claim_unit = normalize_unit(claim.unit)
     fact_unit = normalize_unit(row.get("unit"))
@@ -489,16 +503,38 @@ def _apply_operator(
     direction: str,
     approximate: bool,
 ) -> tuple[Comparison, str]:
-    """Check a bounded claim ("by at least 40%") against the reported value.
+    """Compare the two figures exactly, or refuse to compare them at all.
 
-    Bounds are checked on magnitude when the claim states a direction, because
-    "reduced by at least 40%" means a bigger drop satisfies it even though the
-    signed value is smaller.
+    Version 1 has one numeric rule: equal or not equal, on ``Decimal``. A
+    bounded or approximate claim never reaches here -- ``claims.validate_claim``
+    refuses it before an audit opens -- so an operator other than ``=`` arriving
+    at this point means a caller went round the gate, and the honest answer is
+    ``incomparable`` rather than a tolerance nobody asked for.
     """
-    if operator in ("=", "~"):
-        if values_agree(claimed, observed, approximate=approximate or operator == "~"):
-            return "match", f"claimed {claimed} matches reported {observed}"
-        return "conflict", f"claimed {claimed} but the source reports {observed}"
+    if operator != "=" or approximate:
+        return (
+            "incomparable",
+            f"version 1 compares values exactly, and this comparison is {operator!r}"
+            + (" with a tolerance" if approximate else ""),
+        )
+    if claimed == observed:
+        return "match", f"claimed {claimed} matches reported {observed}"
+    return "conflict", f"claimed {claimed} but the source reports {observed}"
+
+
+def _legacy_bounded(
+    operator: str,
+    claimed: Decimal,
+    observed: Decimal,
+    direction: str,
+) -> tuple[Comparison, str]:
+    """Retained for reference only; version 1 does not call this.
+
+    Bounds were checked on magnitude when the claim stated a direction, because
+    "reduced by at least 40%" means a bigger drop satisfies it even though the
+    signed value is smaller. Reinstating it needs a product decision about what
+    a bound means against a range of reported figures, not just this arithmetic.
+    """
 
     left, right = (
         (abs(observed), abs(claimed)) if direction in ("decrease", "increase")

@@ -32,6 +32,8 @@ ADMIN_URL = os.environ.get(
 )
 TEST_DB = "claim_evidence_lifecycle_test"
 DIMENSIONS = 8
+# Stated explicitly: version 1 never derives the entity from a filename.
+ENTITY = "Danone S.A."
 
 
 def check(condition: bool, message: str) -> None:
@@ -127,7 +129,7 @@ def test_a_partial_fact_failure_is_degraded_and_still_queryable(tmp_path: Path) 
     session = FailingFactSession(failures=1)
     client = prepared(session)
     try:
-        report = client.ingest_document(root, source_uri="urn:degraded")
+        report = client.ingest_document(root, source_uri="urn:degraded", reporting_entity=ENTITY)
         check(
             report.status is VersionStatus.DEGRADED,
             f"one failed candidate of three is degraded, not ready ({report.status})",
@@ -161,7 +163,7 @@ def test_failed_candidates_store_keys_and_codes_only(tmp_path: Path) -> None:
     root = three_candidate_root(tmp_path / "safe-failures")
     client = prepared(FailingFactSession(failures=2))
     try:
-        report = client.ingest_document(root, source_uri="urn:safe-failures")
+        report = client.ingest_document(root, source_uri="urn:safe-failures", reporting_entity=ENTITY)
         rows = failed_fact_candidates(client.conn, report.version_id)
         check(len(rows) == 2, "both failures are recorded")
         for row in rows:
@@ -196,7 +198,7 @@ def test_retry_processes_only_the_failures_and_promotes(tmp_path: Path) -> None:
     session = FailingFactSession(failures=1)
     client = prepared(session)
     try:
-        report = client.ingest_document(root, source_uri="urn:retry")
+        report = client.ingest_document(root, source_uri="urn:retry", reporting_entity=ENTITY)
         check(report.status is VersionStatus.DEGRADED, "the build is degraded")
         calls_after_build = session.fact_calls
         evidence_before = client.conn.execute(
@@ -241,7 +243,7 @@ def test_a_retry_that_still_fails_stays_degraded(tmp_path: Path) -> None:
     session = FailingFactSession(failures=99)
     client = prepared(session)
     try:
-        report = client.ingest_document(root, source_uri="urn:still-failing")
+        report = client.ingest_document(root, source_uri="urn:still-failing", reporting_entity=ENTITY)
         check(report.status is VersionStatus.DEGRADED, "every candidate failed")
         retried = client.retry_facts(report.document_id)
         check(
@@ -263,8 +265,8 @@ def test_reindexing_a_degraded_version_reuses_it(tmp_path: Path) -> None:
     root = three_candidate_root(tmp_path / "reuse-degraded")
     client = prepared(FailingFactSession(failures=1))
     try:
-        first = client.ingest_document(root, source_uri="urn:reuse-degraded")
-        second = client.ingest_document(root, source_uri="urn:reuse-degraded")
+        first = client.ingest_document(root, source_uri="urn:reuse-degraded", reporting_entity=ENTITY)
+        second = client.ingest_document(root, source_uri="urn:reuse-degraded", reporting_entity=ENTITY)
         check(second.reused_existing, "the degraded version is reused, not rebuilt")
         check(second.version_id == first.version_id, "and it is the same version")
         check(
@@ -285,7 +287,7 @@ def test_restart_marks_prior_nonterminal_work_interrupted(tmp_path: Path) -> Non
     root = three_candidate_root(tmp_path / "interrupted")
     client = prepared(FailingFactSession(failures=0))
     try:
-        ready = client.ingest_document(root, source_uri="urn:interrupted")
+        ready = client.ingest_document(root, source_uri="urn:interrupted", reporting_entity=ENTITY)
         check(ready.status is VersionStatus.READY, "one good version exists")
 
         # A build and an audit that were still going when the process died.
