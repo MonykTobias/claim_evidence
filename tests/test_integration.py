@@ -988,6 +988,143 @@ def check_explanation_carries_no_model_text(tmp: Path) -> None:
             check(secret not in blob, f"persisted explanation omits {secret[:32]!r}")
 
 
+# --- M-9: context follows the page, not the insert order --------------------
+
+
+def check_expansion_follows_source_order_not_ids(tmp: Path) -> None:
+    """Insert the page's units backwards; expansion must ignore that entirely."""
+    from claim_evidence.db import (
+        start_version,
+        upsert_document,
+        upsert_evidence,
+        upsert_page,
+        neighbours,
+    )
+    from claim_evidence.ingest import identity_key
+    from claim_evidence.source import OutputReader, page_units
+
+    root = build_root(tmp / "ordered")
+    config = settings()
+    conn = connect(config.database_url)
+    with make_client(default_session(), conn) as client:
+        reader = OutputReader(root)
+        page = reader.validate()[0]
+        units = list(page_units(reader, page, reader.blocks_by_page().get(1, [])))
+        check(
+            [u.source_order for u in units] == list(range(len(units))),
+            "every unit carries a source order",
+        )
+
+        document_id = upsert_document(
+            conn, "ordered", None, "urn:ordered",
+            identity_key(reader.root, None, "urn:ordered"),
+        )
+        version_id = start_version(
+            conn, document_id, "fp-ordered", embed_model="fake",
+            embed_dim=DIMENSIONS, output_root=str(reader.root), source_pdf=None,
+        )
+        page_id = upsert_page(
+            conn, version_id, page.page, page.width, page.height, page.rel
+        )
+        # Reversed: the highest evidence id is now the first unit on the page.
+        ids = upsert_evidence(conn, version_id, page_id, list(reversed(units)))
+        conn.execute(
+            "UPDATE document_version SET status = 'ready' WHERE id = %s", (version_id,)
+        )
+        conn.commit()
+
+        by_key = {u.unit_key: u for u in units}
+        value = next(
+            u for u in units
+            if u.kind is EvidenceKind.TABLE_VALUE and u.table_context.get("value") == "(40.2) %"
+        )
+        expanded = neighbours(conn, ids[value.unit_key])
+        returned = [row["unit_key"] for row in expanded]
+        check(bool(returned), "the value cell expands to something")
+
+        siblings = [
+            k for k in returned if by_key[k].context_key == value.context_key
+        ]
+        check(
+            returned[0] in siblings,
+            f"its own table row context comes first ({returned[0]})",
+        )
+        check(
+            any(by_key[k].kind is EvidenceKind.TABLE_ROW for k in siblings),
+            "and the row itself is among them",
+        )
+        check(
+            all(by_key[k].kind is not EvidenceKind.PAGE_MARKDOWN for k in returned),
+            "generated page markdown is never offered as citable support",
+        )
+        check(
+            value.unit_key not in returned, "the candidate is not its own neighbour"
+        )
+
+        check(
+            all(int(row["pdf_page"]) == page.page for row in expanded),
+            "every neighbour is on the candidate's own page",
+        )
+        check(
+            all(int(row["document_id"]) == document_id for row in expanded),
+            "and in the candidate's own document",
+        )
+
+        conn.execute("DELETE FROM document WHERE id = %s", (document_id,))
+        conn.commit()
+
+
+def check_narrative_blocks_expand_in_page_order(tmp: Path) -> None:
+    from claim_evidence.db import neighbours
+
+    root = build_root(tmp / "prose")
+    with make_client(default_session()) as client:
+        report = client.ingest_document(root, source_uri="urn:prose")
+        rows = client.conn.execute(
+            "SELECT e.id, e.unit_key, e.source_order, e.context_key FROM evidence_unit e"
+            " JOIN page p ON p.id = e.page_id"
+            " WHERE e.version_id = %s AND p.pdf_page = 1 AND e.kind = 'narrative'"
+            " ORDER BY e.source_order",
+            (report.version_id,),
+        ).fetchall()
+        check(len(rows) >= 2, f"the page has adjacent narrative blocks ({len(rows)})")
+        check(
+            all(r["context_key"].startswith("p0001:block:") for r in rows),
+            "each block carries its own context key",
+        )
+
+        first = rows[0]
+        returned = [r["unit_key"] for r in neighbours(client.conn, int(first["id"]))]
+        check(
+            rows[1]["unit_key"] in returned,
+            "the next block on the page is a neighbour of the first",
+        )
+
+
+def check_expansion_uses_its_indexes(tmp: Path) -> None:
+    with make_client(default_session()) as client:
+        conn = client.conn
+        evidence_id = conn.execute(
+            "SELECT e.id FROM evidence_unit e JOIN document_version v ON v.id = e.version_id"
+            " WHERE v.status = 'ready' AND e.source_order IS NOT NULL LIMIT 1"
+        ).fetchone()["id"]
+        conn.execute("SET enable_seqscan = off")
+        plan = "\n".join(
+            str(r)
+            for r in conn.execute(
+                "EXPLAIN SELECT id FROM evidence_unit"
+                " WHERE page_id = (SELECT page_id FROM evidence_unit WHERE id = %s)"
+                " ORDER BY source_order LIMIT 4",
+                (evidence_id,),
+            ).fetchall()
+        )
+        check(
+            "evidence_unit_source_order_idx" in plan or "evidence_unit_page_idx" in plan,
+            f"the page/source-order lookup uses an index ({plan[:120]})",
+        )
+        conn.execute("SET enable_seqscan = on")
+
+
 # --- M-4: an audit records its corpus and its outcome -----------------------
 
 
@@ -1434,6 +1571,9 @@ def main() -> int:
         check_vague_claim_explains_the_scope_gap,
         check_explanation_round_trips_through_the_trace,
         check_explanation_carries_no_model_text,
+        check_expansion_follows_source_order_not_ids,
+        check_narrative_blocks_expand_in_page_order,
+        check_expansion_uses_its_indexes,
         check_audit_persists_its_scope_and_status,
         check_trace_survives_document_removal,
         check_failed_audit_is_explicit_and_safe,

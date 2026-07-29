@@ -245,7 +245,12 @@ and page Markdown are embedded.
    pgvector.
 3. Merge with reciprocal-rank fusion, boosting exact numbers, years, units, and
    scope tokens.
-4. Expand the top candidates with their page neighbours.
+4. Expand the top candidates with their page neighbours, following the source:
+   units sharing a `context_key` first (a table value's own row and its sibling
+   cells), then the same page by distance in `source_order`, then evidence id
+   only to break ties. Auto-increment ids reflect insertion and resume history,
+   not what the page says, so they no longer decide what counts as context. A
+   version indexed before this falls back to page order until it is re-indexed.
 5. Crop and re-verify any visual candidate.
 6. Compare arithmetically whenever every material qualifier aligns. Exact claims
    need exact displayed agreement; "about"/"roughly"/"approximately" allow 5%

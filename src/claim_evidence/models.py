@@ -486,6 +486,11 @@ class EvidenceUnit(BaseModel):
     regions: list[Region] = Field(default_factory=list)
     geometry_precision: GeometryPrecision = GeometryPrecision.BLOCK
     truncated_source: bool = False
+    # Where this unit sits on its page, and what it belongs to. Context
+    # expansion reads these instead of evidence ids, which record when a row
+    # was inserted rather than what the page actually says.
+    source_order: int | None = None
+    context_key: str | None = None
 
 
 class Fact(BaseModel):

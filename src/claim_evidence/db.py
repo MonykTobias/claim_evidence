@@ -259,9 +259,10 @@ def upsert_evidence(
             INSERT INTO evidence_unit (
                 version_id, page_id, unit_key, kind, quality, citable,
                 source_text, normalized_text, heading_path, table_context,
-                artifact_path, geometry_precision, truncated_source
+                artifact_path, geometry_precision, truncated_source,
+                source_order, context_key
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (version_id, unit_key) DO UPDATE SET
                 page_id = EXCLUDED.page_id,
                 kind = EXCLUDED.kind,
@@ -274,6 +275,10 @@ def upsert_evidence(
                 artifact_path = EXCLUDED.artifact_path,
                 geometry_precision = EXCLUDED.geometry_precision,
                 truncated_source = EXCLUDED.truncated_source,
+                -- Refreshed on resume like every other source-derived field:
+                -- a page whose blocks moved must not keep last attempt's order.
+                source_order = EXCLUDED.source_order,
+                context_key = EXCLUDED.context_key,
                 embedding = CASE
                     WHEN evidence_unit.normalized_text
                          IS DISTINCT FROM EXCLUDED.normalized_text
@@ -294,6 +299,8 @@ def upsert_evidence(
                 unit.artifact_path,
                 str(unit.geometry_precision),
                 unit.truncated_source,
+                unit.source_order,
+                unit.context_key,
             ),
         ).fetchone()
         evidence_id = int(row["id"])
@@ -626,16 +633,38 @@ def regions_for(conn: psycopg.Connection, evidence_ids: Sequence[int]) -> dict[i
 def neighbours(
     conn: psycopg.Connection, evidence_id: int, radius: int = 1
 ) -> list[dict[str, Any]]:
-    """Adjacent source blocks and sibling rows used to expand a candidate."""
+    """Adjacent source blocks and sibling rows used to expand a candidate.
+
+    Ordered by what the page says, not by what the database did. Evidence ids
+    record insertion and resume history: a table reconstructed on a second
+    attempt gets ids far from the paragraph beside it, and a row inserted next
+    to a candidate by coincidence looked like its closest context. So:
+
+    1. units sharing the candidate's ``context_key`` -- its own table row, the
+       cells in it -- which is a relationship, not a proximity guess;
+    2. then the same page ordered by distance in ``source_order``;
+    3. then evidence id, purely to make ties repeatable.
+
+    A version indexed before ``source_order`` existed sorts by nulls last and
+    falls back to page order until it is re-indexed. Same page, same ready
+    version, same document throughout; the candidate itself and non-citable
+    page Markdown are never returned.
+    """
     return conn.execute(
         f"""
         {_EVIDENCE_SELECT}
-        WHERE {_READY} AND e.page_id = (SELECT page_id FROM evidence_unit WHERE id = %s)
-          AND e.id <> %s AND e.citable
-        ORDER BY abs(e.id - %s)
-        LIMIT %s
+        WHERE {_READY} AND e.page_id = (SELECT page_id FROM evidence_unit WHERE id = %(id)s)
+          AND e.id <> %(id)s AND e.citable
+        ORDER BY
+            (e.context_key IS NOT NULL
+             AND e.context_key = (SELECT context_key FROM evidence_unit
+                                   WHERE id = %(id)s)) DESC,
+            abs(e.source_order - (SELECT source_order FROM evidence_unit
+                                   WHERE id = %(id)s)) NULLS LAST,
+            e.id
+        LIMIT %(limit)s
         """,
-        (evidence_id, evidence_id, evidence_id, radius * 4),
+        {"id": evidence_id, "limit": radius * 4},
     ).fetchall()
 
 

@@ -355,6 +355,7 @@ def narrative_units(page: PageSource, blocks: list[dict[str, Any]]) -> list[Evid
         units.append(
             EvidenceUnit(
                 unit_key=f"p{page.page:04d}:narrative:{block['block_id']}",
+                context_key=f"p{page.page:04d}:block:{block['block_id']}",
                 page=page.page,
                 kind=EvidenceKind.NARRATIVE,
                 text=text,
@@ -457,9 +458,14 @@ def table_units(
         row_fallback, row_precision = _fallback_regions(
             row_union, table_region, role=RegionRole.SUPPORTING_CONTEXT
         )
+        # One key per table row. Its value cells share it, which is what makes
+        # "expand this cell to its descriptor, header and unit" a lookup rather
+        # than a guess about which rows happen to sit near it.
+        row_context = f"p{page.page:04d}:table:{candidate_id}:row:{r}"
         units.append(
             EvidenceUnit(
                 unit_key=f"p{page.page:04d}:table_row:{candidate_id}:r{r}",
+                context_key=row_context,
                 page=page.page,
                 kind=EvidenceKind.TABLE_ROW,
                 text=row_text,
@@ -512,6 +518,7 @@ def table_units(
             units.append(
                 EvidenceUnit(
                     unit_key=f"p{page.page:04d}:table_value:{candidate_id}:r{r}:c{c}",
+                    context_key=row_context,
                     page=page.page,
                     kind=EvidenceKind.TABLE_VALUE,
                     text=text,
@@ -620,6 +627,7 @@ def visual_units(
         units.append(
             EvidenceUnit(
                 unit_key=f"p{page.page:04d}:visual:{index}",
+                context_key=f"p{page.page:04d}:visual:{index}",
                 page=page.page,
                 kind=EvidenceKind.VISUAL,
                 text=text or f"visual region {index} on page {page.page}",
@@ -672,8 +680,8 @@ def page_units(
     page: PageSource,
     blocks: list[dict[str, Any]],
 ) -> Iterator[EvidenceUnit]:
-    """Every evidence unit for one page, in artifact-priority order."""
-    yield from narrative_units(page, blocks)
+    """Every evidence unit for one page, in reading order."""
+    units: list[EvidenceUnit] = list(narrative_units(page, blocks))
 
     heading_by_block = {
         str(b["block_id"]).split("-")[-1]: [clean_text(h) for h in b.get("heading_path") or []]
@@ -689,18 +697,47 @@ def page_units(
             default_heading,
         )
         try:
-            yield from table_units(page, candidate, heading)
+            units.extend(table_units(page, candidate, heading))
         except (KeyError, TypeError, ValueError) as exc:
             reader.warnings.append(
                 f"page {page.page} table {candidate.get('candidate_id')} skipped: {exc}"
             )
             reader.skipped.append(f"{page.rel}/table_candidates.json")
 
-    yield from visual_units(page, reader.image_summaries(page), default_heading)
+    units.extend(visual_units(page, reader.image_summaries(page), default_heading))
 
     unit = markdown_unit(page, reader.page_markdown(page))
     if unit:
-        yield unit
+        units.append(unit)
+
+    yield from _in_reading_order(units)
+
+
+def _in_reading_order(units: list[EvidenceUnit]) -> list[EvidenceUnit]:
+    """Number the page's units top to bottom, artifact order breaking ties.
+
+    A deterministic approximation of reading order, not a layout analysis: the
+    top edge of a unit's highest region places it, and the order the artifacts
+    produced it settles anything at the same height. That is enough for "what
+    sits next to this on the page", and it is stable across re-ingestion in a
+    way evidence ids are not.
+
+    Generated page Markdown always sorts last. It covers the whole page, so by
+    position it would rank first and become every candidate's nearest
+    neighbour, which is precisely the thing it must never be.
+    """
+    def position(entry: tuple[int, EvidenceUnit]) -> tuple[float, int]:
+        index, unit = entry
+        if unit.kind is EvidenceKind.PAGE_MARKDOWN:
+            return (2.0, index)
+        top = min((region.bbox[1] for region in unit.regions), default=1.0)
+        return (top, index)
+
+    ordered = sorted(enumerate(units), key=position)
+    return [
+        unit.model_copy(update={"source_order": order})
+        for order, (_, unit) in enumerate(ordered)
+    ]
 
 
 __all__ = [
