@@ -988,6 +988,114 @@ def check_explanation_carries_no_model_text(tmp: Path) -> None:
             check(secret not in blob, f"persisted explanation omits {secret[:32]!r}")
 
 
+# --- M-4: an audit records its corpus and its outcome -----------------------
+
+
+def check_audit_persists_its_scope_and_status(tmp: Path) -> None:
+    with make_client(default_session()) as client:
+        ready = {int(r["id"]) for r in client.documents()}
+        chosen = sorted(ready)[0]
+
+        scoped = client.audit_claim(VAGUE, document_ids=[chosen])
+        trace = client.get_audit_trace(scoped.audit_id)
+        check(not scoped.citations, "the vague claim cites nothing")
+        check(
+            trace.document_ids == [chosen],
+            f"the requested scope is retained without citations ({trace.document_ids})",
+        )
+        check(trace.status == "completed", "a finished audit is explicitly completed")
+        check(trace.completed_at is not None, "and carries its completion time")
+        check(trace.failure_code is None, "with no failure metadata")
+
+        everything = client.audit_claim(SUPPORTED)
+        all_trace = client.get_audit_trace(everything.audit_id)
+        check(
+            set(all_trace.document_ids) == ready,
+            f"an unscoped audit records the ids ready at the time ({all_trace.document_ids})",
+        )
+        stored = client.conn.execute(
+            "SELECT requested_document_ids FROM audit_run WHERE id = %s",
+            (everything.audit_id,),
+        ).fetchone()["requested_document_ids"]
+        check(
+            set(int(i) for i in stored) == ready,
+            "the exact ids are stored, not an empty list meaning 'whatever exists'",
+        )
+
+
+def check_trace_survives_document_removal(tmp: Path) -> None:
+    root = build_root(tmp / "doomed")
+    with make_client(default_session()) as client:
+        report = client.ingest_document(root, source_uri="urn:doomed")
+        result = client.audit_claim(SUPPORTED, document_ids=[report.document_id])
+        client.remove_document(report.document_id, confirm_document_id=report.document_id)
+
+        trace = client.get_audit_trace(result.audit_id)
+        check(
+            report.document_id in trace.document_ids,
+            "the trace still names the document that was searched",
+        )
+        check(trace.status == "completed", "and still reads as a completed audit")
+        check(trace.claim == SUPPORTED, "with its claim intact")
+
+
+def check_failed_audit_is_explicit_and_safe(tmp: Path) -> None:
+    import claim_evidence.audit as audit_module
+
+    original = audit_module._deterministic
+    audit_module._deterministic = lambda *a, **k: (_ for _ in ()).throw(
+        audit_module.AuditError("adjudication failed: secret-sentinel-model-reply")
+    )
+    try:
+        with make_client(default_session()) as client:
+            before = client.conn.execute(
+                "SELECT count(*) AS n FROM audit_run"
+            ).fetchone()["n"]
+            try:
+                client.audit_claim(SUPPORTED)
+            except audit_module.AuditError:
+                pass
+            else:
+                raise AssertionError("the audit should have raised")
+
+            row = client.conn.execute(
+                "SELECT * FROM audit_run ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            check(
+                client.conn.execute("SELECT count(*) AS n FROM audit_run").fetchone()["n"]
+                == before + 1,
+                "the failed audit is on the record, not discarded",
+            )
+            check(row["status"] == "failed", "and is explicitly failed")
+            check(row["verdict"] is None, "with no verdict")
+            check(row["failure_code"] == "internal_error", "a safe failure code")
+            check(bool(row["failure_phase"]), "the failing phase")
+            check(row["retryable"] is True, "and its retryability")
+            check(bool(row["requested_document_ids"]), "the searched corpus is kept")
+            blob = json.dumps(dict(row), default=str)
+            for secret in ("secret-sentinel-model-reply", "You decide whether", "postgresql://"):
+                check(secret not in blob, f"the row omits {secret[:28]!r}")
+
+            trace = client.get_audit_trace(int(row["id"]))
+            check(trace.status == "failed", "the trace reports the failure")
+            check(trace.failure_code == "internal_error", "with the safe code")
+            check(trace.retryable is True, "and its retryability")
+    finally:
+        audit_module._deterministic = original
+
+
+def check_scope_failure_creates_no_audit_row(tmp: Path) -> None:
+    with make_client(default_session()) as client:
+        before = client.conn.execute("SELECT count(*) AS n FROM audit_run").fetchone()["n"]
+        _expect(
+            NotFoundError,
+            lambda: client.audit_claim(SUPPORTED, document_ids=[10_000_002]),
+            "an invalid scope is rejected",
+        )
+        after = client.conn.execute("SELECT count(*) AS n FROM audit_run").fetchone()["n"]
+        check(after == before, "and no audit row was opened for it")
+
+
 # --- M-3: three identities, none of them standing in for another ------------
 
 
@@ -1326,6 +1434,10 @@ def main() -> int:
         check_vague_claim_explains_the_scope_gap,
         check_explanation_round_trips_through_the_trace,
         check_explanation_carries_no_model_text,
+        check_audit_persists_its_scope_and_status,
+        check_trace_survives_document_removal,
+        check_failed_audit_is_explicit_and_safe,
+        check_scope_failure_creates_no_audit_row,
         check_source_hash_is_the_real_pdf_digest,
         check_improved_extraction_replaces_the_version,
         check_page_image_change_rebuilds_the_version,

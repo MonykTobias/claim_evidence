@@ -193,13 +193,21 @@ def get_audit_trace(conn: psycopg.Connection, audit_id: int | str) -> AuditTrace
     return AuditTrace(
         audit_id=identifier,
         claim=run["claim"],
-        # The audited corpus, which for an insufficient verdict with no
-        # citations is the only record of what was actually searched.
+        # The corpus recorded when the audit opened, which is the only account
+        # that survives an insufficient verdict, a failure, or a document being
+        # removed afterwards. Citations are a subset of it, never its source.
         document_ids=sorted(
-            {int(c["document_id"]) for c in citations if "document_id" in c}
+            {int(i) for i in run.get("requested_document_ids") or []}
             | {r.document_id for r in references}
+            | {int(c["document_id"]) for c in citations if "document_id" in c}
         ),
+        status=run.get("status") or "completed",
         created_at=run.get("created_at"),
+        completed_at=run.get("completed_at"),
+        failed_at=run.get("failed_at"),
+        failure_code=run.get("failure_code"),
+        failure_phase=run.get("failure_phase"),
+        retryable=run.get("retryable"),
         decision_explanation=(
             DecisionExplanation(**explanation) if explanation.get("decided_by") else None
         ),
@@ -232,6 +240,9 @@ def get_audit_trace(conn: psycopg.Connection, audit_id: int | str) -> AuditTrace
             )
             for row in audit_candidates(conn, identifier)
         ],
+        # Legacy column, kept only so rows written before the failure
+        # lifecycle existed still read. New failures use failure_code/phase,
+        # which are vetted values rather than whatever was raised.
         error=run.get("error"),
     )
 

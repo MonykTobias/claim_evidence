@@ -402,8 +402,17 @@ class AuditTrace(BaseModel):
 
     audit_id: int
     claim: str
+    # The corpus that was searched, recorded when the audit opened. Not derived
+    # from citations: an insufficient verdict cites nothing and still searched
+    # something, and a document removed afterwards must not erase the record.
     document_ids: list[int] = Field(default_factory=list)
+    status: Literal["running", "completed", "failed"] = "completed"
     created_at: datetime | None = None
+    completed_at: datetime | None = None
+    failed_at: datetime | None = None
+    failure_code: str | None = None
+    failure_phase: str | None = None
+    retryable: bool | None = None
     parsed_claim: dict[str, Any] = Field(default_factory=dict)
     verdict: Verdict | None = None
     rationale: str | None = None

@@ -174,6 +174,18 @@ keep their own comparisons.
 prose stays in `rationale`. Nothing in the explanation is a prompt, a raw model
 reply, or a local path.
 
+`AuditTrace` also carries the audit's own lifecycle: `status` is `running`,
+`completed`, or `failed`, alongside `completed_at`/`failed_at` and, on failure,
+a safe `failure_code`, `failure_phase`, and `retryable`. A failed audit is an
+explicitly failed row, not an ambiguous one with a null verdict, and it stores
+no exception text.
+
+`document_ids` is the corpus recorded when the audit opened — for an unscoped
+audit, the exact ready ids at that moment. It is never reconstructed from
+citations, so it survives an `insufficient` verdict, a failure, and a document
+being removed afterwards. A scope that fails validation opens no audit row at
+all.
+
 `timings` reports elapsed seconds for `parsing`, `retrieval`, `fusion_context`,
 `visual_verification`, `verdict`, `persistence`, and `total`. A group whose
 phases never ran is `null` rather than `0.0`. `index_references` pins the exact

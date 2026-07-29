@@ -695,16 +695,54 @@ def create_audit(
     parsed: dict[str, Any],
     chat_model: str,
     embed_model: str,
+    requested_document_ids: Sequence[int] = (),
 ) -> int:
+    """Open a running audit, with the corpus it is about to search.
+
+    The scope is recorded now, not derived from citations later: an audit that
+    cites nothing still searched something, and "which documents did this
+    question actually cover?" is exactly the question an insufficient verdict
+    raises. For an unscoped audit these are the ready ids at this moment, not
+    an empty list standing for whatever happens to be ready when someone reads
+    the trace back.
+    """
     row = conn.execute(
         """
-        INSERT INTO audit_run (claim, parsed_claim, chat_model, embed_model)
-        VALUES (%s, %s, %s, %s) RETURNING id
+        INSERT INTO audit_run
+            (claim, parsed_claim, chat_model, embed_model, requested_document_ids)
+        VALUES (%s, %s, %s, %s, %s) RETURNING id
         """,
-        (claim, Jsonb(_jsonable(parsed)), chat_model, embed_model),
+        (
+            claim,
+            Jsonb(_jsonable(parsed)),
+            chat_model,
+            embed_model,
+            Jsonb([int(i) for i in requested_document_ids]),
+        ),
     ).fetchone()
     conn.commit()
     return int(row["id"])
+
+
+def fail_audit(
+    conn: psycopg.Connection,
+    audit_id: int,
+    *,
+    code: str,
+    phase: str,
+    retryable: bool,
+) -> None:
+    """Mark an audit failed with safe metadata only, never the exception."""
+    with conn.transaction():
+        conn.execute(
+            """
+            UPDATE audit_run
+               SET status = 'failed', failed_at = now(),
+                   failure_code = %s, failure_phase = %s, retryable = %s
+             WHERE id = %s AND status = 'running'
+            """,
+            (code, phase, retryable, audit_id),
+        )
 
 
 def record_candidates(
@@ -766,7 +804,8 @@ def finish_audit(
         """
         UPDATE audit_run SET verdict = %s, rationale = %s, evidence_quality = %s,
             missing_qualifiers = %s, citations = %s, error = %s,
-            decision_explanation = %s, timings = %s, index_references = %s
+            decision_explanation = %s, timings = %s, index_references = %s,
+            status = 'completed', completed_at = now()
         WHERE id = %s
         """,
         (
@@ -804,6 +843,7 @@ __all__ = [
     "delete_stale_pages",
     "document_scope",
     "exact_vector_search",
+    "fail_audit",
     "facts_for_evidence",
     "find_version",
     "finish_audit",

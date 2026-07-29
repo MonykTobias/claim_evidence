@@ -12,15 +12,19 @@ guess drawn from generated Markdown or an unverified image summary.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any, Sequence
 
 import psycopg
 
+log = logging.getLogger(__name__)
+
 from .config import Settings
 from .db import (
     create_audit,
     facts_for_evidence,
+    fail_audit,
     finish_audit,
     record_candidates,
     regions_for,
@@ -46,7 +50,12 @@ from .models import (
 )
 from .errors import ClaimEvidenceError
 from .ollama import OllamaClient, OllamaError
-from .progress import ProgressCallback, ProgressReporter, audit_timings
+from .progress import (
+    ProgressCallback,
+    ProgressReporter,
+    audit_timings,
+    classify_error,
+)
 from .retrieve import expand, retrieve, to_citation
 from .vision import verify_visual
 
@@ -123,7 +132,26 @@ def audit_claim(
         )
     except BaseException as exc:
         reporter.fail(exc)
+        if reporter.audit_id is not None:
+            _record_audit_failure(conn, reporter.audit_id, exc, reporter.phase)
         raise
+
+
+def _record_audit_failure(
+    conn: psycopg.Connection, audit_id: int, exc: BaseException, phase: str
+) -> None:
+    """Turn a null-verdict row into an explicitly failed one.
+
+    Safe metadata only, and never at the cost of the original exception: a
+    database that is also unhappy must not replace the caller's answer with a
+    second, less useful one.
+    """
+    code, retryable, _message = classify_error(exc)
+    try:
+        conn.rollback()
+        fail_audit(conn, audit_id, code=code, phase=phase or "unknown", retryable=retryable)
+    except Exception:  # noqa: BLE001 - never mask the original failure
+        log.exception("could not record the failure of audit %s", audit_id)
 
 
 def _audit(
@@ -139,7 +167,14 @@ def _audit(
 ) -> ClaimResult:
     parsed = parse_claim(client, claim, reporter)
     audit_id = create_audit(
-        conn, claim, parsed.model_dump(mode="json"), settings.chat_model, settings.embed_model
+        conn,
+        claim,
+        parsed.model_dump(mode="json"),
+        settings.chat_model,
+        settings.embed_model,
+        # The corpus this audit is about to search, resolved by H-5 before any
+        # of this ran, so the record survives a document being removed later.
+        [reference.document_id for reference in index_references],
     )
     reporter.audit_id = audit_id
 
