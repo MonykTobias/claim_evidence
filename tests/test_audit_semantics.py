@@ -14,7 +14,7 @@ import pytest
 
 from claim_evidence.audit import _collapse_duplicates, _deterministic
 from claim_evidence.contracts import VERDICTS
-from claim_evidence.facts import compare, heuristic_claim
+from claim_evidence.facts import SCOPE_MISMATCH, compare, heuristic_claim
 from claim_evidence.models import Citation, EvidenceKind, EvidenceQuality, Verdict
 
 ENTITY = "Danone S.A."
@@ -229,6 +229,125 @@ def test_the_comparator_and_the_verdict_agree_on_every_fact() -> None:
             direct == comparisons[0].numeric.outcome == outcome,
             f"{value}: compare() and the audit agree on {outcome}",
         )
+
+
+# --- free-form claims -------------------------------------------------------
+
+IKEA = (
+    "In FY24, IKEA’s estimated total climate footprint was 21.3 million "
+    "tonnes of CO₂ equivalent."
+)
+# The same figure and unit, stated about a boundary both sides name. Scope is
+# what makes a comparison possible at all: `scopes_comparable` fails closed on
+# a claim that names no boundary, which is why the sentence above reaches the
+# adjudicator instead of the arithmetic.
+SCOPED = (
+    "In FY24, IKEA’s Scope 1 and 2 emissions were 21.3 million tonnes of "
+    "CO₂ equivalent."
+)
+
+
+def footprint_fact(
+    value: str = "21300000",
+    *,
+    unit: str = "tCO2e",
+    reporting: str | None = "FY2024",
+) -> dict[str, Any]:
+    """A Scope 1 and 2 emissions row, as a report's table would state it."""
+    return {
+        "id": 1,
+        "evidence_id": 200,
+        "subject": "IKEA",
+        "metric": "IKEA Scope 1 and 2 emissions FY24 | tonnes of CO2 equivalent",
+        "value_decimal": Decimal(value),
+        "unit": unit,
+        "direction": "unknown",
+        "comparison": "=",
+        "reporting_period": reporting,
+        "baseline_period": None,
+        "scope": "Scope 1 and 2 emissions",
+        "geography": None,
+        "qualifiers": {"displayed_value": value},
+    }
+
+
+def ikea_claim(text: str = SCOPED):
+    return heuristic_claim(text).model_copy(update={"subject": "IKEA"})
+
+
+def test_a_claim_compares_across_unit_scales() -> None:
+    """21.3 MtCO2e and 21,300,000 tCO2e are the same figure."""
+    outcome, reason = compare(ikea_claim(), footprint_fact())
+    check(outcome == "match", f"the claim matches the reported total ({reason})")
+    check(
+        compare(ikea_claim(), footprint_fact("21400000"))[0] == "conflict",
+        "and a different total is a conflict, not a rounding win",
+    )
+    check(
+        compare(ikea_claim(), footprint_fact("21300000", unit="t"))[0] == "incomparable",
+        "while plain tonnes are not tonnes of CO2-equivalent",
+    )
+
+
+def test_a_fiscal_period_never_silently_becomes_a_calendar_year() -> None:
+    check(
+        compare(ikea_claim(), footprint_fact(reporting="FY24"))[0] == "match",
+        "FY24 and FY2024 are one period",
+    )
+    outcome, reason = compare(ikea_claim(), footprint_fact(reporting="2024"))
+    check(outcome == "incomparable", f"but calendar 2024 is not ({outcome})")
+    check("FY2024" in reason and "2024" in reason, f"and the reason says so ({reason})")
+
+
+def test_the_regression_sentence_is_audited_rather_than_refused() -> None:
+    """The sentence version 1 turned away now reaches the evidence.
+
+    It names no scope boundary, so the arithmetic declines it -- and declining
+    is not a verdict. It is handed to cited semantic adjudication, which is a
+    statement about what the selected documents say rather than about what this
+    package can parse.
+    """
+    parsed = heuristic_claim(IKEA).model_copy(update={"subject": "IKEA"})
+    check(
+        (parsed.value_decimal, parsed.unit, parsed.reporting_period)
+        == (Decimal("21.3"), "mtco2e", "FY2024"),
+        "the figure, its compound unit, and its fiscal period were all read",
+    )
+    outcome, reason = compare(parsed, footprint_fact())
+    check(outcome == "incomparable", f"the arithmetic declines it ({outcome})")
+    check(
+        reason.startswith(SCOPE_MISMATCH),
+        "because the claim names no boundary -- which is what the adjudicator "
+        f"is told, rather than a contradiction ({reason[:60]})",
+    )
+
+
+def test_a_cross_company_comparison_is_never_a_deterministic_verdict() -> None:
+    """The selected documents decide it, or nothing does.
+
+    Version 1 refused this shape outright. It is now audited, and against a
+    corpus holding only one company's figures the arithmetic must decline to
+    answer rather than contradict the claim with the nearest number it has.
+    """
+    claim = "IKEA cut emissions by more than Nestle did in 2025."
+    (verdict, _rationale, citations, *_rest), comparisons = decide(
+        [fact("-40.2")], claim_text=claim
+    )
+    check(verdict is None, "no deterministic verdict is reached")
+    check(citations == [], "and nothing is cited for it")
+    check(
+        comparisons[0].numeric.outcome != "conflict",
+        "the claim is not contradicted by a figure about one of the two companies",
+    )
+
+
+def test_estimated_describes_the_metric_not_the_number() -> None:
+    parsed = ikea_claim()
+    check(not parsed.approximate, "'estimated total climate footprint' is not a hedge")
+    check(
+        compare(parsed, footprint_fact("21340000"))[0] == "conflict",
+        "so 21.34 Mt is compared exactly against the stated 21.3, and differs",
+    )
 
 
 # --- vocabulary -------------------------------------------------------------

@@ -25,17 +25,21 @@ from .models import (
     QualifierComparison,
 )
 from .normalize import (
+    all_periods,
     all_years,
     clean_text,
     contains_quote,
     content_tokens,
     detect_direction,
     is_approximate,
+    known_unit,
     normalize_for_match,
+    normalize_period,
     normalize_unit,
     parse_value,
     scopes_comparable,
     signed_change,
+    unit_conversion,
     values_agree,
 )
 
@@ -79,10 +83,10 @@ def table_fact(unit: EvidenceUnit, subject: str) -> Fact | None:
     unit_label = normalize_unit(context.get("unit") or "") or inline_unit
 
     header_text = " ".join(header_path)
-    reporting = _last_year(header_text)
+    reporting = _last_period(header_text)
     # "... vs. 2020" in the row descriptor names the baseline the value is
     # measured against; without it a variation is not comparable to a claim.
-    descriptor_years = all_years(descriptor)
+    descriptor_years = all_periods(descriptor)
     baseline = descriptor_years[-1] if descriptor_years else None
     if reporting is None and descriptor_years:
         reporting = None  # a year in the descriptor is a baseline, not a period
@@ -111,9 +115,10 @@ def table_fact(unit: EvidenceUnit, subject: str) -> Fact | None:
     )
 
 
-def _last_year(text: str) -> str | None:
-    years = all_years(text)
-    return years[-1] if years else None
+def _last_period(text: str) -> str | None:
+    """The period a column header names, fiscal labels included."""
+    periods = all_periods(text)
+    return periods[-1] if periods else None
 
 
 def table_facts(units: Iterable[EvidenceUnit], subject: str) -> list[Fact]:
@@ -196,6 +201,12 @@ def accept_llm_facts(
 
 # --- claim parsing ----------------------------------------------------------
 
+# "from 2020 to 2025", "since FY20": the period right after the preposition is
+# the baseline, whichever order the two were written in.
+_FROM_PERIOD = re.compile(
+    r"\b(?:from|since)\s+(FY\s?\d{4}|FY\s?\d{2}|(?:19|20)\d{2})\b", re.I
+)
+
 CLAIM_PARSE_SYSTEM = """\
 You decompose one atomic claim about a company report into comparable parts.
 
@@ -209,6 +220,9 @@ Rules:
   and industry emissions". Leave it null when the claim does not name one.
 - Set `comparison` to "~" and `approximate` to true only when the claim hedges
   with words such as about, roughly, or approximately.
+- Set `comparison` to ">=", ">", "<=" or "<" when the claim states a bound such
+  as "at least", "more than", "no more than", or "up to". Leave it "=" when the
+  claim states a figure outright.
 - `key_terms` lists the distinctive words a search should preserve.
 """
 
@@ -216,7 +230,7 @@ Rules:
 def heuristic_claim(claim: str) -> ParsedClaim:
     """Deterministic parse used to seed retrieval and as an offline fallback."""
     text = clean_text(claim)
-    years = all_years(text)
+    years = all_periods(text)
     value, unit = _claim_value(text)
     direction = detect_direction(text)
     approximate = is_approximate(text)
@@ -225,7 +239,9 @@ def heuristic_claim(claim: str) -> ParsedClaim:
     if len(years) >= 2:
         # "in 2025 versus 2020" -- the baseline is the one after the comparison.
         reporting, baseline = years[0], years[-1]
-        if re.search(r"(from|since)\s+" + re.escape(years[0]), text, re.IGNORECASE):
+        opening = _FROM_PERIOD.search(text)
+        if opening and normalize_period(opening.group(1)) == years[0]:
+            # "from FY20 to FY25" states the baseline first.
             reporting, baseline = years[-1], years[0]
     elif years:
         reporting = years[0]
@@ -270,19 +286,47 @@ def _claim_operator(text: str, approximate: bool) -> str:
     return "~" if approximate else "="
 
 
+# A signed figure, where the sign is attached rather than left over from a
+# range: in "2020-2025" the "-" belongs to neither number.
+_CLAIM_NUMBER = re.compile(r"(?<![\w.,])[+-]?\d[\d,.]*")
+
+
+def _unit_after(text: str, index: int) -> str | None:
+    """The unit stated directly after a value, longest reading first.
+
+    Longest first because "million tonnes of CO2 equivalent" is one unit and
+    "million" is not, and because the words in between -- "of" -- are part of
+    how a report writes it rather than a separator to skip.
+    """
+    words = [w.strip(".,;:") for w in clean_text(text[index : index + 80]).split()][:5]
+    for size in range(len(words), 0, -1):
+        unit = known_unit(" ".join(words[:size]))
+        if unit:
+            return unit
+    return None
+
+
 def _claim_value(text: str) -> tuple[Decimal | None, str | None]:
-    # `%` is not a word character, so a trailing \b would never match "40.2% in".
-    match = re.search(
-        r"(\d[\d,.]*)\s*(?:%|\b(?:percent|percentage points?|pp)\b)", text, re.I
-    )
-    if match:
-        value, _ = parse_value(match.group(1))
-        return value, "%"
-    match = re.search(r"\b(\d[\d,.]*)\b", text)
-    if match and match.group(1) not in all_years(text):
-        value, _ = parse_value(match.group(1))
-        return value, None
-    return None, None
+    """The figure the claim states, and the unit stated next to it.
+
+    The first *number* is not the value: "Scope 1 and 2 emissions" opens with a
+    metric name that contains digits, and reading 1 as the figure answers a
+    question nobody asked. A number carrying a unit is what a claim states, so
+    that is what is looked for first.
+    """
+    periods = set(all_periods(text)) | set(all_years(text))
+    fallback: Decimal | None = None
+    for match in _CLAIM_NUMBER.finditer(text):
+        raw = match.group(0).strip(".,")
+        if not raw or raw.lstrip("+-") in periods:
+            continue
+        unit = _unit_after(text, match.end())
+        if unit:
+            value, _ = parse_value(raw)
+            return value, unit
+        if fallback is None:
+            fallback, _ = parse_value(raw)
+    return fallback, None
 
 
 def merge_claim(parsed: ParsedClaim, fallback: ParsedClaim) -> ParsedClaim:
@@ -298,6 +342,13 @@ def merge_claim(parsed: ParsedClaim, fallback: ParsedClaim) -> ParsedClaim:
         update["key_terms"] = fallback.key_terms
     if not parsed.metric:
         update["metric"] = fallback.metric
+    # "=" is the field's default, so a model that says nothing about the
+    # comparison is indistinguishable from one asserting equality. The wording
+    # is not ambiguous -- "at least 40%" is a bound whether or not the model
+    # noticed -- and reading it as equality turns a satisfied claim into a
+    # contradiction against the very figure that satisfies it.
+    if parsed.comparison == "=" and fallback.comparison != "=":
+        update["comparison"] = fallback.comparison
     if parsed.approximate or fallback.approximate:
         update["approximate"] = True
         update["comparison"] = "~"
@@ -386,41 +437,52 @@ def compare_detailed(claim: ParsedClaim, fact: dict[str, Any] | Fact) -> Compari
 
     claim_unit = normalize_unit(claim.unit)
     fact_unit = normalize_unit(row.get("unit"))
+    # Comparison-time conversion, so an index built before this understood
+    # "MtCO2e" still answers -- nothing stored is rewritten. `None` covers both
+    # "not the same quantity" and "a unit this package cannot convert", and
+    # both of those are incomparable rather than a conflict.
+    conversion = unit_conversion(claim_unit, fact_unit)
     if not claim_unit or not fact_unit:
         note("unit", claim_unit, fact_unit, "missing",
              "unit is not stated on both sides",
              blocking=claim_unit != fact_unit)
-    elif claim_unit != fact_unit:
+    elif conversion is None:
         note("unit", claim_unit, fact_unit, "mismatch",
              f"unit {claim_unit!r} does not match {fact_unit!r}", blocking=True)
     else:
-        note("unit", claim_unit, fact_unit, "match")
+        note("unit", claim_unit, fact_unit, "match",
+             None if conversion == 1
+             else f"{claim_unit} converts to {fact_unit} exactly")
 
-    fact_reporting = row.get("reporting_period")
-    if claim.reporting_period and fact_reporting:
-        same = claim.reporting_period == fact_reporting
-        note("reporting_period", claim.reporting_period, fact_reporting,
+    # FY24 and FY2024 are one period; neither is calendar 2024. Normalized on
+    # both sides here so a fact indexed under either spelling still compares.
+    claim_reporting = normalize_period(claim.reporting_period)
+    fact_reporting = normalize_period(row.get("reporting_period"))
+    if claim_reporting and fact_reporting:
+        same = claim_reporting == fact_reporting
+        note("reporting_period", claim_reporting, fact_reporting,
              "match" if same else "mismatch",
              None if same else
-             f"reporting period {claim.reporting_period} does not match {fact_reporting}",
+             f"reporting period {claim_reporting} does not match {fact_reporting}",
              blocking=not same)
-    elif claim.reporting_period and not fact_reporting:
-        note("reporting_period", claim.reporting_period, None, "missing",
+    elif claim_reporting and not fact_reporting:
+        note("reporting_period", claim_reporting, None, "missing",
              "fact states no reporting period", blocking=True)
     else:
-        note("reporting_period", claim.reporting_period, fact_reporting, "missing")
+        note("reporting_period", claim_reporting, fact_reporting, "missing")
 
-    fact_baseline = row.get("baseline_period")
-    if claim.baseline_period and claim.baseline_period != fact_baseline:
-        note("baseline_period", claim.baseline_period, fact_baseline,
+    claim_baseline = normalize_period(claim.baseline_period)
+    fact_baseline = normalize_period(row.get("baseline_period"))
+    if claim_baseline and claim_baseline != fact_baseline:
+        note("baseline_period", claim_baseline, fact_baseline,
              "mismatch" if fact_baseline else "missing",
-             f"baseline {claim.baseline_period} does not match {fact_baseline}",
+             f"baseline {claim_baseline} does not match {fact_baseline}",
              blocking=True)
-    elif fact_baseline and not claim.baseline_period:
+    elif fact_baseline and not claim_baseline:
         note("baseline_period", None, fact_baseline, "missing",
              "fact is measured against a baseline the claim omits", blocking=True)
-    elif claim.baseline_period:
-        note("baseline_period", claim.baseline_period, fact_baseline, "match")
+    elif claim_baseline:
+        note("baseline_period", claim_baseline, fact_baseline, "match")
     else:
         note("baseline_period", None, None, "missing")
 
@@ -477,11 +539,14 @@ def compare_detailed(claim: ParsedClaim, fact: dict[str, Any] | Fact) -> Compari
         )
 
     observed = Decimal(str(observed))
-    claimed = signed_change(claim.value_decimal, claim.direction)
+    # Into the source's unit before anything is compared: 21.3 MtCO2e and
+    # 21,300,000 tCO2e are the same figure, and only one of them is on the page.
+    stated = claim.value_decimal * (conversion if conversion is not None else 1)
+    claimed = signed_change(stated, claim.direction)
     fact_direction = row.get("direction") or "unknown"
     direction = claim.direction if claim.direction != "unknown" else fact_direction
     if claim.direction == "unknown" and fact_direction != "unknown":
-        claimed = signed_change(claim.value_decimal, fact_direction)
+        claimed = signed_change(stated, fact_direction)
     outcome, reason = _apply_operator(
         claim.comparison, claimed, observed, direction, claim.approximate
     )
@@ -516,39 +581,37 @@ def _apply_operator(
     direction: str,
     approximate: bool,
 ) -> tuple[Comparison, str]:
-    """Compare the two figures exactly, or refuse to compare them at all.
+    """Compare the two figures the way the claim stated its own precision.
 
-    Version 1 has one numeric rule: equal or not equal, on ``Decimal``. A
-    bounded or approximate claim never reaches here -- ``claims.validate_claim``
-    refuses it before an audit opens -- so an operator other than ``=`` arriving
-    at this point means a caller went round the gate, and the honest answer is
-    ``incomparable`` rather than a tolerance nobody asked for.
+    Three rules, all on ``Decimal`` and all decided here rather than by a model:
+
+    * A bound is satisfied or it is not (:func:`_bounded`).
+    * A hedged claim is compared at the precision it was written to, so "about
+      40%" accepts a reported 40.2% and "about 21.3" still refuses 21.5. There
+      is no global percentage tolerance: 5% of a small figure and 5% of a large
+      one are different claims, and neither is what the writer wrote.
+    * Anything else is equal or not equal.
     """
-    if operator != "=" or approximate:
-        return (
-            "incomparable",
-            f"version 1 compares values exactly, and this comparison is {operator!r}"
-            + (" with a tolerance" if approximate else ""),
-        )
-    if claimed == observed:
+    if operator in (">=", ">", "<=", "<"):
+        return _bounded(operator, claimed, observed, direction)
+    if values_agree(claimed, observed, approximate=approximate or operator == "~"):
         return "match", f"claimed {claimed} matches reported {observed}"
     return "conflict", f"claimed {claimed} but the source reports {observed}"
 
 
-def _legacy_bounded(
+def _bounded(
     operator: str,
     claimed: Decimal,
     observed: Decimal,
     direction: str,
 ) -> tuple[Comparison, str]:
-    """Retained for reference only; version 1 does not call this.
+    """A bound, compared on magnitude when the claim states a direction.
 
-    Bounds were checked on magnitude when the claim stated a direction, because
-    "reduced by at least 40%" means a bigger drop satisfies it even though the
-    signed value is smaller. Reinstating it needs a product decision about what
-    a bound means against a range of reported figures, not just this arithmetic.
+    "reduced by at least 40%" is satisfied by a 40.2% reduction even though
+    -40.2 is the *smaller* signed number: the claim is about how big the drop
+    was. Without a stated direction there is no magnitude to read, so the signed
+    values are compared as they stand.
     """
-
     left, right = (
         (abs(observed), abs(claimed)) if direction in ("decrease", "increase")
         else (observed, claimed)

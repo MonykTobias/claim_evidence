@@ -13,7 +13,7 @@ from typing import Sequence
 import psycopg
 
 from .audit import audit_claim as _audit_claim
-from .claims import validate_claim
+from .claims import validate_free_text
 from .config import Settings
 from .decompose import decompose_claims, verify_claims
 from .db import (
@@ -266,14 +266,20 @@ class ClaimEvidence:
         return to_matches(self.conn, candidates)
 
     def check_claim(self, claim: str, *, reporting_entity: str) -> str:
-        """Answer whether this claim is auditable, without auditing it.
+        """Answer whether this claim can be submitted, without auditing it.
 
-        The same version-1 grammar `audit_claim` applies, reachable before any
-        work is queued: a caller that runs audits in the background can refuse
-        an unsupported claim in the request that submitted it, instead of
+        The same trust-boundary check `audit_claim` applies -- text, non-empty,
+        within the length limit, and about a named entity -- reachable before
+        any work is queued, so a caller running audits in the background refuses
+        a malformed request in the request that submitted it rather than
         accepting the job and failing it a moment later.
+
+        It is deliberately not a judgement about what the claim says. Whether a
+        claim is answerable is decided by the evidence, and answering it from a
+        pattern here would refuse claims this package can now compare.
         """
-        return validate_claim(claim, reporting_entity=reporting_entity).text
+        text, _entity = validate_free_text(claim, reporting_entity=reporting_entity)
+        return text
 
     def decompose_claims(
         self, text: str, *, reporting_entity: str
@@ -320,25 +326,29 @@ class ClaimEvidence:
         widen silently to every document, which turns a frontend that had not
         finished loading into a much larger query whose answer looks normal.
 
-        The claim is validated against the version-1 grammar *before* anything
-        is written or any model is called, so an unsupported claim costs a typed
-        error and nothing else.
+        The trust boundary is checked *before* anything is written or any model
+        is called, so a malformed request costs a typed error and nothing else.
+        What the claim asserts is not checked here: it is answered by the
+        evidence, and a claim outside what this package can compare exactly
+        reaches a cited semantic adjudication rather than a refusal.
         """
         request = AuditRequest(
             claim=claim, scope=list(scope) if not isinstance(scope, str) else scope,
             limit=limit,
         )
-        supported = validate_claim(request.claim, reporting_entity=reporting_entity)
+        text, entity = validate_free_text(
+            request.claim, reporting_entity=reporting_entity
+        )
         selection, references = self._resolve_scope(request.document_ids)
         return _audit_claim(
             self.conn,
             self.ollama,
             self.settings,
-            supported.text,
+            text,
             document_ids=selection,
             index_references=references,
             limit=request.limit,
-            reporting_entity=supported.reporting_entity,
+            reporting_entity=entity,
             progress=progress,
         )
 

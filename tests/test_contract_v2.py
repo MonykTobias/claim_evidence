@@ -17,7 +17,9 @@ from claim_evidence import contracts
 from claim_evidence.errors import ValidationError
 from claim_evidence.models import (
     AuditRequest,
+    ClaimDecomposition,
     ClaimResult,
+    ClaimVerification,
     DocumentSummary,
     EvidenceDetail,
     ProgressEvent,
@@ -27,7 +29,9 @@ from claim_evidence.models import (
 
 MODELS: dict[str, Any] = {
     "audit_request": AuditRequest,
+    "claim_decomposition": ClaimDecomposition,
     "claim_result": ClaimResult,
+    "claim_verification": ClaimVerification,
     "document_summary": DocumentSummary,
     "error": PublicError,
     "evidence_detail": EvidenceDetail,
@@ -155,6 +159,25 @@ def test_vocabulary_matches_the_models() -> None:
     check(
         "cancelled" in vocabulary["job_statuses"],
         "cancellation is its own outcome, not a failure",
+    )
+    check(
+        tuple(vocabulary["grounding_statuses"]) == ("token_grounded", "not_grounded")
+        and tuple(vocabulary["entailment_outcomes"])[0] == "entailed",
+        "both claim gates publish their own vocabulary",
+    )
+    check(
+        "mixed" not in vocabulary["claim_batch_statuses"]
+        and "mixed_outcomes" in vocabulary["claim_batch_statuses"],
+        "a post whose claims came out differently is not a `mixed` verdict",
+    )
+    check(
+        set(vocabulary["claim_batch_statuses"]) - set(vocabulary["verdicts"])
+        == {"mixed_outcomes", "incomplete", "needs_review"},
+        "and the post-level states that have no verdict equivalent are named",
+    )
+    check(
+        vocabulary["max_atomic_claims"] == 20,
+        "the claim limit is published, so a frontend keeps no second copy",
     )
     check(
         "interrupted" in vocabulary["version_statuses"]

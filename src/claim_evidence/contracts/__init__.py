@@ -101,6 +101,30 @@ TERMINAL_PROGRESS_PHASE = "completed"
 # exactly those. Omitted, null, and empty are validation errors, never "all".
 SCOPE_ALL = "all"
 
+# The two gates a proposed subclaim passes before it may be audited.
+# `token_grounded` is provenance only -- every meaningful token was in the post,
+# in this order -- and says nothing about meaning, which is what entailment
+# answers. Only `entailed` may proceed.
+GROUNDING_STATUSES = ("token_grounded", "not_grounded")
+ENTAILMENT_OUTCOMES = ("entailed", "ambiguous", "not_entailed", "contradicted")
+
+# One post's worth of assertions. More is refused rather than truncated:
+# auditing the first twenty of thirty answers a question nobody asked.
+MAX_ATOMIC_CLAIMS = 20
+
+# How a whole post reads once its atomic claims have been audited. Deliberately
+# *not* the verdict vocabulary: `mixed` is a backend verdict about one claim
+# whose evidence disagrees with itself, and reusing it for "these claims came
+# out differently" would make two unrelated states indistinguishable.
+CLAIM_BATCH_STATUSES = (
+    "supported",
+    "contradicted",
+    "insufficient",
+    "mixed_outcomes",
+    "incomplete",
+    "needs_review",
+)
+
 # Where a citation points. One closed vocabulary so a renderer can style a
 # value cell differently from its descriptor without guessing.
 REGION_ROLES = (
@@ -145,6 +169,10 @@ def vocabulary() -> dict[str, Any]:
         "progress_statuses": list(PROGRESS_STATUSES),
         "terminal_progress_phase": TERMINAL_PROGRESS_PHASE,
         "scope_all": SCOPE_ALL,
+        "grounding_statuses": list(GROUNDING_STATUSES),
+        "entailment_outcomes": list(ENTAILMENT_OUTCOMES),
+        "claim_batch_statuses": list(CLAIM_BATCH_STATUSES),
+        "max_atomic_claims": MAX_ATOMIC_CLAIMS,
         "region_roles": list(REGION_ROLES),
         "geometry_precisions": list(GEOMETRY_PRECISIONS),
         "coordinate_space": COORDINATE_SPACE,
@@ -177,9 +205,13 @@ __all__ = [
     "API_CONTRACT_VERSION",
     "AUDIT_PHASES",
     "AUDIT_STATUSES",
+    "CLAIM_BATCH_STATUSES",
     "COORDINATE_SPACE",
     "CONTRACTS_DIR",
+    "ENTAILMENT_OUTCOMES",
     "ERROR_CODES",
+    "GROUNDING_STATUSES",
+    "MAX_ATOMIC_CLAIMS",
     "ERROR_STATUS",
     "EVIDENCE_KINDS",
     "EVIDENCE_QUALITIES",

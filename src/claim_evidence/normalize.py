@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any, Iterable
 
 from .models import GeometryPrecision, Region, RegionRole
@@ -23,6 +23,12 @@ from .models import GeometryPrecision, Region, RegionRole
 # -- different normalized text, a different region, a different parsed value.
 # It is part of the build fingerprint, so bumping it rebuilds; not bumping it
 # after such a change leaves an index whose text no longer matches its rules.
+#
+# Unit and period canonicalization is deliberately *not* covered by that rule:
+# `compare()` re-normalizes both the claim and the stored fact every time it
+# runs, so an index built before this understood "MtCO2e" or "FY24" answers
+# exactly as one built after it. Re-indexing a 494-page report to relabel a
+# column would cost hours and change no verdict.
 NORMALIZATION_VERSION = 1
 
 # Dashes, minus signs, and non-breaking hyphens all render as "-" in a PDF but
@@ -45,8 +51,6 @@ _SCOPE_RE = re.compile(r"\bscope\s*([123])\b")
 _APPROX_WORDS = ("about", "roughly", "approximately", "around", "circa", "~", "approx")
 _DECREASE_WORDS = ("reduc", "decreas", "declin", "lower", "cut", "down by", "fell")
 _INCREASE_WORDS = ("increas", "grew", "growth", "rose", "up by", "higher", "gain")
-
-APPROXIMATE_TOLERANCE = Decimal("0.05")
 
 
 def clean_text(value: str) -> str:
@@ -197,6 +201,68 @@ def unit_of(text: str) -> str | None:
     return None
 
 
+# One canonical spelling per unit. Only wordings that mean exactly the same
+# quantity: "ton" and "tonne" are the same unit spelled two ways, whereas a
+# short ton is not, and is deliberately absent.
+_UNIT_ALIASES = {
+    "percent": "%", "percentage": "%",
+    "percentage point": "percentage points", "pp": "percentage points",
+    "tonne": "t", "tonnes": "t", "ton": "t", "tons": "t",
+    "metric ton": "t", "metric tons": "t",
+    "metric tonne": "t", "metric tonnes": "t",
+    "kilotonne": "kt", "kilotonnes": "kt", "thousand tonnes": "kt",
+    "megatonne": "mt", "megatonnes": "mt", "million tonnes": "mt",
+    "gigatonne": "gt", "gigatonnes": "gt", "billion tonnes": "gt",
+    "kilogram": "kg", "kilograms": "kg", "gram": "g", "grams": "g",
+    "litre": "l", "litres": "l", "liter": "l", "liters": "l",
+    "cubic metre": "m3", "cubic metres": "m3",
+    "cubic meter": "m3", "cubic meters": "m3", "m³": "m3",
+    "kilometre": "km", "kilometres": "km", "kilometer": "km", "kilometers": "km",
+}
+
+# "MtCO2e", "Mt CO2-eq", "million tonnes of CO₂ equivalent". The equivalence
+# marker is required: a tonne of CO2 and a tonne of CO2-equivalent are written
+# differently because they are claimed differently, and a bare "tonnes of CO2"
+# is left un-canonicalized so it falls through to cited semantic adjudication
+# rather than being silently compared against a CO2e figure.
+_CO2E_RE = re.compile(
+    r"^(?P<prefix>g|k|m|gt|kt|mt|t|gigatonnes?|megatonnes?|kilotonnes?|tonnes?|"
+    r"million tonnes|thousand tonnes|billion tonnes)?\s*(?:of\s+)?"
+    r"co2\s*[-\s]?\s*(?:e|eq|equiv|equivalents?)\s*\.?$"
+)
+_CO2E_PREFIX = {
+    "": "t", "t": "t", "tonne": "t", "tonnes": "t",
+    "k": "kt", "kt": "kt", "kilotonne": "kt", "kilotonnes": "kt",
+    "thousand tonnes": "kt",
+    "m": "mt", "mt": "mt", "megatonne": "mt", "megatonnes": "mt",
+    "million tonnes": "mt",
+    "g": "gt", "gt": "gt", "gigatonne": "gt", "gigatonnes": "gt",
+    "billion tonnes": "gt",
+}
+
+# Exact Decimal multipliers into one base unit per physical quantity. Only
+# same-dimension prefixes are convertible; "t" (mass) and "tco2e" (emissions)
+# share a base deliberately never, because a tonne of waste is not a tonne of
+# CO2-equivalent. A unit absent from here is simply incomparable.
+_UNIT_BASE: dict[str, tuple[str, Decimal]] = {
+    "%": ("%", Decimal(1)),
+    "percentage points": ("percentage points", Decimal(1)),
+    "g": ("t", Decimal("0.000001")), "kg": ("t", Decimal("0.001")),
+    "t": ("t", Decimal(1)), "kt": ("t", Decimal(1_000)),
+    "mt": ("t", Decimal(1_000_000)), "gt": ("t", Decimal(1_000_000_000)),
+    "tco2e": ("tco2e", Decimal(1)), "ktco2e": ("tco2e", Decimal(1_000)),
+    "mtco2e": ("tco2e", Decimal(1_000_000)),
+    "gtco2e": ("tco2e", Decimal(1_000_000_000)),
+    "kwh": ("kwh", Decimal(1)), "mwh": ("kwh", Decimal(1_000)),
+    "gwh": ("kwh", Decimal(1_000_000)), "twh": ("kwh", Decimal(1_000_000_000)),
+    "mj": ("mj", Decimal(1)), "gj": ("mj", Decimal(1_000)),
+    "tj": ("mj", Decimal(1_000_000)),
+    "ml": ("l", Decimal("0.001")), "l": ("l", Decimal(1)),
+    "hl": ("l", Decimal(100)), "m3": ("l", Decimal(1_000)),
+    "km": ("km", Decimal(1)),
+}
+
+
 def normalize_unit(raw: str | None) -> str | None:
     """Collapse the many ways a report spells the same unit."""
     if raw is None:
@@ -206,7 +272,55 @@ def normalize_unit(raw: str | None) -> str | None:
         return None
     if "%" in lowered or lowered.startswith("percentage") or lowered == "percent":
         return "%"
-    return lowered
+    match = _CO2E_RE.match(lowered)
+    if match:
+        prefix = (match.group("prefix") or "").strip()
+        canonical = _CO2E_PREFIX.get(prefix)
+        if canonical:
+            return f"{canonical}co2e"
+    return _UNIT_ALIASES.get(lowered, lowered)
+
+
+# The spellings that really are a percent unit. `normalize_unit` answers "%" for
+# anything *containing* one, which is right for a table header like "Percentage
+# of variation" and wrong for a phrase that merely has a "%" further along.
+_PERCENT_SPELLINGS = frozenset({
+    "%", "percent", "percentage",
+    "percentage point", "percentage points", "pp",
+})
+
+
+def known_unit(raw: str | None) -> str | None:
+    """The canonical spelling, but only when the text *is* that unit.
+
+    Stricter than :func:`normalize_unit` on purpose. This is what reads the unit
+    stated next to a value, and there the surrounding words matter: in "Scope 1
+    and 2 emissions by 40.2%" the text after the 1 contains a percent sign, and
+    a lenient reading makes the metric name "Scope 1" into the value 1%.
+    """
+    unit = normalize_unit(raw)
+    if unit not in _UNIT_BASE:
+        return None
+    if unit == "%" and clean_text(raw or "").casefold().strip(" .") not in _PERCENT_SPELLINGS:
+        return None
+    return unit
+
+
+def unit_conversion(source: str | None, target: str | None) -> Decimal | None:
+    """Exact multiplier from one unit into another, or None if they do not
+    measure the same thing.
+
+    Exact on purpose: every factor is a power of ten held as a ``Decimal``, so
+    converting 21.3 Mt to tonnes is 21300000 and not 21299999.999999998.
+    """
+    if not source or not target:
+        return None
+    if source == target:
+        return Decimal(1)
+    left, right = _UNIT_BASE.get(source), _UNIT_BASE.get(target)
+    if left is None or right is None or left[0] != right[0]:
+        return None
+    return left[1] / right[1]
 
 
 def parse_period(text: str) -> str | None:
@@ -221,6 +335,40 @@ def parse_period(text: str) -> str | None:
 
 def all_years(text: str) -> list[str]:
     return [m.group(0) for m in _YEAR_RE.finditer(clean_text(text))]
+
+
+# "FY24", "FY 2024", "FY2024". A two-digit year is read as 20xx: these are
+# sustainability reports, and 1924 is not a reporting period anyone means.
+_FY_RE = re.compile(r"\bFY\s?(\d{4}|\d{2})\b", re.I)
+_PERIOD_RE = re.compile(r"\bFY\s?(?:\d{4}|\d{2})\b|\b(?:19|20)\d{2}\b", re.I)
+
+
+def normalize_period(value: str | None) -> str | None:
+    """One canonical label for a period a claim or a fact states.
+
+    ``FY24`` and ``FY2024`` are the same fiscal period and normalize together.
+    Neither becomes calendar ``2024``: a fiscal year that ends in June overlaps
+    two calendar years, and quietly equating them would compare a figure to a
+    period the report never reported.
+    """
+    if value is None:
+        return None
+    text = clean_text(value)
+    if not text:
+        return None
+    match = _FY_RE.fullmatch(text) or _FY_RE.search(text)
+    if match:
+        year = match.group(1)
+        return f"FY{year if len(year) == 4 else '20' + year}"
+    return text
+
+
+def all_periods(text: str) -> list[str]:
+    """Every period the text states, canonicalized, in the order stated."""
+    return [
+        normalize_period(m.group(0)) or m.group(0)
+        for m in _PERIOD_RE.finditer(clean_text(text))
+    ]
 
 
 def detect_direction(text: str) -> str:
@@ -255,14 +403,24 @@ def signed_change(value: Decimal | None, direction: str) -> Decimal | None:
 def values_agree(
     claimed: Decimal, observed: Decimal, *, approximate: bool
 ) -> bool:
-    """Exact displayed agreement, or 5% relative tolerance when hedged."""
+    """Exact displayed agreement, or agreement at the claim's own precision.
+
+    A hedged claim is compared at the precision it was written to: "about 40%"
+    is satisfied by 40.2%, because rounded to whole percent that *is* 40. A
+    fixed percentage tolerance is deliberately not used -- 5% of a small figure
+    and 5% of a large one are different claims, and neither is what the writer
+    said. "about 21.3" therefore still excludes 21.5.
+    """
     if claimed == observed:
         return True
     if not approximate:
         return False
-    if claimed == 0:
-        return observed == 0
-    return abs(observed - claimed) / abs(claimed) <= APPROXIMATE_TOLERANCE
+    try:
+        return observed.quantize(claimed, rounding=ROUND_HALF_UP) == claimed
+    except (InvalidOperation, ValueError):
+        # A figure too large to express at the claim's precision is not a near
+        # miss; refusing to compare is the honest answer.
+        return False
 
 
 def scope_markers(text: str) -> frozenset[str]:
@@ -310,15 +468,17 @@ _STOPWORDS = frozenset(
 
 
 __all__ = [
-    "APPROXIMATE_TOLERANCE",
+    "all_periods",
     "all_years",
     "clean_text",
     "content_tokens",
     "contains_quote",
     "detect_direction",
     "is_approximate",
+    "known_unit",
     "normalize_bbox",
     "normalize_for_match",
+    "normalize_period",
     "normalize_unit",
     "parse_period",
     "parse_value",
@@ -327,6 +487,7 @@ __all__ = [
     "scopes_comparable",
     "signed_change",
     "union_bbox",
+    "unit_conversion",
     "unit_of",
     "values_agree",
 ]

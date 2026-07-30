@@ -1,0 +1,8 @@
+{
+  "source_text": "In FY24 we cut water use by 10%.",
+  "claims": [],
+  "entailment": [
+    {"claim_index": 0, "outcome": "probably", "reason_code": "x"}
+  ],
+  "ok": false
+}

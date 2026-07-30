@@ -368,7 +368,11 @@ def _deterministic(
             [c for c, _ in matches[:3]],
             [],
             False,
-            "exact_numeric_match",
+            # A bound and an exact figure are satisfied by different arithmetic,
+            # and a trace that called both "exact" would not say which ran.
+            "bounded_numeric_match"
+            if parsed.comparison in (">=", ">", "<=", "<")
+            else "exact_numeric_match",
         )
     if conflicts:
         return (

@@ -8,9 +8,11 @@ from pathlib import Path
 
 from claim_evidence.models import GeometryPrecision
 from claim_evidence.normalize import (
+    all_periods,
     contains_quote,
     detect_direction,
     normalize_bbox,
+    normalize_period,
     normalize_unit,
     parse_period,
     parse_value,
@@ -18,6 +20,7 @@ from claim_evidence.normalize import (
     scopes_comparable,
     signed_change,
     union_bbox,
+    unit_conversion,
     values_agree,
 )
 
@@ -94,6 +97,49 @@ def test_unit_normalization() -> None:
     check(normalize_unit(None) is None, "missing unit stays missing")
 
 
+def test_co2_equivalent_spellings_fold_together() -> None:
+    for spelling in (
+        "million tonnes of CO₂ equivalent",
+        "million tonnes of CO2 equivalent",
+        "MtCO2e",
+        "Mt CO2-eq",
+        "megatonnes CO2 equivalent",
+    ):
+        check(normalize_unit(spelling) == "mtco2e", f"{spelling!r} -> mtco2e")
+    check(normalize_unit("tCO2e") == "tco2e", "the unprefixed form too")
+    check(
+        normalize_unit("million tonnes of CO2") == "million tonnes of co2",
+        "but a bare CO2 figure is left alone: it is not the same claim as CO2e",
+    )
+
+
+def test_only_same_dimension_units_convert_and_exactly() -> None:
+    check(unit_conversion("mtco2e", "tco2e") == Decimal(1_000_000), "Mt -> t is exact")
+    check(unit_conversion("t", "kt") == Decimal("0.001"), "and exact the other way")
+    check(
+        Decimal("21.3") * unit_conversion("mtco2e", "tco2e") == Decimal("21300000.0"),
+        "21.3 MtCO2e converts without a floating-point remainder",
+    )
+    check(unit_conversion("t", "tco2e") is None, "a tonne is not a tonne of CO2e")
+    check(unit_conversion("kwh", "t") is None, "and energy is not mass")
+    check(unit_conversion("widgets", "t") is None, "an unknown unit converts to nothing")
+    check(unit_conversion("%", "%") == 1, "the same unit is a no-op")
+
+
+def test_fiscal_periods_normalize_but_never_become_calendar_years() -> None:
+    check(normalize_period("FY24") == "FY2024", "a two-digit fiscal year expands")
+    check(normalize_period("FY 2024") == "FY2024", "and a spaced one folds")
+    check(normalize_period("FY2024") == "FY2024", "the canonical form is stable")
+    check(
+        normalize_period("2024") != normalize_period("FY24"),
+        "a fiscal year is not the calendar year it overlaps",
+    )
+    check(
+        all_periods("In FY24, versus FY2020 and 2019") == ["FY2024", "FY2020", "2019"],
+        "every period is read in the order it was stated",
+    )
+
+
 def test_period_and_direction() -> None:
     check(parse_period("Performance history 2025") == "2025", "year read from header")
     check(parse_period("Unit") is None, "no year means no period")
@@ -114,8 +160,20 @@ def test_signed_change_and_tolerance() -> None:
         "exact claim rejects a near miss",
     )
     check(
-        values_agree(Decimal("-40.0"), Decimal("-40.2"), approximate=True),
-        "hedged claim inside 5% tolerance",
+        values_agree(Decimal("-40"), Decimal("-40.2"), approximate=True),
+        "'about 40%' is satisfied at the precision it was written to",
+    )
+    check(
+        not values_agree(Decimal("-40.0"), Decimal("-40.2"), approximate=True),
+        "'about 40.0%' was written to one decimal, and 40.2 differs there",
+    )
+    check(
+        values_agree(Decimal("21.3"), Decimal("21.34"), approximate=True),
+        "'about 21.3' accepts 21.34",
+    )
+    check(
+        not values_agree(Decimal("21.3"), Decimal("21.5"), approximate=True),
+        "and still refuses 21.5, which no percentage tolerance would have",
     )
     check(
         not values_agree(Decimal("-40.0"), Decimal("-90.0"), approximate=True),

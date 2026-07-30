@@ -175,13 +175,13 @@ def test_two_facts_produce_two_independent_comparisons() -> None:
     )
 
 
-def test_an_approximate_claim_is_never_compared() -> None:
-    """The tolerance is gone: version 1 compares values exactly or not at all.
+def test_an_approximate_claim_is_compared_at_its_own_precision() -> None:
+    """A hedge is a statement about precision, not a licence to be vague.
 
-    A hedged claim is refused by `claims.validate_claim` before an audit opens.
-    If one reaches the comparator anyway, the answer is `incomparable` -- never
-    a match won by a tolerance nobody asked for, and never a `conflict`, which
-    would report a disagreement that was really a rounding rule.
+    "roughly 40%" is compared at whole percent, where a reported 40.2% *is* 40.
+    The same claim written "roughly 40.0%" is not: it was stated to one decimal,
+    and 40.2 differs there. No global percentage tolerance is involved, so this
+    never becomes a match won by a rounding rule nobody asked for.
     """
     hedged = (
         "Danone reduced Scope 1 and 2 energy and industry emissions by roughly "
@@ -190,31 +190,77 @@ def test_an_approximate_claim_is_never_compared() -> None:
     parsed = heuristic_claim(hedged)
     check(parsed.approximate, "hedged wording is still detected")
     verdict, reason = compare(parsed, emissions_fact())
-    check(verdict == "incomparable", f"an approximate claim is incomparable ({verdict})")
-    check("exactly" in reason, f"and the reason says why ({reason})")
+    check(verdict == "match", f"'roughly 40%' matches a reported 40.2% ({reason})")
+
+    precise = heuristic_claim(hedged.replace("roughly 40%", "roughly 40.0%"))
+    check(
+        compare(precise, emissions_fact())[0] == "conflict",
+        "'roughly 40.0%' states one decimal, and 40.2 is not 40.0 there",
+    )
 
     exact = hedged.replace("roughly 40%", "40%")
     check(
         compare(heuristic_claim(exact), emissions_fact())[0] == "conflict",
-        "the same number stated exactly is compared, and 40 is not 40.2",
+        "and an unhedged 40% is still compared exactly: 40 is not 40.2",
     )
 
 
-def test_bounded_claims_are_not_compared_either() -> None:
+def test_a_metric_name_containing_digits_is_not_the_value() -> None:
+    """"Scope 1 and 2" is a metric, and reading the 1 as the figure is a wrong
+    answer -- including when a percent sign appears later in the sentence."""
+    parsed = heuristic_claim(SUPPORTED)
+    check(parsed.value_decimal == Decimal("40.2"), f"the value is {parsed.value_decimal}")
+    check(parsed.unit == "%", f"with the unit stated next to it ({parsed.unit})")
+    for text, value, unit in (
+        ("Danone reported 1,044 tonnes of waste in 2025.", Decimal("1044"), "t"),
+        ("Danone reported 12 GWh of renewable electricity.", Decimal("12"), "gwh"),
+        ("Danone reduced Scope 1 and 2 emissions in 2025.", Decimal("1"), None),
+    ):
+        claim = heuristic_claim(text)
+        check(
+            (claim.value_decimal, claim.unit) == (value, unit),
+            f"{text[:44]}... -> {claim.value_decimal} {claim.unit}",
+        )
+
+
+def test_a_bound_the_model_missed_is_still_a_bound() -> None:
+    """`=` is the field's default, so silence is not an assertion of equality.
+
+    A model that says nothing about the comparison would otherwise turn "at
+    least 40%" into "exactly 40%", and contradict the claim with the very
+    figure that satisfies it.
+    """
+    bounded = SUPPORTED.replace("by 40.2%", "by at least 40%")
+    silent = ParsedClaim(subject="Danone S.A.", metric=bounded, direction="decrease")
+    merged = merge_claim(silent, heuristic_claim(bounded))
+    check(merged.comparison == ">=", f"the deterministic bound is kept ({merged.comparison})")
+    check(compare(merged, emissions_fact())[0] == "match", "so 40.2% satisfies it")
+
+    stated = ParsedClaim(subject="Danone S.A.", metric=bounded, comparison="<=")
+    check(
+        merge_claim(stated, heuristic_claim(bounded)).comparison == "<=",
+        "a comparison the model did state is never overwritten",
+    )
+
+
+def test_a_bound_is_satisfied_or_it_is_not() -> None:
+    """"reduced by at least 40%" is about how big the drop was.
+
+    The signed value of a 40.2% reduction is -40.2, which is *smaller* than -40.
+    Comparing bounds on magnitude when the claim states a direction is what
+    stops a satisfied claim being reported as a contradiction.
+    """
     fact = emissions_fact()  # a 40.2% reduction
-    for wording, operator in (
-        ("by at least 40%", ">="),
-        ("by at least 50%", ">="),
-        ("by no more than 50%", "<="),
-        ("by no more than 30%", "<="),
+    for wording, operator, expected in (
+        ("by at least 40%", ">=", "match"),
+        ("by at least 50%", ">=", "conflict"),
+        ("by no more than 50%", "<=", "match"),
+        ("by no more than 30%", "<=", "conflict"),
     ):
         parsed = heuristic_claim(SUPPORTED.replace("by 40.2%", wording))
-        check(parsed.comparison == operator, f"{wording!r} still parses as {operator}")
-        verdict, _ = compare(parsed, fact)
-        check(
-            verdict == "incomparable",
-            f"{wording!r} is incomparable, not silently satisfied ({verdict})",
-        )
+        check(parsed.comparison == operator, f"{wording!r} parses as {operator}")
+        verdict, reason = compare(parsed, fact)
+        check(verdict == expected, f"{wording!r} is {verdict} ({reason})")
 
 
 def test_an_exact_value_match_is_the_only_match() -> None:

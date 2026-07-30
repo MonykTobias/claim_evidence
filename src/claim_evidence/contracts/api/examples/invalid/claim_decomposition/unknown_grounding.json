@@ -1,0 +1,10 @@
+{
+  "source_text": "In FY24 we cut water use by 10%.",
+  "claims": [
+    {
+      "text": "In FY24 we cut water use by 10%",
+      "source_tokens": [],
+      "grounding": "probably_fine"
+    }
+  ]
+}

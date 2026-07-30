@@ -323,11 +323,35 @@ and page Markdown are embedded.
    not what the page says, so they no longer decide what counts as context. A
    version indexed before this falls back to page order until it is re-indexed.
 5. Crop and re-verify any visual candidate.
-6. Compare arithmetically whenever every material qualifier aligns. Exact claims
-   need exact displayed agreement; "about"/"roughly"/"approximately" allow 5%
-   relative tolerance.
+6. Compare arithmetically whenever every material qualifier aligns.
 7. Fall back to the structured LLM verifier only for semantic qualification and
    ambiguity.
+
+The arithmetic has three rules, and a model decides none of them:
+
+* An exact claim needs exact displayed agreement on `Decimal`.
+* A bound — "at least 40%", "no more than 30%" — is satisfied or it is not.
+  When the claim states a direction the comparison is on magnitude, because
+  "reduced by at least 40%" is about how big the drop was and the signed value
+  of a 40.2% reduction is the *smaller* number.
+* A hedge — "about", "roughly", "approximately" — is compared at the precision
+  the claim was written to. "about 40%" accepts a reported 40.2%; "about 40.0%"
+  does not, and "about 21.3" still refuses 21.5. There is no global percentage
+  tolerance: 5% of a small figure and 5% of a large one are different claims,
+  and neither is what the writer wrote.
+
+Two things are canonicalized at comparison time rather than at index time, so
+an existing index answers under the current rules without being rebuilt:
+
+* **Periods.** `FY24` and `FY2024` are one fiscal period. Neither is calendar
+  `2024` — a fiscal year that ends in June overlaps two calendar years, and
+  equating them would compare a figure to a period the report never reported.
+* **Units.** `MtCO2e`, `Mt CO2-eq`, and "million tonnes of CO₂ equivalent" are
+  one unit, and same-quantity prefixes convert with exact `Decimal` multipliers
+  (21.3 MtCO2e is 21300000 tCO2e, not 21299999.999999998). A tonne is not a
+  tonne of CO2-equivalent, energy is not mass, and a bare "tonnes of CO2" is
+  not canonicalized to CO2e. Anything not convertible stays incomparable and
+  falls through to cited semantic adjudication.
 
 `compare()` returns *incomparable*, not *contradicted*, when a qualifier does
 not line up, which is what stops a vague claim from being forced into a
@@ -625,7 +649,7 @@ when it stops applying.
 | Language | English source documents and English claims | Any other language, and any cross-language matching |
 | Network | Loopback only (`127.0.0.1`), one trusted local user, CSRF plus same-origin checks | Non-loopback binds, remote access, TLS, authentication, more than one user |
 | Concurrency | One frontend process and one ingestion worker | A second worker or process, external concurrent CLI ingestion, cross-process locking, distributed jobs |
-| Claims | One entity, one metric, one exact decimal value, and a closed unit vocabulary | Approximate, compound, qualitative, ranged, or unit-free claims — all refused before any retrieval or model call |
+| Claims | One reporting entity per audit; free-form English text, split into atomic claims and grounded back to it before anything is audited | Auditing a post without human review of the split, more than 20 atomic claims at once, or establishing a comparison the selected documents do not make |
 | Data | The index and its audits are disposable and rebuildable; `db reset-dev` drops and rebuilds a `_test`/`_dev` database | Migration between schema versions, preserved audit history, backup, restore, or archival |
 | Scale | A handful of documents, rebuilt from their sources when anything changes | Large corpora, latency targets, throughput guarantees, or a certified hardware envelope |
 
