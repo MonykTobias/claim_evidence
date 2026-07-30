@@ -565,3 +565,56 @@ database, or models are missing.
 No autonomous agent loop, no REST API or MCP server, no generic ontology or
 community detection, no separate graph and vector stores, and one atomic claim
 per audit call.
+
+## Prototype boundaries
+
+This is a version-1 prototype for one person on one machine. Everything below
+is a deliberate limit, not an oversight, and each one has a written trigger for
+when it stops applying.
+
+| Boundary | What is supported | What is not |
+|---|---|---|
+| Language | English source documents and English claims | Any other language, and any cross-language matching |
+| Network | Loopback only (`127.0.0.1`), one trusted local user, CSRF plus same-origin checks | Non-loopback binds, remote access, TLS, authentication, more than one user |
+| Concurrency | One frontend process and one ingestion worker | A second worker or process, external concurrent CLI ingestion, cross-process locking, distributed jobs |
+| Claims | One entity, one metric, one exact decimal value, and a closed unit vocabulary | Approximate, compound, qualitative, ranged, or unit-free claims — all refused before any retrieval or model call |
+| Data | The index and its audits are disposable and rebuildable; `db reset-dev` drops and rebuilds a `_test`/`_dev` database | Migration between schema versions, preserved audit history, backup, restore, or archival |
+| Scale | A handful of documents, rebuilt from their sources when anything changes | Large corpora, latency targets, throughput guarantees, or a certified hardware envelope |
+
+### Deferred groups
+
+These are recorded in `document_extract/PROTOTYPE_DECISIONS.md` and
+`COMPLETE_GAP_REGISTER.md`, and none of them is implemented here.
+
+- **DG-01 — until the schema is stable.** No migration ledger, no in-place
+  upgrade, no preserved document ids or audits, no backup/restore. Triggered
+  when a schema version is declared stable, or any database must survive an
+  upgrade.
+- **DG-02 — until concurrent or multi-process use.** No second worker, no
+  cross-process advisory locking, no external CLI ingestion running alongside
+  the frontend. Triggered when a second process may write to the same store.
+- **DG-03 — until remote or multi-user deployment.** No authentication,
+  authorization, TLS, remote bind, or user isolation. Triggered by any
+  non-loopback bind, remote database, or second user.
+- **DG-04 — until the corpus is large enough that rebuilding hurts.** No
+  amendment/restatement policy, no multilingual support, no general knowledge
+  graph or layout reasoning, no durable audit retention. Triggered past roughly
+  twenty documents, a two-hour rebuild, or a non-English requirement.
+- **DG-05 — until measured need.** No archival or compaction, no large-load
+  fixture, no latency budget, no telemetry programme, no performance
+  certification. Triggered by a measured failure, an operational target, or
+  distribution to another machine.
+
+### Acceptance
+
+One command proves the whole workflow, and reports a blocked or missing check
+as a failed run rather than a skip:
+
+```powershell
+gw_detector_v2\scripts\verify_prototype.ps1
+```
+
+It writes a timestamped JSON and Markdown report to
+`gw_detector_v2\verification\prototype\` recording the repository revisions,
+schema version and checksum, contract versions, model tags and digests, and
+fixture version behind that result.

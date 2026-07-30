@@ -262,6 +262,16 @@ class ClaimEvidence:
         )
         return to_matches(self.conn, candidates)
 
+    def check_claim(self, claim: str, *, reporting_entity: str) -> str:
+        """Answer whether this claim is auditable, without auditing it.
+
+        The same version-1 grammar `audit_claim` applies, reachable before any
+        work is queued: a caller that runs audits in the background can refuse
+        an unsupported claim in the request that submitted it, instead of
+        accepting the job and failing it a moment later.
+        """
+        return validate_claim(claim, reporting_entity=reporting_entity).text
+
     def audit_claim(
         self,
         claim: str,
