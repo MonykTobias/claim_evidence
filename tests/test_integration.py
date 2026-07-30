@@ -462,7 +462,10 @@ def check_adjudicator_prompt_is_bounded(tmp: Path) -> None:
     with make_client(default_session(Adjudication=capture)) as client:
         client.audit_claim(VAGUE, scope="all", reporting_entity=ENTITY)
     check(bool(seen), "the adjudicator was consulted")
-    passages = seen[0].split("Evidence:\n", 1)[1].strip().split("\n\n")
+    import re
+
+    passages = re.findall(r"<evidence [^>]*>\n(.*?)\n</evidence>", seen[0], re.S)
+    check(bool(passages), "the prompt carries delimited evidence passages")
     check(len(passages) <= MAX_PASSAGES, f"passage count capped ({len(passages)})")
     longest = max(len(p) for p in passages)
     check(longest <= PASSAGE_CHARS + 200, f"each passage is truncated ({longest} chars)")

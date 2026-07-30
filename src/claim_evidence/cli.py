@@ -4,15 +4,19 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
+import os
 import sys
+import traceback
 from typing import Sequence
 
 from .audit import AuditError
 from .client import ClaimEvidence
-from .errors import ClaimEvidenceError
+from .errors import ClaimEvidenceError, ValidationError
 from .ingest import IngestionError
 from .models import ClaimResult, EvidenceMatch, HealthReport, IngestReport
 from .ollama import OllamaError
+from .progress import classify_error
 from .reset import CONFIRM_PHRASE, reset_dev
 from .source import OutputValidationError
 
@@ -67,6 +71,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     ingest = sub.add_parser("ingest", help="index a completed output root")
     ingest.add_argument("output_root")
+    ingest.add_argument(
+        "--entity",
+        dest="reporting_entity",
+        required=True,
+        help="the reporting entity every stored fact is attributed to; a "
+        "document filename is not one",
+    )
     ingest.add_argument("--pdf", dest="source_pdf", help="source PDF for SHA-256 identity")
     ingest.add_argument("--source-uri", dest="source_uri")
     ingest.add_argument(
@@ -107,8 +118,26 @@ def build_parser() -> argparse.ArgumentParser:
 
     audit = sub.add_parser("audit", help="audit one atomic claim")
     audit.add_argument("claim")
+    audit.add_argument(
+        "--entity",
+        dest="reporting_entity",
+        required=True,
+        help="who the claim is about; version 1 audits one named entity",
+    )
     audit.add_argument("--limit", type=int, default=20)
-    audit.add_argument("--document-id", type=int, action="append", dest="document_ids")
+    audit.add_argument(
+        "--document-id",
+        type=int,
+        action="append",
+        dest="document_ids",
+        help="restrict the audit to these documents; omit to search all of "
+        "them, which must be said rather than defaulted to",
+    )
+    audit.add_argument(
+        "--all-documents",
+        action="store_true",
+        help="search every queryable document",
+    )
     audit.add_argument("--json", action="store_true")
 
     return parser
@@ -184,6 +213,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "ingest":
             report = client.ingest_document(
                 args.output_root,
+                reporting_entity=args.reporting_entity,
                 source_pdf=args.source_pdf,
                 source_uri=args.source_uri,
                 force=args.force,
@@ -203,8 +233,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             return 0
 
+        # Scope is stated, never defaulted: one of the two flags is required,
+        # so an audit can never quietly widen to the whole corpus.
+        if args.all_documents == bool(args.document_ids):
+            raise ValidationError(
+                "pass either --all-documents or one or more --document-id"
+            )
         result = client.audit_claim(
-            args.claim, document_ids=args.document_ids, limit=args.limit
+            args.claim,
+            scope="all" if args.all_documents else args.document_ids,
+            reporting_entity=args.reporting_entity,
+            limit=args.limit,
         )
         print(
             json.dumps(result.model_dump(mode="json"), indent=2)
@@ -334,11 +373,46 @@ def _format_evidence(detail) -> str:
     return "\n".join(lines)
 
 
+DEBUG_VARIABLE = "CLAIM_EVIDENCE_DEBUG"
+
+
 def cli() -> None:
+    """Run one command, reporting failures the way a public surface must.
+
+    Every failure is classified before it is printed. Only the package's own
+    typed errors carry a message written for a person; an Ollama error embeds
+    the model's reply, a driver error embeds the host and sometimes the
+    password, and an unexpected bug embeds whatever it happened to be holding.
+    Those are reported by category.
+
+    The raw cause is available, but it has to be asked for: set
+    ``CLAIM_EVIDENCE_DEBUG=1`` and it goes to stderr as a traceback. That is a
+    local debugging aid, not the default, because the default output is what
+    ends up pasted into a chat window or a bug report.
+    """
+    debug = os.environ.get(DEBUG_VARIABLE, "").strip().lower() in ("1", "true", "yes")
+    if debug:
+        logging.basicConfig(
+            level=logging.DEBUG,
+            stream=sys.stderr,
+            format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        )
     try:
         raise SystemExit(main())
-    except USER_ERRORS as exc:
-        print(f"error: {exc}", file=sys.stderr)
+    except SystemExit:
+        raise
+    except BaseException as exc:  # noqa: BLE001 - one classification point
+        code, retryable, message = classify_error(exc)
+        print(f"error [{code}]: {message}", file=sys.stderr)
+        if retryable:
+            print("this may succeed on a retry", file=sys.stderr)
+        if debug:
+            traceback.print_exc()
+        else:
+            print(
+                f"set {DEBUG_VARIABLE}=1 for the underlying cause",
+                file=sys.stderr,
+            )
         raise SystemExit(1) from None
 
 
