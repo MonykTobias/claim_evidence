@@ -137,6 +137,35 @@ _WORD_RULES: tuple[tuple[str, re.Pattern[str], str], ...] = (
 )
 
 
+def validate_free_text(
+    text: str, *, reporting_entity: str, label: str = "claim"
+) -> tuple[str, str]:
+    """The trust-boundary check every text entry point shares.
+
+    Type, emptiness, length, and a stated reporting entity -- nothing about what
+    the text says. Returns the cleaned text and entity so a caller never works
+    from the raw input.
+    """
+    if not isinstance(text, str):
+        raise ValidationError(f"{label} must be text")
+    cleaned = clean_text(text)
+    if not cleaned:
+        raise ValidationError(f"{label} is required")
+    if len(cleaned) > MAX_CLAIM_CHARS:
+        raise ValidationError(f"{label} must be at most {MAX_CLAIM_CHARS} characters")
+
+    entity = clean_text(reporting_entity or "")
+    if not entity:
+        # The filename is a display label, not a fact about who reported what.
+        # Deriving the subject from it made "danoneurdaccessible.pdf" an entity
+        # and quietly attributed every figure in the document to that string.
+        raise ValidationError(
+            "reporting_entity is required: an audit is about one named entity, "
+            "and a document's filename is not one"
+        )
+    return cleaned, entity
+
+
 def validate_claim(claim: str, *, reporting_entity: str) -> SupportedClaim:
     """Parse one claim, or refuse it with a stable reason code.
 
@@ -308,4 +337,5 @@ __all__ = [
     "NUMBER",
     "SupportedClaim",
     "validate_claim",
+    "validate_free_text",
 ]

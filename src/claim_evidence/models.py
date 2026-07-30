@@ -334,6 +334,101 @@ class AuditRequest(PublicModel):
         return None if self.scope == "all" else sorted(set(self.scope))
 
 
+class SourceToken(PublicModel):
+    """One token of a proposed claim, at its position in the original text.
+
+    Offsets are into the source exactly as it was submitted, so a caller
+    highlights the real characters rather than a normalized copy of them.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    token: str
+    start: int
+    end: int
+
+
+class GroundedClaim(PublicModel):
+    """One proposed atomic claim, and the deterministic proof it came from the
+    post -- or the category under which that proof failed.
+
+    ``token_grounded`` is a statement about provenance only. It says every
+    meaningful word was in the source in this order; it does not say the claim
+    still means what the post meant, which is a separate check.
+    """
+
+    text: str
+    source_tokens: list[SourceToken] = Field(default_factory=list)
+    grounding: Literal["token_grounded", "not_grounded"]
+    reason_code: str | None = None
+
+
+class ClaimDecomposition(PublicModel):
+    """What one post decomposed into, failures included.
+
+    A proposal that failed grounding is reported rather than dropped: silently
+    removing it hides that the splitter tried to introduce something.
+    """
+
+    source_text: str
+    claims: list[GroundedClaim] = Field(default_factory=list)
+
+
+class EntailmentCheck(BaseModel):
+    """Whether the original post directly asserts one final subclaim.
+
+    Not a verdict about the world and not evidence-based: the verifier sees the
+    post and the subclaim only, and answers whether one says the other.
+    """
+
+    claim_index: int
+    outcome: Literal["entailed", "ambiguous", "not_entailed", "contradicted"]
+    reason_code: str = ""
+
+
+class EntailmentBatch(BaseModel):
+    """The verifier's reply for a whole batch, in one call.
+
+    Required, not defaulted, for the reason ``Fact.quote`` is: a defaulted list
+    turns a reply that answered nothing into an empty, *valid* answer, and an
+    empty answer here would read as "no claim was contested".
+    """
+
+    checks: list[EntailmentCheck]
+
+
+class ClaimVerification(PublicModel):
+    """Both gates for one batch of final subclaims, and whether they passed.
+
+    ``ok`` is decided here so a caller cannot arrive at a second, more generous
+    definition of "may be audited". It is false whenever any claim failed
+    grounding or is anything other than ``entailed``.
+    """
+
+    source_text: str
+    claims: list[GroundedClaim] = Field(default_factory=list)
+    entailment: list[EntailmentCheck] = Field(default_factory=list)
+    ok: bool = False
+
+
+class ProposedClaim(BaseModel):
+    """One assertion the splitter proposes. Text only -- offsets and grounding
+    are calculated here, never accepted from a model."""
+
+    text: str
+
+
+class ClaimSplit(BaseModel):
+    """LLM claim-splitter response payload.
+
+    ``claims`` is required so a reply that answered something else entirely is
+    a schema failure -- and therefore a retry and then a hard error -- rather
+    than an empty list indistinguishable from "this post asserts nothing".
+    """
+
+    claims: list[ProposedClaim]
+
+
 class PublicError(PublicModel):
     """The one error shape every public surface returns.
 
@@ -755,8 +850,13 @@ __all__ = [
     "AuditRequest",
     "AuditTrace",
     "Citation",
+    "ClaimDecomposition",
     "ClaimResult",
+    "ClaimSplit",
+    "ClaimVerification",
     "DocumentSummary",
+    "EntailmentBatch",
+    "EntailmentCheck",
     "EvidenceDetail",
     "EvidenceKind",
     "EvidenceMatch",
@@ -765,17 +865,20 @@ __all__ = [
     "Fact",
     "FactExtraction",
     "GeometryPrecision",
+    "GroundedClaim",
     "HealthReport",
     "IngestReport",
     "ModelHealth",
     "ParsedClaim",
     "ProgressEvent",
+    "ProposedClaim",
     "PublicError",
     "PublicModel",
     "phase_percent",
     "Region",
     "RegionRole",
     "RemovalReport",
+    "SourceToken",
     "TraceCandidate",
     "Verdict",
     "VisualResult",

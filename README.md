@@ -164,6 +164,54 @@ statement about the request, not about the report.
 model confidence: an uncalibrated number reads as precision the system does not
 have.
 
+### Splitting a post into claims
+
+`audit_claim` audits one assertion. A social-media post usually makes several,
+so two calls turn one into the other — and neither of them audits anything.
+
+```python
+decomposition = client.decompose_claims(post, reporting_entity="IKEA")
+# decomposition.claims[i].text          the proposed assertion
+# decomposition.claims[i].grounding     token_grounded | not_grounded
+# decomposition.claims[i].source_tokens [{token, start, end}, ...]
+# decomposition.claims[i].reason_code   why grounding failed, when it did
+
+verification = client.verify_claims(
+    post, ["...", "..."], reporting_entity="IKEA"
+)
+# verification.ok            every claim grounded *and* entailed
+# verification.entailment[i] entailed | ambiguous | not_entailed | contradicted
+```
+
+The splitter is a model, so what it returns is a proposal. Two independent
+checks stand between a proposal and an audit:
+
+* **Grounding** is deterministic and runs no model. Every meaningful token of a
+  proposed claim must appear in the post, in the same order, and its character
+  offsets are recorded. Numbers, signs, units, dates and fiscal periods,
+  negation, modality, bounds, direction, and causal words are protected: they
+  are never normalized away, and altering one is refused as
+  `protected_token_changed`. Embedding similarity is deliberately not used —
+  two sentences sit close in vector space while disagreeing on exactly those.
+* **Entailment** is one separate structured call over the whole batch, made
+  after the user has reviewed and edited the rows. It sees the post and the
+  final subclaims only, never document evidence, and answers whether the post
+  directly asserts each one. A single claim identical to the whole input skips
+  it: its meaning cannot have changed.
+
+Grounding proves provenance, not meaning. "Emissions fell 20% and water use
+fell 10%" grounds "Emissions fell 10%" — every word is there, in order — and it
+is the entailment check that refuses it.
+
+`verify_claims` recomputes grounding from the text submitted to it, because the
+review step lets a user edit a row and an edited row is a new proposal. `ok` is
+decided here so no caller arrives at a second, more generous definition of
+"may be audited": it is false if *any* claim failed either gate, and a caller
+must then create no audit rows at all. A post with no checkable assertion is
+`UnsupportedClaimError(reason_code="no_atomic_claim")`; more than 20 is
+`too_many_claims`. An unreachable or unparseable model is
+`DependencyUnavailableError` — retryable, and never a smaller batch.
+
 ### Why a verdict came out that way
 
 `ClaimResult` and `AuditTrace` both carry `decision_explanation`, `timings`, and

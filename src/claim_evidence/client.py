@@ -15,6 +15,7 @@ import psycopg
 from .audit import audit_claim as _audit_claim
 from .claims import validate_claim
 from .config import Settings
+from .decompose import decompose_claims, verify_claims
 from .db import (
     connect,
     delete_document,
@@ -37,7 +38,9 @@ from .ingest import ensure_schema, ingest_document, retry_failed_facts
 from .models import (
     AuditRequest,
     AuditTrace,
+    ClaimDecomposition,
     ClaimResult,
+    ClaimVerification,
     DocumentSummary,
     EvidenceDetail,
     EvidenceMatch,
@@ -271,6 +274,35 @@ class ClaimEvidence:
         accepting the job and failing it a moment later.
         """
         return validate_claim(claim, reporting_entity=reporting_entity).text
+
+    def decompose_claims(
+        self, text: str, *, reporting_entity: str
+    ) -> ClaimDecomposition:
+        """Propose the atomic claims in one post, each grounded to its source.
+
+        Nothing is persisted and no audit is opened: this answers "what is being
+        claimed here", and a person decides which of those answers to audit.
+        Every proposal comes back with the character offsets it was proved
+        against, or the category under which that proof failed.
+        """
+        return decompose_claims(self.ollama, text, reporting_entity=reporting_entity)
+
+    def verify_claims(
+        self, source_text: str, claims: Sequence[str], *, reporting_entity: str
+    ) -> ClaimVerification:
+        """Re-ground and entail the claims a user finally chose.
+
+        Both gates, in one place, so no caller can audit a subclaim that only
+        passed one of them. Grounding is recomputed from the submitted text --
+        the review step lets the user edit these rows, and an edited claim is a
+        new proposal, not a checked one.
+        """
+        return verify_claims(
+            self.ollama,
+            source_text,
+            list(claims),
+            reporting_entity=reporting_entity,
+        )
 
     def audit_claim(
         self,
