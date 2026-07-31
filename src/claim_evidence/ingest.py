@@ -100,6 +100,7 @@ VERIFY_STEPS = (
     "citation paths",
     "artifact containment",
     "source order",
+    "markdown mapping",
     "embedding coverage",
     "embedding dimension",
     "fact links",
@@ -109,7 +110,10 @@ VERIFY_STEPS = (
 # Bumped when the *meaning* of an identity basis changes, so a redefinition
 # cannot silently equate old and new keys.
 IDENTITY_VERSION = 1
-FINGERPRINT_VERSION = 1
+# 2: page Markdown is indexed per mapped segment carrying the source keys it
+# was generated from, instead of one whole-page blob. Same extraction output,
+# different stored evidence, so every existing index has to be rebuilt.
+FINGERPRINT_VERSION = 2
 
 
 def normalize_source_uri(uri: str) -> str:
@@ -842,6 +846,32 @@ def _verify(
         )
     passed(6, "Source order verified")
 
+    # Generated Markdown is only in the index because it maps onto real
+    # evidence. A segment whose mapping is empty, or reaches a unit that is not
+    # citable, not on its page, or not in this version, is context with no
+    # provenance -- which is the one thing it was never allowed to be.
+    unmapped = conn.execute(
+        """
+        SELECT count(*) AS n FROM evidence_unit m
+        WHERE m.version_id = %s AND m.kind = %s
+          AND (jsonb_array_length(
+                   COALESCE(m.table_context -> 'sources', '[]'::jsonb)) = 0
+               OR EXISTS (
+                   SELECT 1
+                   FROM jsonb_array_elements_text(m.table_context -> 'sources') AS k(key)
+                   WHERE NOT EXISTS (
+                       SELECT 1 FROM evidence_unit s
+                       WHERE s.version_id = m.version_id AND s.page_id = m.page_id
+                         AND s.unit_key = k.key AND s.citable)))
+        """,
+        (version_id, str(EvidenceKind.PAGE_MARKDOWN)),
+    ).fetchone()["n"]
+    if unmapped:
+        raise IngestionError(
+            f"{unmapped} page Markdown units do not resolve to citable evidence"
+        )
+    passed(7, "Markdown mapping verified")
+
     unembedded = conn.execute(
         """
         SELECT count(*) AS n FROM evidence_unit
@@ -851,7 +881,7 @@ def _verify(
     ).fetchone()["n"]
     if unembedded:
         raise IngestionError(f"{unembedded} embeddable units have no embedding")
-    passed(7, "Embedding coverage verified")
+    passed(8, "Embedding coverage verified")
 
     wrong = conn.execute(
         """
@@ -865,7 +895,7 @@ def _verify(
         raise IngestionError(
             f"{wrong} stored embeddings are not {settings.embed_dimensions}-dimensional"
         )
-    passed(8, "Embedding dimension verified")
+    passed(9, "Embedding dimension verified")
 
     crossed = conn.execute(
         """

@@ -293,8 +293,48 @@ page rather than the path it tried to reach.
 | `blocks.jsonl` | headings, prose, block geometry | yes |
 | `table_candidates.json` | rows, values, cell geometry | yes |
 | `image_summaries.jsonl` | visual retrieval hints | only after crop verification |
-| `docling_final.md` | page context | no |
+| `docling_final.md` | mapped page context | no |
 | `page.png` | crops for visual re-verification | via the crop |
+
+### Mapped page context
+
+`docling_final.md` is generated: refined, repaired, and reordered, so a
+sentence in it may be one the page never printed. It is indexed only where it
+maps exactly back onto the units it was generated from, and the mapping is
+built at ingestion by string matching — no embeddings, no similarity, no model.
+
+Each blank-line paragraph, and each table row on its own, is a candidate
+segment. A segment is indexed when every substantive character in it is
+accounted for by an anchor: a narrative block's text, a table cell as printed,
+or an image's own path. Markdown punctuation between anchors is fine; a clause
+no unit accounts for is not, and drops the whole segment. A table header row
+anchors to nothing and is never indexed. A stored segment is `citable = false`,
+`quality = none`, derives no facts, is never returned as a neighbour, and
+carries the `unit_key`s of its sources rather than any geometry of its own.
+
+It is read only after direct evidence has failed. If the deterministic
+comparison or the adjudicator reaches `supported`, `contradicted`, or `mixed`
+from original evidence, no Markdown is consulted at all. On `insufficient`, the
+mapped segments already in the candidate pool are resolved to their original
+units, those units join the pool, and the arithmetic runs again over the wider
+set before the adjudicator is asked a second time.
+
+The value is the case direct retrieval structurally cannot serve: one sentence
+Docling split across two boxes exists in neither block, so neither can be
+retrieved by it. The segment offers both together — and the citations are still
+those two blocks, with their own regions.
+
+In the prompt a segment is a `<page_context>` block with no id, placed before
+the `<evidence>` blocks it maps to. A group is atomic: the segment and every
+unit it resolves to go in together or not at all, so context never appears
+beside a subset of what it describes. A group that will not fit under
+`MAX_PASSAGES`, or that contains a visual whose crop was rejected, is dropped
+whole. The cap counts context blocks; nothing else about citations changes.
+
+There is no in-place upgrade. `FINGERPRINT_VERSION` is `2`, so an index built
+before this rebuilds on the next `ingest` of the same output root — no
+re-extraction and no schema change, but the documents do have to be re-indexed
+before the fallback is available to them.
 
 Block text prefers `text_full` and falls back to the 500-character `text`,
 flagging the unit as truncated. Older runs without `text_full` therefore index
@@ -326,6 +366,8 @@ and page Markdown are embedded.
 6. Compare arithmetically whenever every material qualifier aligns.
 7. Fall back to the structured LLM verifier only for semantic qualification and
    ambiguity.
+8. Only on `insufficient`, retry steps 5–7 with the mapped page context and the
+   original units it resolves to. The citations remain those original units.
 
 The arithmetic has three rules, and a model decides none of them:
 

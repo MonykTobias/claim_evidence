@@ -95,6 +95,7 @@ def write_output_root(
     page_numbers: list[int] | None = None,
     page_dirs: dict[int, str] | None = None,
     page_totals: dict[int, int] | None = None,
+    markdown: dict[int, str] | None = None,
     run: dict[str, Any] | None = None,
     drop_run: bool = False,
 ) -> Path:
@@ -104,6 +105,10 @@ def write_output_root(
     instead of ``1..pages``; ``page_dirs`` overrides the manifest's page_dir
     value without moving the directory it was written to, which is how the
     containment tests point a manifest entry outside the root.
+
+    ``markdown`` supplies a page's ``docling_final.md``. The default deliberately
+    resolves to no evidence at all, so every test that is not about the Markdown
+    mapping indexes no page-context units and stays a test of what it was about.
     """
     numbers = page_numbers or list(range(1, pages + 1))
     root.mkdir(parents=True, exist_ok=True)
@@ -114,7 +119,8 @@ def write_output_root(
         page_dir = root / name
         page_dir.mkdir(exist_ok=True)
         (page_dir / "docling_final.md").write_text(
-            f"# Page {page}\n\nGenerated page context.\n", encoding="utf-8"
+            (markdown or {}).get(page, f"# Page {page}\n\nGenerated page context.\n"),
+            encoding="utf-8",
         )
         (page_dir / "layout_prompt_map.json").write_text(
             json.dumps({"page_size": [PAGE_W, PAGE_H], "blocks": []}), encoding="utf-8"

@@ -23,6 +23,7 @@ log = logging.getLogger(__name__)
 from .config import Settings
 from .db import (
     create_audit,
+    evidence_by_unit_key,
     facts_for_evidence,
     fail_audit,
     finish_audit,
@@ -84,6 +85,9 @@ Rules:
   qualifiers, or only generated page context is available. Prefer it over a
   guess, and list what is missing in `missing_qualifiers`.
 - `supporting_evidence_ids` may only contain ids present in the passages.
+- A <page_context> block is generated prose that joins the <evidence> passages
+  printed after it. Use it to read them together; it has no id and can never be
+  cited. Anything it says that no <evidence> passage also says is not evidence.
 """
 
 MAX_PASSAGES = 15
@@ -224,6 +228,7 @@ def _audit(
     citable = [c for c in candidates if c["row"]["citable"]]
 
     visual_status: dict[int, str] = {}
+    visual_results: dict[int, VisualVerification] = {}
     reasons: dict[int, str] = {}
     comparisons: list[EvidenceComparison] = []
     verdict, rationale, citations, missing, scope_ambiguous, rule = _deterministic(
@@ -236,7 +241,8 @@ def _audit(
         decided_by = "adjudicator"
         verdict, rationale, citations, missing, rule = _adjudicate(
             conn, client, claim, parsed, citable, regions, visual_status,
-            scope_ambiguous=scope_ambiguous, reporter=reporter, audit_id=audit_id,
+            visual_results, scope_ambiguous=scope_ambiguous, reporter=reporter,
+            audit_id=audit_id,
         )
     else:
         # Arithmetic decided, so no crop was ever inspected.
@@ -244,6 +250,40 @@ def _audit(
             "verifying_visuals", "No visual evidence needed", completed=0, total=0
         )
         reporter.start("deciding_verdict", "Comparing the claim to the evidence")
+
+    # Direct evidence came back with nothing. Only now is generated Markdown
+    # worth reading, and only where it maps onto original units: a sentence the
+    # refinement assembled out of two separated boxes is the one thing direct
+    # retrieval structurally cannot offer, because neither box contains it.
+    #
+    # Everything below still decides on the original units. The Markdown is
+    # context that says "read these together"; the citations remain theirs.
+    groups = (
+        _markdown_groups(conn, candidates)
+        if verdict is Verdict.INSUFFICIENT
+        else []
+    )
+    if groups:
+        candidates = [*candidates, *_mapped_extras(candidates, groups)]
+        regions = regions_for(conn, [int(c["row"]["id"]) for c in candidates])
+        citable = [c for c in candidates if c["row"]["citable"]]
+        # Recomputed, not appended to: the first pass compared a strict subset
+        # and found nothing, so its entries would all be repeated here.
+        reasons.clear()
+        comparisons.clear()
+        verdict, rationale, citations, missing, scope_ambiguous, rule = _deterministic(
+            conn, parsed, citable, regions, reasons, comparisons
+        )
+        explained_by = "deterministic_comparison"
+        decided_by = "comparison"
+        if verdict is None:
+            explained_by = "semantic_adjudication"
+            decided_by = "adjudicator"
+            verdict, rationale, citations, missing, rule = _adjudicate(
+                conn, client, claim, parsed, citable, regions, visual_status,
+                visual_results, scope_ambiguous=scope_ambiguous, reporter=reporter,
+                audit_id=audit_id, contexts=groups,
+            )
     reporter.done("deciding_verdict", f"Verdict: {verdict}")
 
     selected_ids = {citation.evidence_id for citation in citations}
@@ -416,6 +456,66 @@ def _optional_int(value: Any) -> int | None:
     return None if value is None else int(value)
 
 
+def _markdown_groups(
+    conn: psycopg.Connection, candidates: Sequence[dict[str, Any]]
+) -> list[tuple[dict[str, Any], list[dict[str, Any]]]]:
+    """Retrieved Markdown segments paired with the evidence they were made from.
+
+    No second retrieval: page Markdown is embedded and searched like everything
+    else, so anything relevant is already in the pool -- demoted below the units
+    that can actually be cited, which is where it belongs until they have
+    failed.
+
+    A segment whose mapping no longer fully resolves is dropped entirely. A
+    partly-resolved mapping is not a smaller mapping, it is one whose text is
+    no longer fully accounted for, and that is the case this whole path exists
+    to refuse.
+    """
+    groups: list[tuple[dict[str, Any], list[dict[str, Any]]]] = []
+    for candidate in candidates:
+        row = candidate["row"]
+        if EvidenceKind(row["kind"]) is not EvidenceKind.PAGE_MARKDOWN:
+            continue
+        keys = list((row.get("table_context") or {}).get("sources") or [])
+        resolved = evidence_by_unit_key(conn, int(row["version_id"]), keys)
+        if keys and len(resolved) == len(set(keys)):
+            groups.append((row, [resolved[key] for key in dict.fromkeys(keys)]))
+    return groups
+
+
+def _mapped_extras(
+    candidates: Sequence[dict[str, Any]],
+    groups: Sequence[tuple[dict[str, Any], list[dict[str, Any]]]],
+) -> list[dict[str, Any]]:
+    """Mapped sources that direct retrieval did not already return.
+
+    Recorded as an expansion of the Markdown segment that named them, so the
+    trace says how they entered the pool. Ones already retrieved directly keep
+    their original ranking metadata rather than being restated as expansions.
+    """
+    seen = {int(c["row"]["id"]) for c in candidates}
+    extras: list[dict[str, Any]] = []
+    for context_row, sources in groups:
+        for row in sources:
+            evidence_id = int(row["id"])
+            if evidence_id in seen:
+                continue
+            seen.add(evidence_id)
+            extras.append(
+                {
+                    "row": row,
+                    "score": 0.0,
+                    "lexical_rank": None,
+                    "vector_rank": None,
+                    "graph_rank": None,
+                    "combined_rank": None,
+                    "expanded_from": int(context_row["id"]),
+                    "mapped": True,
+                }
+            )
+    return extras
+
+
 def _sanitize_passage(text: str) -> str:
     """One passage, bounded and unable to close its own delimiter.
 
@@ -423,11 +523,18 @@ def _sanitize_passage(text: str) -> str:
     otherwise end its block early and let whatever follows read as prompt
     structure rather than as document content. Neutralising the delimiter is
     what keeps "delimited as data" true rather than merely intended.
+
+    Generated Markdown gets the same treatment and one more tag to escape. It
+    is the most likely place for an injected instruction to survive: the
+    refinement model has already rewritten it once, so a sentence in it need
+    not appear anywhere on the page.
     """
     bounded = text[:PASSAGE_CHARS]
     return (
         bounded.replace("<evidence", "&lt;evidence")
         .replace("</evidence", "&lt;/evidence")
+        .replace("<page_context", "&lt;page_context")
+        .replace("</page_context", "&lt;/page_context")
         .replace("<claim>", "&lt;claim&gt;")
         .replace("</claim>", "&lt;/claim&gt;")
     )
@@ -441,11 +548,12 @@ def _adjudicate(
     candidates: Sequence[dict[str, Any]],
     regions: dict[int, list[dict[str, Any]]],
     visual_status: dict[int, str],
+    visual_results: dict[int, VisualVerification],
     scope_ambiguous: bool = False,
     reporter: ProgressReporter | None = None,
     audit_id: int | None = None,
+    contexts: Sequence[tuple[dict[str, Any], list[dict[str, Any]]]] = (),
 ) -> tuple[Verdict, str, list[Citation], list[str], str]:
-    visual_results: dict[int, VisualVerification] = {}
     usable = _verify_visuals(
         conn, client, claim, candidates, regions, visual_status,
         reporter or ProgressReporter(None, "audit"),
@@ -463,21 +571,7 @@ def _adjudicate(
             "no_citable_evidence",
         )
 
-    # Bounded on purpose: an over-long prompt is silently truncated by the
-    # runtime, which drops evidence without any signal that it happened.
-    #
-    # Each passage is wrapped in its own tag carrying the evidence id it may be
-    # cited as. Source text is untrusted -- a report can contain a sentence that
-    # reads like an instruction, deliberately or not -- so it is delimited as
-    # data and the system prompt says any instruction inside it is ignored. The
-    # id lives in the *tag*, not in the text, so a passage cannot claim to be a
-    # different piece of evidence than it is.
-    passages = "\n".join(
-        f'<evidence id="{cid.evidence_id}" page="{cid.pdf_page}" '
-        f'kind="{cid.source_kind}" quality="{cid.quality}">\n'
-        f"{_sanitize_passage(text)}\n</evidence>"
-        for cid, text, _ in usable[:MAX_PASSAGES]
-    )
+    passages, prompt_ids = _passages(usable, contexts)
     note = (
         "\n\nNote: the evidence reports on narrower or different boundaries than "
         "the claim names, so no passage is scope-comparable to it.\n"
@@ -511,7 +605,7 @@ def _adjudicate(
             "scope_not_comparable",
         )
 
-    by_id = {cid.evidence_id: cid for cid, _, _ in usable[:MAX_PASSAGES]}
+    by_id = {cid.evidence_id: cid for cid, _, _ in usable if cid.evidence_id in prompt_ids}
     cited = [by_id[i] for i in decision.supporting_evidence_ids if i in by_id]
     if decision.verdict is not Verdict.INSUFFICIENT and not cited:
         # A verdict the model could not attach to a real passage is not a
@@ -530,6 +624,73 @@ def _adjudicate(
         decision.missing_qualifiers,
         _SEMANTIC_RULES.get(decision.verdict, "missing_material_qualifier"),
     )
+
+
+def _evidence_block(citation: Citation, text: str) -> str:
+    """One passage, tagged with the id it may be cited as.
+
+    Source text is untrusted -- a report can contain a sentence that reads like
+    an instruction, deliberately or not -- so it is delimited as data and the
+    system prompt says any instruction inside it is ignored. The id lives in
+    the *tag*, not in the text, so a passage cannot claim to be a different
+    piece of evidence than it is.
+    """
+    return (
+        f'<evidence id="{citation.evidence_id}" page="{citation.pdf_page}" '
+        f'kind="{citation.source_kind}" quality="{citation.quality}">\n'
+        f"{_sanitize_passage(text)}\n</evidence>"
+    )
+
+
+def _passages(
+    usable: Sequence[tuple[Citation, str, dict[str, Any]]],
+    contexts: Sequence[tuple[dict[str, Any], list[dict[str, Any]]]],
+) -> tuple[str, set[int]]:
+    """The prompt's evidence section, and the ids it actually contains.
+
+    Bounded on purpose: an over-long prompt is silently truncated by the
+    runtime, which drops evidence without any signal that it happened. The cap
+    counts every block, generated context included -- context that displaced
+    the passage proving the claim would be worse than no context at all.
+
+    A mapped group is atomic. Its Markdown segment and every original unit it
+    resolves to go in together or not at all: the segment's whole justification
+    is that it joins those units, so offering it beside a subset of them would
+    invite exactly the inference nothing in the index supports. A group that
+    cannot fit, or that contains a visual whose crop was rejected, is dropped
+    whole rather than trimmed. Mapped groups are placed first -- direct
+    retrieval has already come back with nothing by the time any of this runs.
+    """
+    by_id = {citation.evidence_id: (citation, text) for citation, text, _ in usable}
+    blocks: list[str] = []
+    used: set[int] = set()
+
+    for context_row, sources in contexts:
+        group = [
+            f'<page_context page="{context_row["pdf_page"]}">\n'
+            f'{_sanitize_passage(context_row["source_text"])}\n</page_context>'
+        ]
+        ids = [int(row["id"]) for row in sources]
+        if not all(evidence_id in by_id for evidence_id in ids):
+            # A rejected or unavailable crop among the sources. The segment
+            # describes evidence this audit could not verify, so it goes too.
+            continue
+        group.extend(
+            _evidence_block(*by_id[evidence_id])
+            for evidence_id in ids
+            if evidence_id not in used
+        )
+        if len(blocks) + len(group) > MAX_PASSAGES:
+            continue
+        blocks.extend(group)
+        used.update(ids)
+
+    for citation, text, _row in usable:
+        if citation.evidence_id in used or len(blocks) >= MAX_PASSAGES:
+            continue
+        used.add(citation.evidence_id)
+        blocks.append(_evidence_block(citation, text))
+    return "\n".join(blocks), used
 
 
 # The semantic verifier's outcome, named as a rule. `insufficient` here means
@@ -587,36 +748,51 @@ def _verify_visuals(
             continue
 
         checked += 1
-        page_png = _page_png(conn, evidence_id)
-        if page_png is None:
-            visual_status[evidence_id] = "unavailable"
+        # The Markdown fallback re-runs this over a wider candidate set. A crop
+        # already checked in this audit keeps its answer: cropping and asking
+        # the vision model twice costs a second inference to arrive at the
+        # verdict already recorded, and a disagreeing second answer would make
+        # the trace contradict itself.
+        result = visual_results.get(evidence_id)
+        if result is None and visual_status.get(evidence_id) == "unavailable":
             reporter.step(
                 "verifying_visuals", "Page image unavailable",
                 completed=checked, total=visuals,
             )
             continue
-        result = verify_visual(
-            client,
-            page_png,
-            citation.regions,
-            claim,
-            claim_value=str(parsed.value_decimal) if parsed.value_decimal is not None else "",
-            claim_unit=parsed.unit or "",
-        )
+        if result is None:
+            page_png = _page_png(conn, evidence_id)
+            if page_png is None:
+                visual_status[evidence_id] = "unavailable"
+                reporter.step(
+                    "verifying_visuals", "Page image unavailable",
+                    completed=checked, total=visuals,
+                )
+                continue
+            result = verify_visual(
+                client,
+                page_png,
+                citation.regions,
+                claim,
+                claim_value=(
+                    str(parsed.value_decimal) if parsed.value_decimal is not None else ""
+                ),
+                claim_unit=parsed.unit or "",
+            )
+            visual_results[evidence_id] = result
+            if audit_id is not None:
+                record_visual_verification(
+                    conn, audit_id, evidence_id,
+                    result=str(result.result),
+                    reason_code=result.reason_code,
+                    visible_text=result.visible_text,
+                )
         reporter.step(
             "verifying_visuals",
             f"Checked crop {checked} of {visuals}",
             completed=checked,
             total=visuals,
         )
-        visual_results[evidence_id] = result
-        if audit_id is not None:
-            record_visual_verification(
-                conn, audit_id, evidence_id,
-                result=str(result.result),
-                reason_code=result.reason_code,
-                visible_text=result.visible_text,
-            )
         if result.result in (VisualResult.ILLEGIBLE, VisualResult.UNRELATED):
             visual_status[evidence_id] = "rejected"
             continue
@@ -807,10 +983,17 @@ def _candidate_reason(
         return "visual: crop verified"
     if evidence_id in selected_ids:
         return f"selected by {decided_by}"
+    if candidate.get("mapped"):
+        return "original source of mapped page Markdown"
     if candidate.get("expanded_from"):
         return "context expansion from a higher-ranked candidate"
     if not candidate["row"].get("citable", True):
-        return "retrieved as context; not citable"
+        sources = (candidate["row"].get("table_context") or {}).get("sources") or []
+        return (
+            f"mapped page Markdown over {len(sources)} source units; not citable"
+            if sources
+            else "retrieved as context; not citable"
+        )
     return "retrieved but not selected"
 
 

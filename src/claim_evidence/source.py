@@ -13,7 +13,7 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, Sequence
 
 from document_extract.contracts import (
     OPTIONAL_PAGE_ROLES,
@@ -710,28 +710,152 @@ def visual_units(
     return units
 
 
-def markdown_unit(page: PageSource, markdown: str) -> EvidenceUnit | None:
-    text = clean_text(markdown)
-    if not text:
+# --- generated Markdown, mapped back to what produced it ---------------------
+
+# Two characters is the shortest anchor worth trusting. A single character
+# matches somewhere in almost any segment, and an anchor that could have landed
+# anywhere is not provenance.
+MIN_ANCHOR_CHARS = 2
+# Markdown structure and punctuation carry no assertion of their own. Whatever
+# survives removing the anchors *and* these is text no original unit accounts
+# for -- the refinement wrote it -- and it disqualifies the whole segment.
+_MARKDOWN_SYNTAX = re.compile(r"[#*_|>`\[\]()!:\-+~\\/.,;\s]+")
+
+
+def _anchor_texts(unit: EvidenceUnit) -> list[str]:
+    """The literal strings this unit would appear as in generated Markdown.
+
+    Deliberately not ``unit.text``. A table unit's text is an assembled
+    sentence ("descriptor | header (unit): value") that no Markdown ever
+    contains, and a visual's is a model-written summary. What actually lands in
+    the file is the cell as printed and the image's own path.
+    """
+    context = unit.table_context or {}
+    if unit.kind is EvidenceKind.NARRATIVE:
+        return [unit.text]
+    if unit.kind is EvidenceKind.TABLE_VALUE:
+        return [str(context.get("value") or "")]
+    if unit.kind is EvidenceKind.TABLE_ROW:
+        # A row is reached through the descriptor and unit cells; its value
+        # cells resolve to their own units.
+        return [str(context.get("descriptor") or ""), str(context.get("unit") or "")]
+    if unit.kind is EvidenceKind.VISUAL:
+        return [str(context.get("rel_path") or "")]
+    return []
+
+
+def markdown_segments(markdown: str) -> list[str]:
+    """Split generated Markdown into the pieces retrieval can offer as context.
+
+    A table row is its own segment. Its cells resolve to real evidence while
+    the header row above it resolves to nothing, and one segment spanning both
+    would throw away the whole table for the sake of the header.
+    """
+    segments: list[str] = []
+    for chunk in re.split(r"\n\s*\n", markdown):
+        lines = [line.strip() for line in chunk.splitlines() if line.strip()]
+        if not lines:
+            continue
+        if any(line.startswith("|") for line in lines):
+            segments.extend(lines)
+        else:
+            segments.append(" ".join(lines))
+    return segments
+
+
+def anchor_segment(
+    segment: str, anchors: Sequence[tuple[str, str]]
+) -> list[str] | None:
+    """Unit keys covering this segment exactly, in reading order, or ``None``.
+
+    Anchors are placed longest-first into non-overlapping spans, and then the
+    residual is tested: if anything but Markdown punctuation survives removing
+    every one of them, some part of this segment was written rather than
+    extracted, and the segment is dropped whole.
+
+    Partial coverage is the case that matters. It is exactly how a rewritten
+    claim would otherwise ride into a prompt attached to evidence that does not
+    say it, which is the one thing generated text must never be able to do.
+    """
+    haystack = normalize_for_match(segment)
+    placed: list[tuple[int, int, str]] = []
+    for needle, key in anchors:
+        start = 0
+        while (at := haystack.find(needle, start)) != -1:
+            end = at + len(needle)
+            if not any(s < end and at < e for s, e, _ in placed):
+                placed.append((at, end, key))
+                break
+            # Occupied by a longer anchor, or by an identical value in another
+            # column; keep looking rather than giving this one up.
+            start = at + 1
+    if not placed:
         return None
-    return EvidenceUnit(
-        unit_key=f"p{page.page:04d}:page_markdown",
-        page=page.page,
-        kind=EvidenceKind.PAGE_MARKDOWN,
-        text=text,
-        normalized_text=normalize_for_match(text),
-        citable=False,
-        quality=EvidenceQuality.NONE,
-        artifact_path=f"{page.rel}/docling_final.md",
-        regions=[
-            Region(
-                bbox=(0.0, 0.0, 1.0, 1.0),
-                role=RegionRole.SUPPORTING_CONTEXT,
-                precision=GeometryPrecision.PAGE,
-            )
-        ],
-        geometry_precision=GeometryPrecision.PAGE,
+    placed.sort()
+    residual = haystack
+    for start, end, _ in reversed(placed):
+        residual = residual[:start] + residual[end:]
+    if _MARKDOWN_SYNTAX.sub("", residual):
+        return None
+    return list(dict.fromkeys(key for _, _, key in placed))
+
+
+def markdown_units(
+    page: PageSource, markdown: str, units: Sequence[EvidenceUnit]
+) -> list[EvidenceUnit]:
+    """One non-citable context unit per Markdown segment that resolves exactly.
+
+    The final Markdown is generated: it is refined, repaired, and reordered,
+    and a sentence in it may be one the page never printed. So it earns a place
+    in the index only by mapping, exactly, onto the units it was generated
+    from, and it carries their keys rather than any geometry of its own. A
+    segment that maps to nothing is not indexed at all -- it cannot be
+    retrieved, so it cannot reach a prompt, so it cannot move a verdict.
+
+    ``sources`` holds unit keys, not evidence ids. Keys are what survives a
+    re-index; ids record which attempt inserted a row.
+    """
+    anchors = sorted(
+        (
+            (normalized, unit.unit_key)
+            for unit in units
+            if unit.citable
+            for text in _anchor_texts(unit)
+            if len(normalized := normalize_for_match(text)) >= MIN_ANCHOR_CHARS
+        ),
+        key=lambda anchor: -len(anchor[0]),
     )
+    if not anchors:
+        return []
+
+    mapped: list[EvidenceUnit] = []
+    for index, segment in enumerate(markdown_segments(markdown)):
+        keys = anchor_segment(segment, anchors)
+        text = clean_text(segment)
+        if not keys or not text:
+            continue
+        mapped.append(
+            EvidenceUnit(
+                unit_key=f"p{page.page:04d}:page_markdown:{index:04d}",
+                page=page.page,
+                kind=EvidenceKind.PAGE_MARKDOWN,
+                text=text,
+                normalized_text=normalize_for_match(text),
+                citable=False,
+                quality=EvidenceQuality.NONE,
+                table_context={"sources": keys},
+                artifact_path=f"{page.rel}/docling_final.md",
+                regions=[
+                    Region(
+                        bbox=(0.0, 0.0, 1.0, 1.0),
+                        role=RegionRole.SUPPORTING_CONTEXT,
+                        precision=GeometryPrecision.PAGE,
+                    )
+                ],
+                geometry_precision=GeometryPrecision.PAGE,
+            )
+        )
+    return mapped
 
 
 def page_units(
@@ -765,9 +889,9 @@ def page_units(
 
     units.extend(visual_units(page, reader.image_summaries(page), default_heading))
 
-    unit = markdown_unit(page, reader.page_markdown(page))
-    if unit:
-        units.append(unit)
+    # Last, and from the units above: generated Markdown is indexed only where
+    # it maps back onto them.
+    units.extend(markdown_units(page, reader.page_markdown(page), units))
 
     yield from _in_reading_order(units)
 
@@ -801,15 +925,18 @@ def _in_reading_order(units: list[EvidenceUnit]) -> list[EvidenceUnit]:
 
 __all__ = [
     "FINGERPRINTED_ARTIFACTS",
+    "MIN_ANCHOR_CHARS",
     "canonical_digest",
     "canonical_json",
     "NON_CITABLE_KINDS",
     "OutputReader",
     "OutputValidationError",
     "PageSource",
+    "anchor_segment",
     "block_text",
     "flatten_header",
-    "markdown_unit",
+    "markdown_segments",
+    "markdown_units",
     "narrative_units",
     "page_units",
     "sha256_file",

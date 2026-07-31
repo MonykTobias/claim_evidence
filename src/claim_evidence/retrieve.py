@@ -40,9 +40,11 @@ RRF_K = 60
 # scale would swamp the ranks entirely and leave ties broken by row id.
 EXACT_TOKEN_BONUS = 1.0 / RRF_K
 SCOPE_TOKEN_BONUS = 0.5 / RRF_K
-# Page Markdown is long, so it matches many query tokens and outranks the cell
-# that actually proves the claim. It is retrieval context and can never be
-# cited, so it is demoted by one bonus unit rather than allowed to fill the pool.
+# A mapped Markdown segment repeats the text of the units it was generated
+# from, so it competes with them on every token they match -- and it can never
+# be cited. Demoted by one bonus unit so it sits just below the evidence that
+# can, which is also the order the audit reads them in: original units first,
+# generated context only once they have come back with nothing.
 NON_CITABLE_PENALTY = 1.0 / RRF_K
 _NUMBER_TOKEN = re.compile(r"\d[\d.,]*")
 

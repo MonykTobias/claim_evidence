@@ -471,6 +471,152 @@ def check_adjudicator_prompt_is_bounded(tmp: Path) -> None:
     check(longest <= PASSAGE_CHARS + 200, f"each passage is truncated ({longest} chars)")
 
 
+SPLIT_CLAIM = "Danone cut plastic packaging by 12.5% against its 2020 baseline."
+# One sentence, printed as two boxes. Neither block contains the claim, so no
+# amount of direct retrieval can return a passage that states it; the refined
+# Markdown put it back together.
+SPLIT_BLOCKS = [
+    "Danone cut plastic packaging by 12.5%",
+    "against its 2020 baseline.",
+]
+SPLIT_MARKDOWN = f"{SPLIT_BLOCKS[0]} {SPLIT_BLOCKS[1]}\n"
+
+
+def _prompt_ids(payload: dict[str, Any], tag: str = "evidence") -> list[int]:
+    import re
+
+    return [
+        int(i)
+        for i in re.findall(rf'<{tag} id="(\d+)"', payload["messages"][1]["content"])
+    ]
+
+
+def check_mapped_markdown_bridges_two_blocks(tmp: Path) -> None:
+    """Generated Markdown may join evidence; the citations stay the originals.
+
+    This is the whole point of indexing final Markdown at all. Direct evidence
+    comes back insufficient because the sentence exists in no single block, the
+    mapped segment offers the two blocks together, and what gets cited is those
+    two blocks and their own regions -- never the Markdown.
+    """
+    import re
+
+    root = write_output_root(
+        tmp / "split",
+        pages=1,
+        blocks=[block(1, index, text) for index, text in enumerate(SPLIT_BLOCKS, 1)],
+        markdown={1: SPLIT_MARKDOWN},
+    )
+    prompts: list[str] = []
+
+    def adjudicate(payload: dict[str, Any]) -> dict[str, Any]:
+        prompts.append(payload["messages"][1]["content"])
+        ids = _prompt_ids(payload)
+        if "<page_context" not in payload["messages"][1]["content"]:
+            return adjudication_reply(payload)
+        return {
+            "verdict": "supported",
+            "rationale": "The two passages together state the reduction.",
+            "supporting_evidence_ids": ids,
+            "missing_qualifiers": [],
+        }
+
+    with make_client(default_session(Adjudication=adjudicate)) as client:
+        report = client.ingest_document(
+            root, source_uri="urn:split", reporting_entity=ENTITY
+        )
+        segments = client.conn.execute(
+            "SELECT source_text, table_context FROM evidence_unit"
+            " WHERE version_id = %s AND kind = %s",
+            (report.version_id, str(EvidenceKind.PAGE_MARKDOWN)),
+        ).fetchall()
+        check(len(segments) == 1, f"one mapped Markdown segment indexed ({len(segments)})")
+        check(
+            len(segments[0]["table_context"]["sources"]) == 2,
+            "and it names both blocks it was generated from",
+        )
+
+        result = client.audit_claim(
+            SPLIT_CLAIM, scope=[report.document_id], reporting_entity=ENTITY
+        )
+
+    check(len(prompts) == 2, f"direct evidence was tried first ({len(prompts)} prompts)")
+    check("<page_context" not in prompts[0], "the first prompt is direct evidence only")
+    check("<page_context" in prompts[1], "the fallback prompt carries mapped context")
+    check(
+        re.search(r'<page_context[^>]*\bid=', prompts[1]) is None,
+        "the context block has no id, so it cannot be cited",
+    )
+    check(
+        SPLIT_MARKDOWN.strip() in prompts[1],
+        "the joined sentence is what the context contributes",
+    )
+
+    kinds = {c.source_kind for c in result.citations}
+    check(
+        result.verdict is Verdict.SUPPORTED and len(result.citations) == 2,
+        f"the joined context resolved the claim ({result.verdict}, {len(result.citations)})",
+    )
+    check(kinds == {EvidenceKind.NARRATIVE}, f"both citations are original blocks ({kinds})")
+    check(
+        all(c.regions and c.artifact_path.endswith("blocks.jsonl") for c in result.citations),
+        "each cites its own block region and artifact",
+    )
+    check(
+        result.evidence_quality is EvidenceQuality.DIRECT_TEXT,
+        f"quality is the original evidence's, not the Markdown's ({result.evidence_quality})",
+    )
+
+
+def check_unmapped_markdown_cannot_answer(tmp: Path) -> None:
+    """A sentence the page never printed is not indexed, so it cannot be read."""
+    root = write_output_root(
+        tmp / "rewritten",
+        pages=1,
+        blocks=[block(1, 1, SPLIT_BLOCKS[0])],
+        # The refinement asserted a baseline no block states.
+        markdown={1: f"{SPLIT_BLOCKS[0]} against its 2020 baseline.\n"},
+    )
+    prompts: list[str] = []
+
+    def adjudicate(payload: dict[str, Any]) -> dict[str, Any]:
+        prompts.append(payload["messages"][1]["content"])
+        return adjudication_reply(payload)
+
+    with make_client(default_session(Adjudication=adjudicate)) as client:
+        report = client.ingest_document(
+            root, source_uri="urn:rewritten", reporting_entity=ENTITY
+        )
+        segments = client.conn.execute(
+            "SELECT count(*) AS n FROM evidence_unit WHERE version_id = %s AND kind = %s",
+            (report.version_id, str(EvidenceKind.PAGE_MARKDOWN)),
+        ).fetchone()["n"]
+        check(segments == 0, "partly-anchored Markdown is not indexed at all")
+        result = client.audit_claim(
+            SPLIT_CLAIM, scope=[report.document_id], reporting_entity=ENTITY
+        )
+
+    check(len(prompts) == 1, f"there was no fallback to fall back to ({len(prompts)})")
+    check(
+        result.verdict is Verdict.INSUFFICIENT and not result.citations,
+        f"the rewritten sentence moved nothing ({result.verdict})",
+    )
+
+
+def check_direct_evidence_never_reaches_the_fallback(tmp: Path) -> None:
+    """A claim the table answers must not pay for the Markdown path."""
+    prompts: list[str] = []
+
+    with make_client(
+        default_session(Adjudication=lambda p: (
+            prompts.append(p["messages"][1]["content"]), adjudication_reply(p)
+        )[1])
+    ) as client:
+        result = client.audit_claim(SUPPORTED, scope="all", reporting_entity=ENTITY)
+    check(result.verdict is Verdict.SUPPORTED, "the table still decides it")
+    check(not prompts, "the adjudicator was never consulted, so neither was Markdown")
+
+
 def check_contradicted_claim(tmp: Path) -> None:
     with make_client(default_session()) as client:
         result = client.audit_claim(CONTRADICTED, scope="all", reporting_entity=ENTITY)
@@ -1704,6 +1850,7 @@ def main() -> int:
         check_hybrid_search_finds_exact_and_semantic,
         check_vector_recall,
         check_supported_claim_cites_the_table,
+        check_direct_evidence_never_reaches_the_fallback,
         check_adjudicator_prompt_is_bounded,
         check_contradicted_claim,
         check_vague_claim_is_insufficient,
@@ -1737,6 +1884,10 @@ def main() -> int:
         check_embedding_dimension_mismatch_is_detected,
         check_document_scope_is_validated,
         check_invalid_scope_costs_nothing,
+        # Near the end: these add their own documents, and the checks above
+        # audit with scope="all".
+        check_mapped_markdown_bridges_two_blocks,
+        check_unmapped_markdown_cannot_answer,
         # Last: it empties the index the checks above rely on.
         check_empty_index_is_not_an_insufficient_verdict,
     ]

@@ -774,7 +774,7 @@ def upsert_fact(
 # --- retrieval --------------------------------------------------------------
 
 _EVIDENCE_COLUMNS = """
-    e.id, e.unit_key, e.kind, e.quality, e.citable, e.source_text,
+    e.id, e.version_id, e.unit_key, e.kind, e.quality, e.citable, e.source_text,
     e.heading_path, e.table_context, e.artifact_path, e.geometry_precision,
     e.source_order, e.context_key,
     p.pdf_page, p.printed_page_label, p.page_dir,
@@ -975,6 +975,33 @@ def neighbours(
         """,
         {"id": evidence_id, "limit": radius * 4},
     ).fetchall()
+
+
+def evidence_by_unit_key(
+    conn: psycopg.Connection, version_id: int, unit_keys: Sequence[str]
+) -> dict[str, dict[str, Any]]:
+    """Resolve a Markdown segment's mapped source keys to citable evidence rows.
+
+    Constrained to one queryable version and to citable rows, which is what
+    stops a mapping from reaching into a different build or pointing at another
+    piece of generated Markdown. Same-page is settled earlier, at ingestion:
+    the keys were written from that page's own units.
+
+    Missing keys are simply absent from the result. The caller decides, and
+    decides by dropping the segment -- a mapping that no longer fully resolves
+    is not a partial mapping, it is an unverified one.
+    """
+    if not unit_keys:
+        return {}
+    rows = conn.execute(
+        f"""
+        {_EVIDENCE_SELECT}
+        WHERE {_READY} AND e.version_id = %s AND e.citable
+          AND e.unit_key = ANY(%s)
+        """,
+        (version_id, list(unit_keys)),
+    ).fetchall()
+    return {row["unit_key"]: row for row in rows}
 
 
 def document_scope(

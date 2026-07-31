@@ -369,11 +369,104 @@ def test_markdown_only_table_is_table_precision() -> None:
     )
 
 
-def test_page_markdown_is_not_citable() -> None:
+def _mapped_units(markdown: str, **kwargs) -> list:
+    """Units for a one-page root whose generated Markdown is ``markdown``."""
+    with tempfile.TemporaryDirectory() as temp:
+        root = write_output_root(
+            Path(temp) / "run", pages=1, markdown={1: markdown}, **kwargs
+        )
+        reader = OutputReader(root)
+        page = reader.validate()[0]
+        return list(page_units(reader, page, reader.blocks_by_page().get(1, [])))
+
+
+def _markdown(units: list) -> list:
+    return [u for u in units if u.kind is EvidenceKind.PAGE_MARKDOWN]
+
+
+def test_unmapped_page_markdown_is_not_indexed() -> None:
+    """The default fixture Markdown says something no block on the page does."""
     units = _units_for_table(kpi_table())
-    markdown = next(u for u in units if u.kind is EvidenceKind.PAGE_MARKDOWN)
+    check(not _markdown(units), "Markdown that resolves to nothing is not indexed")
+
+
+def test_page_markdown_is_not_citable() -> None:
+    units = _mapped_units(
+        "Nature indicators\n", blocks=[block(1, 1, "Nature indicators")]
+    )
+    markdown = next(iter(_markdown(units)))
     check(not markdown.citable, "generated page markdown is never citable")
     check(markdown.geometry_precision is GeometryPrecision.PAGE, "page-level geometry")
+    check(
+        markdown.table_context["sources"] == ["p0001:narrative:p0001-b0001"],
+        f"it carries the unit it came from ({markdown.table_context['sources']})",
+    )
+
+
+def test_markdown_joins_two_blocks_into_one_segment() -> None:
+    """The case direct retrieval structurally cannot serve.
+
+    Docling split one sentence across two boxes, so neither block contains the
+    sentence and neither can be retrieved by it. The refinement put it back
+    together, and the segment resolves to both.
+    """
+    units = _mapped_units(
+        "Emissions fell by 40.2% against the 2020 baseline.\n",
+        blocks=[
+            block(1, 1, "Emissions fell by 40.2%"),
+            block(1, 2, "against the 2020 baseline."),
+        ],
+    )
+    segment = next(iter(_markdown(units)))
+    check(
+        segment.table_context["sources"]
+        == ["p0001:narrative:p0001-b0001", "p0001:narrative:p0001-b0002"],
+        f"both blocks, in reading order ({segment.table_context['sources']})",
+    )
+
+
+def test_rewritten_markdown_resolves_to_nothing() -> None:
+    """Half a sentence anchored is not provenance for the other half."""
+    units = _mapped_units(
+        "Emissions fell by 40.2%, the best result of any competitor.\n",
+        blocks=[block(1, 1, "Emissions fell by 40.2%")],
+    )
+    check(not _markdown(units), "a segment with unaccounted text is dropped whole")
+
+
+def test_markdown_table_row_maps_to_its_cells() -> None:
+    units = _mapped_units(
+        "| Key Performance Indicators (KPIs) | Unit | 2024 | 2025 |\n"
+        "|---|---|---|---|\n"
+        "| Scope 1 & 2 energy and industry emissions (market-based) vs. 2020 "
+        "| Percentage of variation | (34.5) % | (40.2) % |\n",
+        blocks=[block(1, 1, "Nature indicators")],
+        tables={1: [kpi_table()]},
+    )
+    segments = _markdown(units)
+    check(len(segments) == 1, f"the header row maps to nothing ({len(segments)})")
+    check(
+        segments[0].table_context["sources"]
+        == [
+            "p0001:table_row:tc001:r2",
+            "p0001:table_value:tc001:r2:c2",
+            "p0001:table_value:tc001:r2:c3",
+        ],
+        f"row and both values ({segments[0].table_context['sources']})",
+    )
+
+
+def test_markdown_image_reference_maps_to_its_visual() -> None:
+    units = _mapped_units(
+        "![](images/picture_p0001_i000.png)\n",
+        blocks=[block(1, 1, "Nature indicators")],
+        images={1: [image_summary(1, 0, "A chart of emissions by year.")]},
+    )
+    segment = next(iter(_markdown(units)))
+    check(
+        segment.table_context["sources"] == ["p0001:visual:0"],
+        f"the image path resolves to its visual unit ({segment.table_context['sources']})",
+    )
 
 
 def test_real_danone_page_359() -> None:
@@ -482,21 +575,16 @@ def test_every_unit_carries_a_source_order_and_tables_carry_a_context_key() -> N
 
 def test_page_markdown_sorts_last_in_source_order() -> None:
     """It covers the whole page, so by position it would be every unit's neighbour."""
-    with tempfile.TemporaryDirectory() as temp:
-        root = write_output_root(
-            Path(temp) / "run",
-            pages=1,
-            blocks=[block(1, 1, "A paragraph.")],
-            tables={1: [kpi_table()]},
-        )
-        reader = OutputReader(root)
-        page = reader.validate()[0]
-        units = list(page_units(reader, page, reader.blocks_by_page().get(1, [])))
-        markdown = next(u for u in units if u.kind is EvidenceKind.PAGE_MARKDOWN)
-        check(
-            markdown.source_order == max(u.source_order for u in units),
-            "generated page markdown is last in source order",
-        )
+    units = _mapped_units(
+        "A paragraph.\n",
+        blocks=[block(1, 1, "A paragraph.")],
+        tables={1: [kpi_table()]},
+    )
+    markdown = next(iter(_markdown(units)))
+    check(
+        markdown.source_order == max(u.source_order for u in units),
+        "generated page markdown is last in source order",
+    )
 
 
 def main() -> int:
