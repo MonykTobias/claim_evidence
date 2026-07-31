@@ -113,7 +113,11 @@ IDENTITY_VERSION = 1
 # 2: page Markdown is indexed per mapped segment carrying the source keys it
 # was generated from, instead of one whole-page blob. Same extraction output,
 # different stored evidence, so every existing index has to be rebuilt.
-FINGERPRINT_VERSION = 2
+# 3: only typed, unhedged chart summaries become visual units, an ambiguous
+# literal fails its Markdown segment, and a repaired table row maps cell by
+# cell. A v2 index holds units these rules would refuse, and no query-time
+# filter can remove a row that should never have been stored.
+FINGERPRINT_VERSION = 3
 
 
 def normalize_source_uri(uri: str) -> str:

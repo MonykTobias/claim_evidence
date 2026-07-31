@@ -180,16 +180,39 @@ def _write_page_png(path: Path) -> None:
     Image.new("RGB", (int(PAGE_W), int(PAGE_H)), "white").save(path)
 
 
-def image_summary(page: int, index: int, summary: str) -> dict[str, Any]:
-    return {
+def image_summary(
+    page: int,
+    index: int,
+    summary: str,
+    *,
+    triage_type: str | None = "chart",
+    summary_type: str | None = "chart",
+    summary_warnings: list[str] | None = None,
+    summary_redundant: bool = False,
+    norm_rect: list[float] | None = None,
+) -> dict[str, Any]:
+    """One image summary row, typed the way the current producer writes them.
+
+    ``triage_type``/``summary_type`` of ``None`` omits the field, which is a
+    legacy record: it still carries ``classification``, and admitting it on that
+    alone is exactly what the current rule refuses.
+    """
+    row = {
         "page": page,
         "index": index,
         "rel_path": f"images/picture_p{page:04d}_i{index:03d}.png",
-        "norm_rect": [0.1, 0.55, 0.7, 0.8],
+        "norm_rect": norm_rect or [0.1, 0.55, 0.7, 0.8],
         "caption": "",
         "summary": summary,
         "classification": "chart",
+        "summary_warnings": list(summary_warnings or []),
+        "summary_redundant": summary_redundant,
     }
+    if triage_type is not None:
+        row["triage_type"] = triage_type
+    if summary_type is not None:
+        row["summary_type"] = summary_type
+    return row
 
 
 def block(

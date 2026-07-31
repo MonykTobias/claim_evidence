@@ -20,6 +20,7 @@ from claim_evidence.source import (
     OutputValidationError,
     block_text,
     flatten_header,
+    markdown_segments,
     page_units,
     sha256_file,
 )
@@ -467,6 +468,218 @@ def test_markdown_image_reference_maps_to_its_visual() -> None:
         segment.table_context["sources"] == ["p0001:visual:0"],
         f"the image path resolves to its visual unit ({segment.table_context['sources']})",
     )
+
+
+# --- only a typed, unhedged chart becomes visual evidence -------------------
+
+# What the producer writes when it read the chart and could not name it. The
+# "(none)" fields are absences, not hedges, and must not be read as ones.
+CHART_SUMMARY = (
+    "Title: (none) Axis labels: (none) Home deliveries increased 48% in FY24 "
+    "versus FY16."
+)
+
+
+def _visuals(units: list) -> list:
+    return [u for u in units if u.kind is EvidenceKind.VISUAL]
+
+
+def _units_on(page_number: int, **kwargs) -> list:
+    """Units for one page of a root built from ``kwargs``."""
+    with tempfile.TemporaryDirectory() as temp:
+        root = write_output_root(Path(temp) / "run", **kwargs)
+        reader = OutputReader(root)
+        page = next(p for p in reader.validate() if p.page == page_number)
+        return list(
+            page_units(reader, page, reader.blocks_by_page().get(page_number, []))
+        )
+
+
+def _one_chart(summary: str, **summary_kwargs) -> list:
+    return _units_on(
+        1, pages=1, images={1: [image_summary(1, 0, summary, **summary_kwargs)]}
+    )
+
+
+def test_a_typed_chart_without_a_title_is_admitted() -> None:
+    check(len(_visuals(_one_chart(CHART_SUMMARY))) == 1, "an untitled chart is a chart")
+
+
+def test_a_hedged_chart_summary_is_rejected() -> None:
+    """A summary that will not commit to its own numbers cannot ground one."""
+    for hedge in (
+        "The values are approximate.",
+        "The values are estimated.",
+        "This is a guess at the trend.",
+        "The axis labels are unclear.",
+        "The figures are illegible.",
+        "The bottom row is not readable.",
+    ):
+        units = _one_chart(f"Home deliveries increased 48% in FY24. {hedge}")
+        check(not _visuals(units), f"rejected: {hedge}")
+
+
+def test_only_a_record_typed_chart_at_both_stages_is_admitted() -> None:
+    for other in ("infographic", "photo", "diagram", "map", "table", "symbol"):
+        units = _one_chart(
+            CHART_SUMMARY, triage_type=other, summary_type=other
+        )
+        check(not _visuals(units), f"a {other} is not re-verifiable evidence")
+    check(
+        not _visuals(_one_chart(CHART_SUMMARY, summary_type="photo")),
+        "triage and summary must agree",
+    )
+    check(
+        not _visuals(_one_chart(CHART_SUMMARY, triage_type="photo")),
+        "in both directions",
+    )
+
+
+def test_a_legacy_classification_only_record_is_rejected() -> None:
+    """``classification`` predates triage; trusting it re-admits everything."""
+    units = _one_chart(CHART_SUMMARY, triage_type=None, summary_type=None)
+    check(not _visuals(units), "an untyped record is not admitted on classification")
+
+
+def test_a_redundant_or_flagged_summary_is_rejected() -> None:
+    check(
+        not _visuals(_one_chart(CHART_SUMMARY, summary_redundant=True)),
+        "a summary that only repeats the page adds no evidence",
+    )
+    check(
+        not _visuals(_one_chart(CHART_SUMMARY, summary_warnings=["low_confidence"])),
+        "a summary the producer itself flagged is not evidence",
+    )
+
+
+def test_an_empty_summary_is_rejected() -> None:
+    check(not _visuals(_one_chart("   ")), "a chart nobody read says nothing")
+
+
+def test_malformed_crop_geometry_drops_only_its_own_record() -> None:
+    units = _units_on(
+        1,
+        pages=1,
+        blocks=[block(1, 1, "A paragraph.")],
+        images={
+            1: [
+                image_summary(1, 0, CHART_SUMMARY, norm_rect=["x", 0.1, 0.2, 0.3]),
+                image_summary(1, 1, "Returns fell 12% in FY24."),
+            ]
+        },
+    )
+    keys = [u.unit_key for u in _visuals(units)]
+    check(keys == ["p0001:visual:1"], f"only the usable chart is indexed ({keys})")
+    check(
+        any(u.kind is EvidenceKind.NARRATIVE for u in units),
+        "and the page keeps the rest of its evidence",
+    )
+
+
+# --- a repaired table row, mapped cell by cell ------------------------------
+
+
+def test_a_table_header_and_its_separator_are_not_segments() -> None:
+    segments = markdown_segments(
+        "| Metric | Change |\n|---|---|\n| Home deliveries | 48% |\n"
+    )
+    check(
+        segments == ["| Home deliveries | 48% |"],
+        f"only the data row asserts anything ({segments})",
+    )
+
+
+def test_pipe_lines_without_a_separator_keep_every_row() -> None:
+    """Older runs emit tables that never declare where the header ends."""
+    segments = markdown_segments("| Metric | Change |\n| Home deliveries | 48% |\n")
+    check(len(segments) == 2, f"both rows are still offered ({segments})")
+
+
+def _chart_row_units(row: str, images: list, page: int = 1, **kwargs) -> list:
+    return _units_on(
+        page,
+        blocks=[],
+        images={page: images},
+        markdown={page: f"| Metric | Change |\n|---|---|\n{row}\n"},
+        **kwargs,
+    )
+
+
+def test_a_repaired_row_maps_to_the_chart_it_was_read_from() -> None:
+    """No unit's text is the row, so only cell-by-cell matching recovers it."""
+    units = _chart_row_units(
+        "| Home deliveries | 48% |", [image_summary(1, 0, CHART_SUMMARY)], pages=1
+    )
+    segment = next(iter(_markdown(units)))
+    check(
+        segment.table_context["sources"] == ["p0001:visual:0"],
+        f"the row names the chart ({segment.table_context['sources']})",
+    )
+    check(not segment.citable, "and is still not citable itself")
+    check(str(segment.quality) == "none", f"with no quality of its own ({segment.quality})")
+    check(
+        segment.artifact_path.endswith("docling_final.md"),
+        "provenance is the generated file it came from",
+    )
+
+
+def test_a_cell_the_chart_never_states_rejects_the_whole_row() -> None:
+    units = _chart_row_units(
+        "| Home deliveries | -8% |", [image_summary(1, 0, CHART_SUMMARY)], pages=1
+    )
+    check(not _markdown(units), "a row with an unaccounted cell is not indexed at all")
+
+
+def test_a_value_two_units_share_rejects_the_whole_row() -> None:
+    units = _chart_row_units(
+        "| Home deliveries | 48% |",
+        [
+            image_summary(1, 0, CHART_SUMMARY),
+            image_summary(1, 1, "Returns also moved 48% in FY24."),
+        ],
+        pages=1,
+    )
+    check(not _markdown(units), "a cell that could have come from either is not provenance")
+
+
+def test_a_value_only_on_another_page_cannot_map_a_row() -> None:
+    units = _units_on(
+        1,
+        pages=2,
+        blocks=[],
+        # Page 1 names the metric; only page 2 states the figure.
+        images={
+            1: [image_summary(1, 0, "Home deliveries by channel, FY16 to FY24.")],
+            2: [image_summary(2, 0, CHART_SUMMARY)],
+        },
+        markdown={1: "| Metric | Change |\n|---|---|\n| Home deliveries | 48% |\n"},
+    )
+    check(not _markdown(units), "the fallback never reaches off its own page")
+
+
+def test_mapped_row_keys_follow_the_cells_left_to_right() -> None:
+    units = _chart_row_units(
+        "| 71% | 48% |",
+        [
+            image_summary(1, 0, "Home deliveries reached 48% in FY24."),
+            image_summary(1, 1, "Renewable share reached 71% in FY24."),
+        ],
+        pages=1,
+    )
+    segment = next(iter(_markdown(units)))
+    check(
+        segment.table_context["sources"] == ["p0001:visual:1", "p0001:visual:0"],
+        f"reading order, not index order ({segment.table_context['sources']})",
+    )
+
+
+def test_a_literal_two_blocks_share_rejects_the_segment() -> None:
+    """A citation chosen between two equal candidates is a guess, not provenance."""
+    units = _mapped_units(
+        "Emissions fell.\n",
+        blocks=[block(1, 1, "Emissions fell."), block(1, 2, "Emissions fell.")],
+    )
+    check(not _markdown(units), "a sentence both blocks print maps to neither")
 
 
 def test_real_danone_page_359() -> None:

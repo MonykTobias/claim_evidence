@@ -655,20 +655,64 @@ def _rows_from_markdown(markdown: str) -> list[list[str]]:
     return rows
 
 
+# A chart prints its own numbers, so a crop of one can be re-read and checked
+# against a claim. A photo, an infographic, a diagram, a map, or a rendered
+# symbol cannot: the model writes a description of it, and a description is not
+# a figure the audit can verify. Only a record the producer typed as a chart at
+# both stages is admitted, and `classification` is deliberately not consulted --
+# it is the legacy field, written before triage existed, and trusting it would
+# re-admit every untyped record this rule exists to keep out.
+CHART_TYPE = "chart"
+# A summary that hedges its own numbers cannot ground anything. These are the
+# words the summariser uses when it could not read a value, and a unit built
+# from one would carry an approximation into retrieval as if it were a reading.
+_UNCERTAIN_SUMMARY = re.compile(
+    r"\b(approximate|estimated|guess|unclear|illegible|not readable)\b",
+    re.IGNORECASE,
+)
+
+
+def _admissible_chart(summary: dict[str, Any]) -> bool:
+    """Whether this image record may become verifiable visual evidence."""
+    if summary.get("triage_type") != CHART_TYPE or summary.get("summary_type") != CHART_TYPE:
+        return False
+    if summary.get("summary_redundant"):
+        return False
+    if summary.get("summary_warnings"):
+        return False
+    text = clean_text(summary.get("summary") or "")
+    return bool(text) and not _UNCERTAIN_SUMMARY.search(text)
+
+
 def visual_units(
     page: PageSource,
     summaries: list[dict[str, Any]],
     heading_path: list[str],
 ) -> list[EvidenceUnit]:
-    """Chart/infographic regions.
+    """Chart regions a later crop check could confirm or refute.
 
     Summaries are retrieval hints only: the unit is stored at coarse precision
-    and cannot support a verdict until the audit re-checks the crop.
+    and cannot support a verdict until the audit re-checks the crop. So the bar
+    for indexing one at all is that re-checking it could *settle* something --
+    which is why only typed, unhedged chart records get in, and why a record
+    whose geometry will not convert is dropped on its own rather than taking the
+    page's other evidence with it.
     """
     units: list[EvidenceUnit] = []
     for summary in summaries:
         bbox = summary.get("norm_rect") or summary.get("bbox")
-        if not bbox:
+        if not bbox or not _admissible_chart(summary):
+            continue
+        try:
+            region = region_from(
+                bbox,
+                page.width,
+                page.height,
+                role=RegionRole.VISUAL_REGION,
+                precision=GeometryPrecision.CROP,
+            )
+        except (KeyError, TypeError, ValueError):
+            # One unusable rectangle is one missing chart, not a failed page.
             continue
         text = clean_text(
             " ".join(
@@ -695,15 +739,7 @@ def visual_units(
                 heading_path=heading_path,
                 table_context={"rel_path": summary.get("rel_path") or ""},
                 artifact_path=f"{page.rel}/image_summaries.jsonl",
-                regions=[
-                    region_from(
-                        bbox,
-                        page.width,
-                        page.height,
-                        role=RegionRole.VISUAL_REGION,
-                        precision=GeometryPrecision.CROP,
-                    )
-                ],
+                regions=[region],
                 geometry_precision=GeometryPrecision.CROP,
             )
         )
@@ -744,6 +780,45 @@ def _anchor_texts(unit: EvidenceUnit) -> list[str]:
     return []
 
 
+def _is_separator_row(line: str) -> bool:
+    """Whether a pipe line is the ``|---|---|`` rule under a table's header."""
+    cells = [c.strip() for c in line.strip("|").split("|")]
+    return any(cells) and all(re.fullmatch(r":?-{2,}:?", c) for c in cells if c)
+
+
+def _table_rows(lines: Sequence[str]) -> list[str]:
+    """Pipe lines reduced to the rows that actually assert something.
+
+    A separator row is a table declaring where its header ends. Everything at or
+    above it names columns, and a column name is not a reading: "2024" as a
+    header says which column, while "2024" in a cell may be the value being
+    claimed. Indexing the header would let a segment resolve through a word the
+    page used only as a label.
+
+    Pipe lines with no separator among them are left alone. Older runs emit
+    tables without one, and dropping their first row would silently lose a real
+    reading in the name of a header that was never declared.
+    """
+    kept: list[str] = []
+    run: list[str] = []
+    for line in lines:
+        if line.startswith("|"):
+            run.append(line)
+            continue
+        kept.extend(_after_separator(run))
+        run = []
+        kept.append(line)
+    kept.extend(_after_separator(run))
+    return kept
+
+
+def _after_separator(run: Sequence[str]) -> list[str]:
+    for index, line in enumerate(run):
+        if _is_separator_row(line):
+            return [row for row in run[index + 1 :] if not _is_separator_row(row)]
+    return list(run)
+
+
 def markdown_segments(markdown: str) -> list[str]:
     """Split generated Markdown into the pieces retrieval can offer as context.
 
@@ -757,14 +832,40 @@ def markdown_segments(markdown: str) -> list[str]:
         if not lines:
             continue
         if any(line.startswith("|") for line in lines):
-            segments.extend(lines)
+            segments.extend(_table_rows(lines))
         else:
             segments.append(" ".join(lines))
     return segments
 
 
+def literal_anchors(units: Sequence[EvidenceUnit]) -> list[tuple[str, str | None]]:
+    """Each distinct literal, paired with the one unit it identifies.
+
+    A literal two or more citable units share identifies neither of them, so it
+    is carried with a ``None`` key: matching it is not weak provenance, it is a
+    segment whose text could have come from either place, and the placement pass
+    rejects it. Two occurrences of the same unit's own literal are not that --
+    they are one unit printed twice.
+    """
+    by_text: dict[str, set[str]] = {}
+    for unit in units:
+        if not unit.citable:
+            continue
+        for text in _anchor_texts(unit):
+            normalized = normalize_for_match(text)
+            if len(normalized) >= MIN_ANCHOR_CHARS:
+                by_text.setdefault(normalized, set()).add(unit.unit_key)
+    return sorted(
+        (
+            (text, next(iter(keys)) if len(keys) == 1 else None)
+            for text, keys in by_text.items()
+        ),
+        key=lambda anchor: -len(anchor[0]),
+    )
+
+
 def anchor_segment(
-    segment: str, anchors: Sequence[tuple[str, str]]
+    segment: str, anchors: Sequence[tuple[str, str | None]]
 ) -> list[str] | None:
     """Unit keys covering this segment exactly, in reading order, or ``None``.
 
@@ -775,7 +876,9 @@ def anchor_segment(
 
     Partial coverage is the case that matters. It is exactly how a rewritten
     claim would otherwise ride into a prompt attached to evidence that does not
-    say it, which is the one thing generated text must never be able to do.
+    say it, which is the one thing generated text must never be able to do. An
+    ambiguous anchor -- one two citable units both print -- fails the segment
+    the same way, because a citation chosen between two candidates is a guess.
     """
     haystack = normalize_for_match(segment)
     placed: list[tuple[int, int, str]] = []
@@ -784,6 +887,8 @@ def anchor_segment(
         while (at := haystack.find(needle, start)) != -1:
             end = at + len(needle)
             if not any(s < end and at < e for s, e, _ in placed):
+                if key is None:
+                    return None
                 placed.append((at, end, key))
                 break
             # Occupied by a longer anchor, or by an identical value in another
@@ -798,6 +903,49 @@ def anchor_segment(
     if _MARKDOWN_SYNTAX.sub("", residual):
         return None
     return list(dict.fromkeys(key for _, _, key in placed))
+
+
+# Emphasis, code spans and line breaks are how the refinement formats a cell;
+# none of them is part of the value. They come off before matching so a bolded
+# figure resolves to the same unit as a plain one.
+_CELL_FORMATTING = re.compile(r"\*\*|__|`|<br\s*/?>", re.IGNORECASE)
+
+
+def row_cell_sources(
+    segment: str, units: Sequence[EvidenceUnit]
+) -> list[str] | None:
+    """Unit keys for a repaired table row, or ``None``.
+
+    The case this exists for: the refinement rebuilds a table out of a chart it
+    read, so the row is real content but no single unit's text is the row -- the
+    literal anchors never line up and the segment is lost. Matching cell by cell
+    recovers it, at the price of a much stricter rule, because a cell is short
+    enough to appear in places it did not come from.
+
+    So every non-empty cell must be a substring of exactly one citable unit on
+    this page, and one cell that matches nothing, or matches two units, rejects
+    the whole row. Half a mapped row is not half a provenance: it is a row whose
+    remaining cells came from somewhere unaccounted for.
+    """
+    if not segment.startswith("|"):
+        return None
+    cells = [
+        normalized
+        for cell in segment.strip("|").split("|")
+        if (normalized := normalize_for_match(_CELL_FORMATTING.sub(" ", cell)))
+    ]
+    if not cells:
+        return None
+    texts = [
+        (unit.unit_key, normalize_for_match(unit.text)) for unit in units if unit.citable
+    ]
+    keys: list[str] = []
+    for cell in cells:
+        matched = {key for key, text in texts if cell in text}
+        if len(matched) != 1:
+            return None
+        keys.append(matched.pop())
+    return list(dict.fromkeys(keys))
 
 
 def markdown_units(
@@ -815,22 +963,13 @@ def markdown_units(
     ``sources`` holds unit keys, not evidence ids. Keys are what survives a
     re-index; ids record which attempt inserted a row.
     """
-    anchors = sorted(
-        (
-            (normalized, unit.unit_key)
-            for unit in units
-            if unit.citable
-            for text in _anchor_texts(unit)
-            if len(normalized := normalize_for_match(text)) >= MIN_ANCHOR_CHARS
-        ),
-        key=lambda anchor: -len(anchor[0]),
-    )
-    if not anchors:
-        return []
+    anchors = literal_anchors(units)
 
     mapped: list[EvidenceUnit] = []
     for index, segment in enumerate(markdown_segments(markdown)):
-        keys = anchor_segment(segment, anchors)
+        # Literal anchoring first: it accounts for the segment's whole text,
+        # which is the stronger claim. Cell matching only sees the cells.
+        keys = anchor_segment(segment, anchors) or row_cell_sources(segment, units)
         text = clean_text(segment)
         if not keys or not text:
             continue
@@ -924,6 +1063,7 @@ def _in_reading_order(units: list[EvidenceUnit]) -> list[EvidenceUnit]:
 
 
 __all__ = [
+    "CHART_TYPE",
     "FINGERPRINTED_ARTIFACTS",
     "MIN_ANCHOR_CHARS",
     "canonical_digest",
@@ -935,6 +1075,8 @@ __all__ = [
     "anchor_segment",
     "block_text",
     "flatten_header",
+    "literal_anchors",
+    "row_cell_sources",
     "markdown_segments",
     "markdown_units",
     "narrative_units",

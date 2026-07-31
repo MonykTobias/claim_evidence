@@ -236,6 +236,32 @@ def test_model_identity_states_its_reproducibility() -> None:
     )
 
 
+def test_a_new_mapping_version_cannot_reuse_the_old_index() -> None:
+    """The rules changed, so the same artifacts are now a different index.
+
+    Nothing in the output root moved: what changed is which of its records this
+    package will store, and no query-time filter can remove a unit that should
+    never have been written. The version is the only thing that says so.
+    """
+    from claim_evidence import ingest
+
+    check(ingest.FINGERPRINT_VERSION == 3, "the current mapping rules are version 3")
+    with tempfile.TemporaryDirectory() as temp:
+        root = build_root(Path(temp) / "run")
+        current = fingerprint_of(root)
+        original = ingest.FINGERPRINT_VERSION
+        try:
+            ingest.FINGERPRINT_VERSION = 2
+            previous = fingerprint_of(root)
+        finally:
+            ingest.FINGERPRINT_VERSION = original
+        check(current != previous, "a v2-ready build is not reusable as v3")
+        check(
+            ingest.FINGERPRINT_VERSION == original,
+            "and the module constant is back where it was",
+        )
+
+
 def test_the_extraction_contract_version_is_part_of_it() -> None:
     with tempfile.TemporaryDirectory() as temp:
         root = build_root(Path(temp) / "run")
