@@ -680,6 +680,23 @@ def check_repaired_table_row_is_offered_only_as_fallback(tmp: Path) -> None:
         result = client.audit_claim(
             ROW_CLAIM, scope=[report.document_id], reporting_entity=ENTITY
         )
+        disposition = client.conn.execute(
+            "SELECT ac.reason FROM audit_candidate ac"
+            " WHERE ac.audit_id = %s AND ac.evidence_id = %s",
+            (result.audit_id, segments[0]["id"]),
+        ).fetchone()
+        check(
+            disposition["reason"] == "markdown group used as page context",
+            f"the trace says how the row was used ({disposition['reason']})",
+        )
+        check(
+            not client.conn.execute(
+                "SELECT selected FROM audit_candidate"
+                " WHERE audit_id = %s AND evidence_id = %s",
+                (result.audit_id, segments[0]["id"]),
+            ).fetchone()["selected"],
+            "and that it was never selected as a citation",
+        )
 
     check(len(prompts) == 2, f"direct evidence was tried first ({len(prompts)})")
     check("<page_context" not in prompts[0], "the first prompt is source evidence only")
@@ -733,6 +750,26 @@ def check_direct_evidence_never_reaches_the_fallback(tmp: Path) -> None:
         )[1])
     ) as client:
         result = client.audit_claim(SUPPORTED, scope="all", reporting_entity=ENTITY)
+        # The trace records what was retrieved. No Markdown row in it *is* the
+        # evidence that the second pass never ran -- the fail-closed shape here
+        # is an absence, not a synthetic "considered and rejected" row.
+        markdown = client.conn.execute(
+            "SELECT count(*) AS n FROM audit_candidate ac"
+            " JOIN evidence_unit e ON e.id = ac.evidence_id"
+            " WHERE ac.audit_id = %s AND e.kind = %s",
+            (result.audit_id, str(EvidenceKind.PAGE_MARKDOWN)),
+        ).fetchone()["n"]
+        check(markdown == 0, f"no Markdown candidate was ever retrieved ({markdown})")
+        check(
+            all(
+                r["reason"] and not r["reason"].startswith("markdown group")
+                for r in client.conn.execute(
+                    "SELECT reason FROM audit_candidate WHERE audit_id = %s",
+                    (result.audit_id,),
+                ).fetchall()
+            ),
+            "and the direct candidates keep their own reasons",
+        )
     check(result.verdict is Verdict.SUPPORTED, "the table still decides it")
     check(not prompts, "the adjudicator was never consulted, so neither was Markdown")
 
@@ -813,17 +850,73 @@ def check_visual_evidence_needs_crop_verification(tmp: Path) -> None:
     with make_client(accepting) as client:
         result = client.audit_claim(claim, scope="all", reporting_entity=ENTITY)
         visual = [c for c in result.citations if c.source_kind is EvidenceKind.VISUAL]
-        if visual:
-            check(
-                visual[0].quality is EvidenceQuality.VERIFIED_VISUAL,
-                "a verified crop is labelled verified_visual",
-            )
-        else:
-            check(
-                result.verdict is not Verdict.SUPPORTED
-                or result.evidence_quality is not EvidenceQuality.COARSE_REGION,
-                "no verdict rests on a coarse region",
-            )
+        check(bool(visual), "an accepted crop can be cited")
+        check(
+            visual[0].quality is EvidenceQuality.VERIFIED_VISUAL,
+            f"and is labelled verified_visual ({visual[0].quality})",
+        )
+        check(
+            result.evidence_quality is not EvidenceQuality.COARSE_REGION,
+            "no verdict rests on a coarse region",
+        )
+        recorded = client.conn.execute(
+            "SELECT evidence_id, result FROM visual_verification WHERE audit_id = %s",
+            (result.audit_id,),
+        ).fetchall()
+        check(
+            any(r["result"] == "support" for r in recorded),
+            f"and the crop check is on the record ({[r['result'] for r in recorded]})",
+        )
+
+
+def check_a_conflicting_crop_is_evidence_against_the_claim(tmp: Path) -> None:
+    """A legible chart showing a *different* figure is the strongest refutation.
+
+    Dropping it as "not supporting" would discard exactly that, so it goes
+    forward as verified evidence and the comparison decides which way it counts.
+    """
+    claim = "The chart shows emissions falling by 40.2%."
+    offered: list[int] = []
+
+    def adjudicate(payload: dict[str, Any]) -> dict[str, Any]:
+        offered.extend(_visual_ids(payload))
+        return adjudication_reply(payload)
+
+    conflicting = default_session(
+        VisualVerification=lambda _: {
+            "result": "conflict",
+            "visible_text": "-34.5% vs 2020",
+            "reason_code": "value_differs",
+        },
+        Adjudication=adjudicate,
+    )
+    with make_client(conflicting) as client:
+        result = client.audit_claim(claim, scope="all", reporting_entity=ENTITY)
+        rows = client.conn.execute(
+            "SELECT evidence_id, result FROM visual_verification WHERE audit_id = %s",
+            (result.audit_id,),
+        ).fetchall()
+        check(
+            any(r["result"] == "conflict" for r in rows),
+            f"the conflicting crop is recorded ({[r['result'] for r in rows]})",
+        )
+        statuses = client.conn.execute(
+            "SELECT ac.visual_status, ac.reason FROM audit_candidate ac"
+            " WHERE ac.audit_id = %s AND ac.evidence_id = ANY(%s)",
+            (result.audit_id, [int(r["evidence_id"]) for r in rows]),
+        ).fetchall()
+        check(
+            all(s["visual_status"] == "verified" for s in statuses),
+            f"and counts as verified, not rejected ({[s['visual_status'] for s in statuses]})",
+        )
+    check(
+        set(offered) == {int(r["evidence_id"]) for r in rows},
+        f"and it is offered to the adjudicator as evidence ({offered})",
+    )
+    check(
+        all(c.source_kind is not EvidenceKind.VISUAL for c in result.citations),
+        "this adjudicator cited nothing, so nothing is cited",
+    )
 
 
 # --- H-1: a selected page range keeps its original PDF page numbers ---------
@@ -1947,10 +2040,19 @@ def check_embedding_dimension_mismatch_is_detected(tmp: Path) -> None:
 
 
 def _visual_ids(payload: dict[str, Any]) -> list[int]:
+    """The ids of the visual passages actually in the prompt.
+
+    Read off the `<evidence>` tag, which is where an id lives -- the older
+    bracketed form this matched stopped being emitted, so it matched nothing and
+    quietly turned every assertion built on it into a no-op.
+    """
     import re
 
     prompt = payload["messages"][1]["content"]
-    return [int(m) for m in re.findall(r"\[(\d+)\] page \d+ \(visual", prompt)]
+    return [
+        int(m)
+        for m in re.findall(r'<evidence id="(\d+)"[^>]*kind="visual"', prompt)
+    ]
 
 
 def main() -> int:
@@ -1977,6 +2079,7 @@ def main() -> int:
         check_verdict_fails_closed_without_citable_evidence,
         check_interrupted_build_is_invisible,
         check_visual_evidence_needs_crop_verification,
+        check_a_conflicting_crop_is_evidence_against_the_claim,
         check_middle_range_keeps_pdf_pages,
         check_source_less_documents_stay_separate,
         check_shared_source_uri_is_one_document,

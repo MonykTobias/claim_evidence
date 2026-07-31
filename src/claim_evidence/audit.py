@@ -223,6 +223,11 @@ def _audit(
     visual_status: dict[int, str] = {}
     visual_results: dict[int, VisualVerification] = {}
     reasons: dict[int, str] = {}
+    # Keyed by the Markdown segment's own evidence id, and kept apart from
+    # `reasons` on purpose: `reasons` is recomputed from scratch when the
+    # fallback re-runs the comparison, and a group's disposition is a fact about
+    # the group, not about that comparison.
+    group_reasons: dict[int, str] = {}
     comparisons: list[EvidenceComparison] = []
     verdict, rationale, citations, missing, scope_ambiguous, rule = _deterministic(
         conn, parsed, citable, regions, reasons, comparisons
@@ -271,7 +276,7 @@ def _audit(
         # keys it was written with; page neighbours of generated text are not
         # its provenance.
         candidates = [*candidates, *markdown_rows]
-        groups = _markdown_groups(conn, markdown_rows)
+        groups = _markdown_groups(conn, markdown_rows, group_reasons)
     if groups:
         candidates = [*candidates, *_mapped_extras(candidates, groups)]
         regions = regions_for(conn, [int(c["row"]["id"]) for c in candidates])
@@ -291,8 +296,17 @@ def _audit(
             verdict, rationale, citations, missing, rule = _adjudicate(
                 conn, client, claim, parsed, citable, regions, visual_status,
                 visual_results, scope_ambiguous=scope_ambiguous, reporter=reporter,
-                audit_id=audit_id, contexts=groups,
+                audit_id=audit_id, contexts=groups, group_reasons=group_reasons,
             )
+        else:
+            # The mapped sources were enough on their own: pulling them in
+            # exposed a comparable fact, and arithmetic settled it before any
+            # prompt was assembled. The segment did its work by naming them.
+            for context_row, _sources in groups:
+                group_reasons.setdefault(
+                    int(context_row["id"]),
+                    "markdown group not used: deterministic fallback decided claim",
+                )
     reporter.done("deciding_verdict", f"Verdict: {verdict}")
 
     if not candidates:
@@ -325,7 +339,8 @@ def _audit(
                 "visual_status": visual_status.get(evidence_id, "not_applicable"),
                 "selected": evidence_id in selected_ids,
                 "reason": _candidate_reason(
-                    c, evidence_id, selected_ids, reasons, visual_status, decided_by
+                    c, evidence_id, selected_ids, reasons, visual_status, decided_by,
+                    group_reasons,
                 ),
             }
             for c in candidates
@@ -476,7 +491,9 @@ def _optional_int(value: Any) -> int | None:
 
 
 def _markdown_groups(
-    conn: psycopg.Connection, candidates: Sequence[dict[str, Any]]
+    conn: psycopg.Connection,
+    candidates: Sequence[dict[str, Any]],
+    group_reasons: dict[int, str],
 ) -> list[tuple[dict[str, Any], list[dict[str, Any]]]]:
     """Retrieved Markdown segments paired with the evidence they were made from.
 
@@ -489,17 +506,25 @@ def _markdown_groups(
     A segment whose mapping no longer fully resolves is dropped entirely. A
     partly-resolved mapping is not a smaller mapping, it is one whose text is
     no longer fully accounted for, and that is the case this whole path exists
-    to refuse.
+    to refuse. Each drop states which of the two ways it failed, so the trace
+    distinguishes a segment that named nothing from one whose sources this
+    version no longer has.
     """
     groups: list[tuple[dict[str, Any], list[dict[str, Any]]]] = []
     for candidate in candidates:
         row = candidate["row"]
         if EvidenceKind(row["kind"]) is not EvidenceKind.PAGE_MARKDOWN:
             continue
+        evidence_id = int(row["id"])
         keys = list((row.get("table_context") or {}).get("sources") or [])
+        if not keys:
+            group_reasons[evidence_id] = "markdown group rejected: empty mapping"
+            continue
         resolved = evidence_by_unit_key(conn, int(row["version_id"]), keys)
-        if keys and len(resolved) == len(set(keys)):
-            groups.append((row, [resolved[key] for key in dict.fromkeys(keys)]))
+        if len(resolved) != len(set(keys)):
+            group_reasons[evidence_id] = "markdown group rejected: missing source"
+            continue
+        groups.append((row, [resolved[key] for key in dict.fromkeys(keys)]))
     return groups
 
 
@@ -573,6 +598,7 @@ def _adjudicate(
     reporter: ProgressReporter | None = None,
     audit_id: int | None = None,
     contexts: Sequence[tuple[dict[str, Any], list[dict[str, Any]]]] = (),
+    group_reasons: dict[int, str] | None = None,
 ) -> tuple[Verdict, str, list[Citation], list[str], str]:
     usable = _verify_visuals(
         conn, client, claim, candidates, regions, visual_status,
@@ -591,7 +617,7 @@ def _adjudicate(
             "no_citable_evidence",
         )
 
-    passages, prompt_ids = _passages(usable, contexts)
+    passages, prompt_ids = _passages(usable, contexts, group_reasons)
     note = (
         "\n\nNote: the evidence reports on narrower or different boundaries than "
         "the claim names, so no passage is scope-comparable to it.\n"
@@ -665,6 +691,7 @@ def _evidence_block(citation: Citation, text: str) -> str:
 def _passages(
     usable: Sequence[tuple[Citation, str, dict[str, Any]]],
     contexts: Sequence[tuple[dict[str, Any], list[dict[str, Any]]]],
+    group_reasons: dict[int, str] | None = None,
 ) -> tuple[str, set[int]]:
     """The prompt's evidence section, and the ids it actually contains.
 
@@ -680,20 +707,29 @@ def _passages(
     cannot fit, or that contains a visual whose crop was rejected, is dropped
     whole rather than trimmed. Mapped groups are placed first -- direct
     retrieval has already come back with nothing by the time any of this runs.
+
+    ``group_reasons`` records which of those happened, per segment. "It did not
+    appear in the prompt" is one observation with three causes, and a trace that
+    could not tell a rejected crop from a full prompt would leave the reader
+    unable to say whether the evidence was refused or merely crowded out.
     """
+    reasons = {} if group_reasons is None else group_reasons
     by_id = {citation.evidence_id: (citation, text) for citation, text, _ in usable}
     blocks: list[str] = []
     used: set[int] = set()
 
     for context_row, sources in contexts:
+        context_id = int(context_row["id"])
         group = [
             f'<page_context page="{context_row["pdf_page"]}">\n'
             f'{_sanitize_passage(context_row["source_text"])}\n</page_context>'
         ]
         ids = [int(row["id"]) for row in sources]
         if not all(evidence_id in by_id for evidence_id in ids):
-            # A rejected or unavailable crop among the sources. The segment
-            # describes evidence this audit could not verify, so it goes too.
+            # Every mapped source was pulled into the candidate pool, so the
+            # only way one is missing here is that crop verification dropped it.
+            # The segment describes evidence this audit could not verify.
+            reasons[context_id] = "markdown group rejected: visual crop"
             continue
         group.extend(
             _evidence_block(*by_id[evidence_id])
@@ -701,9 +737,11 @@ def _passages(
             if evidence_id not in used
         )
         if len(blocks) + len(group) > MAX_PASSAGES:
+            reasons[context_id] = "markdown group rejected: passage cap"
             continue
         blocks.extend(group)
         used.update(ids)
+        reasons[context_id] = "markdown group used as page context"
 
     for citation, text, _row in usable:
         if citation.evidence_id in used or len(blocks) >= MAX_PASSAGES:
@@ -986,12 +1024,21 @@ def _candidate_reason(
     reasons: dict[int, str],
     visual_status: dict[int, str],
     decided_by: str,
+    group_reasons: dict[int, str],
 ) -> str:
     """One short sentence on why a candidate was used or set aside.
 
     Retrieval metadata, not model reasoning: a deterministic comparison result,
     a crop-verification outcome, or how the candidate entered the pool.
+
+    A Markdown segment answers a different question from every other candidate
+    -- not "was this cited" but "was this allowed to join the passages it maps
+    to" -- so its group disposition is reported ahead of the generic reasons,
+    which would otherwise flatten three distinct outcomes into "not citable".
     """
+    if EvidenceKind(candidate["row"]["kind"]) is EvidenceKind.PAGE_MARKDOWN:
+        if (disposition := group_reasons.get(evidence_id)) is not None:
+            return disposition
     if evidence_id in reasons:
         return reasons[evidence_id]
     status = visual_status.get(evidence_id)

@@ -186,12 +186,19 @@ def _context(evidence_id: int, text: str, sources: list[int]):
 def test_a_mapped_group_travels_whole_or_not_at_all() -> None:
     from claim_evidence.audit import _passages
 
-    prompt, used = _passages(_usable(11, 12), [_context(90, "11 and 12 together", [11, 12])])
+    reasons: dict[int, str] = {}
+    prompt, used = _passages(
+        _usable(11, 12), [_context(90, "11 and 12 together", [11, 12])], reasons
+    )
     check(prompt.count("<page_context") == 1, "the segment is offered as context")
     check(used == {11, 12}, f"with both of the units it maps to ({sorted(used)})")
     check(
         prompt.index("<page_context") < prompt.index('<evidence id="11"'),
         "and it is placed before them, so the model reads them together",
+    )
+    check(
+        reasons[90] == "markdown group used as page context",
+        f"and the trace says so ({reasons[90]})",
     )
 
 
@@ -199,20 +206,38 @@ def test_a_group_whose_source_was_dropped_takes_the_context_with_it() -> None:
     """A rejected crop must not leave prose describing what it showed."""
     from claim_evidence.audit import _passages
 
-    prompt, used = _passages(_usable(11), [_context(90, "11 and 12 together", [11, 12])])
+    reasons: dict[int, str] = {}
+    prompt, used = _passages(
+        _usable(11), [_context(90, "11 and 12 together", [11, 12])], reasons
+    )
     check("<page_context" not in prompt, "the segment is not offered without unit 12")
     check(used == {11}, f"only the directly usable passage survives ({sorted(used)})")
+    check(
+        reasons[90] == "markdown group rejected: visual crop",
+        f"recorded as a crop rejection, not as a cap ({reasons[90]})",
+    )
 
 
 def test_an_oversized_group_is_omitted_rather_than_trimmed() -> None:
     from claim_evidence.audit import MAX_PASSAGES, _passages
 
     wide = list(range(1, MAX_PASSAGES + 2))
-    prompt, used = _passages(_usable(*wide), [_context(90, "all of them", wide)])
+    reasons: dict[int, str] = {}
+    prompt, used = _passages(
+        _usable(*wide), [_context(90, "all of them", wide)], reasons
+    )
     check("<page_context" not in prompt, "a group that cannot fit is dropped whole")
     check(
         prompt.count("<evidence id=") == MAX_PASSAGES,
         f"and the cap still holds ({prompt.count('<evidence id=')})",
+    )
+    check(
+        reasons[90] == "markdown group rejected: passage cap",
+        f"recorded as a cap, not as a rejected source ({reasons[90]})",
+    )
+    check(
+        "<page_context" not in prompt and prompt.count("<evidence id=") > 0,
+        "the sources stay available as ordinary evidence on their own merits",
     )
 
 
