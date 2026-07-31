@@ -40,12 +40,6 @@ RRF_K = 60
 # scale would swamp the ranks entirely and leave ties broken by row id.
 EXACT_TOKEN_BONUS = 1.0 / RRF_K
 SCOPE_TOKEN_BONUS = 0.5 / RRF_K
-# A mapped Markdown segment repeats the text of the units it was generated
-# from, so it competes with them on every token they match -- and it can never
-# be cited. Demoted by one bonus unit so it sits just below the evidence that
-# can, which is also the order the audit reads them in: original units first,
-# generated context only once they have come back with nothing.
-NON_CITABLE_PENALTY = 1.0 / RRF_K
 _NUMBER_TOKEN = re.compile(r"\d[\d.,]*")
 
 
@@ -117,8 +111,6 @@ def fuse(
             entry["score"] += EXACT_TOKEN_BONUS * hits / len(tokens)
         if markers and scope_markers(entry["row"]["source_text"]) & markers:
             entry["score"] += SCOPE_TOKEN_BONUS
-        if not entry["row"].get("citable", True):
-            entry["score"] -= NON_CITABLE_PENALTY
 
     # Ties break on where the evidence sits in the document, not on when its
     # row happened to be inserted. Evidence ids record ingestion and resume
@@ -142,6 +134,21 @@ def _document_position(entry: dict[str, Any]) -> tuple[float, int, int, int]:
     )
 
 
+def _admitted(
+    rows: Sequence[dict[str, Any]], allowed_kinds: Sequence[EvidenceKind] | None
+) -> list[dict[str, Any]]:
+    """Rows this retrieval pass is allowed to rank.
+
+    Filtered here rather than in the queries: `db.py` returns what the index
+    holds, and every caller of a search helper -- recall measurement included --
+    would otherwise have to agree with the audit about what is admissible.
+    """
+    if allowed_kinds is None:
+        return [row for row in rows if row.get("citable", True)]
+    wanted = {str(kind) for kind in allowed_kinds}
+    return [row for row in rows if str(row["kind"]) in wanted]
+
+
 def retrieve(
     conn: psycopg.Connection,
     query_embedding: Sequence[float] | None,
@@ -152,23 +159,35 @@ def retrieve(
     limit: int = 20,
     pool: int = 60,
     reporter: ProgressReporter | None = None,
+    allowed_kinds: Sequence[EvidenceKind] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, list[dict[str, Any]]]]:
     """Candidates for one claim, best first, plus the per-channel results.
 
     The raw channel lists come back with the fused list so a caller can report
     what each retriever contributed without querying anything again.
+
+    ``allowed_kinds`` is what separates the two passes an audit makes. Left
+    unset, only citable rows are ranked at all: generated Markdown repeats the
+    text of the units it was made from, so it competes with them on every token
+    they match while being unable to carry a citation, and one that outranked
+    them would spend the caller's limit on a row no verdict can rest on. Set to
+    ``(PAGE_MARKDOWN,)``, only that generated text comes back -- the second
+    pass, run once direct evidence has already come back with nothing.
     """
     report = reporter or ProgressReporter(None, "audit")
     ranked: dict[str, list[dict[str, Any]]] = {}
 
     report.start("retrieving_graph", "Searching claim facts", total=pool)
-    ranked["graph"] = graph_search(
-        conn,
-        metric_terms=sorted(content_tokens(claim.metric or claim_text))[:8],
-        reporting_period=claim.reporting_period,
-        baseline_period=claim.baseline_period,
-        document_ids=document_ids,
-        limit=pool,
+    ranked["graph"] = _admitted(
+        graph_search(
+            conn,
+            metric_terms=sorted(content_tokens(claim.metric or claim_text))[:8],
+            reporting_period=claim.reporting_period,
+            baseline_period=claim.baseline_period,
+            document_ids=document_ids,
+            limit=pool,
+        ),
+        allowed_kinds,
     )
     report.done(
         "retrieving_graph",
@@ -178,8 +197,11 @@ def retrieve(
     )
 
     report.start("retrieving_full_text", "Searching full text", total=pool)
-    ranked["lexical"] = lexical_search(
-        conn, lexical_query(claim_text, claim.key_terms), document_ids, pool
+    ranked["lexical"] = _admitted(
+        lexical_search(
+            conn, lexical_query(claim_text, claim.key_terms), document_ids, pool
+        ),
+        allowed_kinds,
     )
     report.done(
         "retrieving_full_text",
@@ -190,7 +212,9 @@ def retrieve(
 
     if query_embedding is not None:
         report.start("retrieving_vectors", "Searching embeddings", total=pool)
-        ranked["vector"] = vector_search(conn, query_embedding, document_ids, pool)
+        ranked["vector"] = _admitted(
+            vector_search(conn, query_embedding, document_ids, pool), allowed_kinds
+        )
         report.done(
             "retrieving_vectors",
             f"{len(ranked['vector'])} vector candidates",

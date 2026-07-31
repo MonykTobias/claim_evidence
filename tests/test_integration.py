@@ -536,6 +536,24 @@ def check_mapped_markdown_bridges_two_blocks(tmp: Path) -> None:
             "and it names both blocks it was generated from",
         )
 
+        # The segment is the strongest lexical match for the claim -- it is the
+        # only indexed text that states it -- and it still may not be an answer.
+        matches = client.search_evidence(SPLIT_CLAIM, document_ids=[report.document_id])
+        check(bool(matches), "public search returns something for the claim")
+        kinds = {m.citation.source_kind for m in matches}
+        check(
+            EvidenceKind.PAGE_MARKDOWN not in kinds,
+            f"and never generated page Markdown ({kinds})",
+        )
+        one = client.search_evidence(
+            SPLIT_CLAIM, document_ids=[report.document_id], limit=1
+        )
+        check(
+            len(one) == 1
+            and one[0].citation.source_kind is not EvidenceKind.PAGE_MARKDOWN,
+            "a strong Markdown match cannot spend the caller's only result",
+        )
+
         result = client.audit_claim(
             SPLIT_CLAIM, scope=[report.document_id], reporting_entity=ENTITY
         )
@@ -600,6 +618,108 @@ def check_unmapped_markdown_cannot_answer(tmp: Path) -> None:
     check(
         result.verdict is Verdict.INSUFFICIENT and not result.citations,
         f"the rewritten sentence moved nothing ({result.verdict})",
+    )
+
+
+# A table the refinement rebuilt: no block is the row, and the two cells came
+# from two different sentences. Direct retrieval can return either sentence and
+# neither answers the claim.
+ROW_CLAIM = "Home deliveries increased 48% in FY24 versus FY16."
+ROW_BLOCKS = [
+    "Home deliveries grew across every market.",
+    "The FY24 change was 48% against FY16.",
+]
+
+
+def _repaired_row_root(tmp: Path, name: str, row: str) -> Path:
+    return write_output_root(
+        tmp / name,
+        pages=1,
+        blocks=[block(1, index, text) for index, text in enumerate(ROW_BLOCKS, 1)],
+        markdown={1: f"| Metric | Change |\n|---|---|\n{row}\n"},
+    )
+
+
+def check_repaired_table_row_is_offered_only_as_fallback(tmp: Path) -> None:
+    """Cells mapped to separate blocks: context in the second prompt, never a citation."""
+    root = _repaired_row_root(tmp, "repaired", "| Home deliveries | 48% |")
+    prompts: list[str] = []
+
+    def adjudicate(payload: dict[str, Any]) -> dict[str, Any]:
+        content = payload["messages"][1]["content"]
+        prompts.append(content)
+        if "<page_context" not in content:
+            return adjudication_reply(payload)
+        return {
+            "verdict": "supported",
+            "rationale": "The row's two cells are stated by the two passages.",
+            "supporting_evidence_ids": _prompt_ids(payload),
+            "missing_qualifiers": [],
+        }
+
+    with make_client(default_session(Adjudication=adjudicate)) as client:
+        report = client.ingest_document(
+            root, source_uri="urn:repaired", reporting_entity=ENTITY
+        )
+        segments = client.conn.execute(
+            "SELECT id, source_text, table_context FROM evidence_unit"
+            " WHERE version_id = %s AND kind = %s",
+            (report.version_id, str(EvidenceKind.PAGE_MARKDOWN)),
+        ).fetchall()
+        check(len(segments) == 1, f"the repaired row is indexed once ({len(segments)})")
+        check(
+            len(segments[0]["table_context"]["sources"]) == 2,
+            "and maps to both blocks its cells came from",
+        )
+        facts = client.conn.execute(
+            "SELECT count(*) AS n FROM fact_evidence WHERE evidence_id = %s",
+            (segments[0]["id"],),
+        ).fetchone()["n"]
+        check(facts == 0, "a Markdown row never produces a fact")
+
+        result = client.audit_claim(
+            ROW_CLAIM, scope=[report.document_id], reporting_entity=ENTITY
+        )
+
+    check(len(prompts) == 2, f"direct evidence was tried first ({len(prompts)})")
+    check("<page_context" not in prompts[0], "the first prompt is source evidence only")
+    check("<page_context" in prompts[1], "the row is supplied only as fallback context")
+    kinds = {c.source_kind for c in result.citations}
+    check(
+        result.verdict is Verdict.SUPPORTED and kinds == {EvidenceKind.NARRATIVE},
+        f"and what gets cited is the original blocks ({result.verdict}, {kinds})",
+    )
+
+
+def check_a_row_with_an_unmapped_cell_offers_no_context(tmp: Path) -> None:
+    """One cell nothing on the page states, and the whole row stays out."""
+    root = _repaired_row_root(tmp, "unmapped-row", "| Home deliveries | -8% |")
+    prompts: list[str] = []
+
+    with make_client(
+        default_session(Adjudication=lambda p: (
+            prompts.append(p["messages"][1]["content"]), adjudication_reply(p)
+        )[1])
+    ) as client:
+        report = client.ingest_document(
+            root, source_uri="urn:unmapped-row", reporting_entity=ENTITY
+        )
+        segments = client.conn.execute(
+            "SELECT count(*) AS n FROM evidence_unit WHERE version_id = %s AND kind = %s",
+            (report.version_id, str(EvidenceKind.PAGE_MARKDOWN)),
+        ).fetchone()["n"]
+        check(segments == 0, "a row with an unaccounted cell is not indexed")
+        result = client.audit_claim(
+            ROW_CLAIM, scope=[report.document_id], reporting_entity=ENTITY
+        )
+
+    check(
+        all("<page_context" not in p for p in prompts),
+        "so no prompt can carry it as context",
+    )
+    check(
+        result.verdict is Verdict.INSUFFICIENT and not result.citations,
+        f"and the claim stays unanswered ({result.verdict})",
     )
 
 
@@ -1888,6 +2008,8 @@ def main() -> int:
         # audit with scope="all".
         check_mapped_markdown_bridges_two_blocks,
         check_unmapped_markdown_cannot_answer,
+        check_repaired_table_row_is_offered_only_as_fallback,
+        check_a_row_with_an_unmapped_cell_offers_no_context,
         # Last: it empties the index the checks above rely on.
         check_empty_index_is_not_an_insufficient_verdict,
     ]

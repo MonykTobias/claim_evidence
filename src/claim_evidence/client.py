@@ -254,6 +254,14 @@ class ClaimEvidence:
         document_ids: Sequence[int] | None = None,
         limit: int = 20,
     ) -> list[EvidenceMatch]:
+        """Citable evidence for a free-text query, best first.
+
+        Citable only, and stated rather than inherited: every match here is
+        something a caller may quote and point at on a page, so generated page
+        Markdown is not a weaker result to be ranked below the real ones -- it
+        is not a result at all, and a row of it would spend one of the `limit`
+        answers the caller asked for.
+        """
         scope, _references = self._resolve_scope(document_ids)
         parsed = heuristic_claim(query)
         try:
@@ -261,7 +269,8 @@ class ClaimEvidence:
         except OllamaError:
             embedding = None
         candidates, _channels = retrieve(
-            self.conn, embedding, parsed, query, document_ids=scope, limit=limit
+            self.conn, embedding, parsed, query,
+            document_ids=scope, limit=limit, allowed_kinds=None,
         )
         return to_matches(self.conn, candidates)
 

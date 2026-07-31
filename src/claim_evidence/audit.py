@@ -207,22 +207,15 @@ def _audit(
         # two still run, and the completion summary omits its count.
         embedding = None
 
+    # Citable rows only. Generated Markdown is not a weaker candidate to be
+    # ranked below them -- it is not a candidate at all until this pass has
+    # failed, and one competing here would spend `limit` on a row that can
+    # never be cited.
     fused, channels = retrieve(
         conn, embedding, parsed, claim,
         document_ids=document_ids, limit=limit, reporter=reporter,
     )
     candidates = expand(conn, fused, reporter=reporter)
-    if not candidates:
-        return _finish(
-            conn, audit_id, claim, Verdict.INSUFFICIENT,
-            "No evidence matched the claim.", EvidenceQuality.NONE, [], ["evidence"],
-            reporter=reporter, channels=channels, fused=fused, candidates=[],
-            visual_status={},
-            explanation=DecisionExplanation(
-                decided_by="no_evidence", verdict_rule="no_citable_evidence"
-            ),
-            index_references=index_references,
-        )
 
     regions = regions_for(conn, [int(c["row"]["id"]) for c in candidates])
     citable = [c for c in candidates if c["row"]["citable"]]
@@ -256,13 +249,29 @@ def _audit(
     # refinement assembled out of two separated boxes is the one thing direct
     # retrieval structurally cannot offer, because neither box contains it.
     #
+    # A second retrieval, not a re-read of the first: the direct pass never
+    # ranked these rows, so they were never in the pool to demote. It is also
+    # why an empty direct result is not an early exit -- a page whose only
+    # match is a mapped segment is exactly the case this exists for.
+    #
     # Everything below still decides on the original units. The Markdown is
     # context that says "read these together"; the citations remain theirs.
-    groups = (
-        _markdown_groups(conn, candidates)
-        if verdict is Verdict.INSUFFICIENT
-        else []
-    )
+    groups: list[tuple[dict[str, Any], list[dict[str, Any]]]] = []
+    if verdict is Verdict.INSUFFICIENT:
+        markdown_rows, _markdown_channels = retrieve(
+            conn, embedding, parsed, claim,
+            document_ids=document_ids, limit=limit,
+            # Silent: the public phase sequence describes one retrieval, and a
+            # second set of `retrieving_*` events would report progress the
+            # caller's phase list has no place for.
+            reporter=ProgressReporter(None, "audit"),
+            allowed_kinds=(EvidenceKind.PAGE_MARKDOWN,),
+        )
+        # Deliberately not expanded. A segment reaches its own sources by the
+        # keys it was written with; page neighbours of generated text are not
+        # its provenance.
+        candidates = [*candidates, *markdown_rows]
+        groups = _markdown_groups(conn, markdown_rows)
     if groups:
         candidates = [*candidates, *_mapped_extras(candidates, groups)]
         regions = regions_for(conn, [int(c["row"]["id"]) for c in candidates])
@@ -285,6 +294,16 @@ def _audit(
                 audit_id=audit_id, contexts=groups,
             )
     reporter.done("deciding_verdict", f"Verdict: {verdict}")
+
+    if not candidates:
+        # Neither pass returned anything. "The index holds nothing about this"
+        # and "the evidence did not line up" are different answers, and the
+        # explanation has always distinguished them; the only change is that
+        # the Markdown pass now gets to run before this is concluded.
+        rationale = "No evidence matched the claim."
+        missing = ["evidence"]
+        explained_by = "no_evidence"
+        rule = "no_citable_evidence"
 
     selected_ids = {citation.evidence_id for citation in citations}
     reporter.start("persisting_trace", "Saving the retrieval trace")
@@ -461,10 +480,11 @@ def _markdown_groups(
 ) -> list[tuple[dict[str, Any], list[dict[str, Any]]]]:
     """Retrieved Markdown segments paired with the evidence they were made from.
 
-    No second retrieval: page Markdown is embedded and searched like everything
-    else, so anything relevant is already in the pool -- demoted below the units
-    that can actually be cited, which is where it belongs until they have
-    failed.
+    ``candidates`` is the Markdown-only pass, so every row here is generated
+    text and none of it can be cited. What comes back are its *sources*: the
+    original units the segment was written from, resolved by the keys stored at
+    ingestion and constrained by ``evidence_by_unit_key`` to citable rows of one
+    queryable version.
 
     A segment whose mapping no longer fully resolves is dropped entirely. A
     partly-resolved mapping is not a smaller mapping, it is one whose text is

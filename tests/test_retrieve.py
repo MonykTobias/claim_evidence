@@ -202,6 +202,74 @@ def test_a_candidate_without_source_order_sorts_last_but_stays() -> None:
     check(order == [10, 11], "an unordered candidate sorts last rather than vanishing")
 
 
+# --- what each retrieval pass is allowed to rank ----------------------------
+
+
+def _channel_row(evidence_id: int, kind: str, citable: bool) -> dict:
+    return {
+        "id": evidence_id,
+        "kind": kind,
+        "citable": citable,
+        "pdf_page": 1,
+        "source_order": evidence_id,
+        "source_text": "home deliveries rose 48% in fy24",
+    }
+
+
+def _patched_channels(monkeypatched_rows: list[dict]):
+    """Every channel returns the same rows, so only the filter can differ."""
+    import claim_evidence.retrieve as retrieve_module
+
+    original = (
+        retrieve_module.graph_search,
+        retrieve_module.lexical_search,
+        retrieve_module.vector_search,
+    )
+    retrieve_module.graph_search = lambda *a, **k: list(monkeypatched_rows)
+    retrieve_module.lexical_search = lambda *a, **k: list(monkeypatched_rows)
+    retrieve_module.vector_search = lambda *a, **k: list(monkeypatched_rows)
+    return retrieve_module, original
+
+
+def _restore(module, original) -> None:
+    module.graph_search, module.lexical_search, module.vector_search = original
+
+
+def test_direct_retrieval_ranks_only_citable_rows() -> None:
+    """A Markdown row must not spend one of the caller's answers."""
+    from claim_evidence.models import EvidenceKind
+    from claim_evidence.retrieve import retrieve
+
+    rows = [
+        # Ranked first by every channel, and still not a candidate.
+        _channel_row(1, str(EvidenceKind.PAGE_MARKDOWN), citable=False),
+        _channel_row(2, str(EvidenceKind.NARRATIVE), citable=True),
+    ]
+    module, original = _patched_channels(rows)
+    try:
+        claim = heuristic_claim(CLAIM)
+        direct, channels = retrieve(None, [0.1] * 8, claim, CLAIM, limit=1)
+        markdown, _ = retrieve(
+            None, [0.1] * 8, claim, CLAIM, limit=1,
+            allowed_kinds=(EvidenceKind.PAGE_MARKDOWN,),
+        )
+    finally:
+        _restore(module, original)
+
+    check(
+        [int(c["row"]["id"]) for c in direct] == [2],
+        "the citable row is the one candidate the limit buys",
+    )
+    check(
+        all(not any(r["id"] == 1 for r in rows) for rows in channels.values()),
+        "and the Markdown row never reached fusion in any channel",
+    )
+    check(
+        [int(c["row"]["id"]) for c in markdown] == [1],
+        "the Markdown pass returns that row and nothing else",
+    )
+
+
 def main() -> int:
     for name, func in sorted(globals().items()):
         if name.startswith("test_") and callable(func):
