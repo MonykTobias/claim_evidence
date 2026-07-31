@@ -164,6 +164,11 @@ statement about the request, not about the report.
 model confidence: an uncalibrated number reads as precision the system does not
 have.
 
+`search_evidence` returns citable evidence only. Every `citation.source_kind` is
+`narrative`, `table_row`, `table_value`, or `visual` — never `page_markdown`,
+which exists to be read alongside its sources during an audit and is not a
+result a caller can quote or point at on a page.
+
 ### Splitting a post into claims
 
 `audit_claim` audits one assertion. A social-media post usually makes several,
@@ -292,9 +297,27 @@ page rather than the path it tried to reach.
 |---|---|---|
 | `blocks.jsonl` | headings, prose, block geometry | yes |
 | `table_candidates.json` | rows, values, cell geometry | yes |
-| `image_summaries.jsonl` | visual retrieval hints | only after crop verification |
+| `image_summaries.jsonl` | chart retrieval hints | only after crop verification |
 | `docling_final.md` | mapped page context | no |
 | `page.png` | crops for visual re-verification | via the crop |
+
+### Which images become evidence
+
+Only charts, and only ones the producer typed as such at both stages:
+`triage_type` and `summary_type` must both be `chart`. `classification` is the
+legacy field and is deliberately not consulted — reading it would re-admit every
+untyped record. A record is also refused when the producer flagged it
+(`summary_warnings`), marked it redundant with the page text
+(`summary_redundant`), left the summary empty, or when the summary hedges its
+own figures: `approximate`, `estimated`, `guess`, `unclear`, `illegible`, or
+`not readable` as whole words. `Title: (none)` is an absence, not a hedge, and
+does not disqualify anything.
+
+The bar is deliberately "could re-cropping this settle a claim". A photo, an
+infographic, a diagram, or a map yields a model-written description, and a
+description is not a figure the audit can check. A rectangle that will not
+convert to a crop region drops its own record and leaves the rest of the page
+alone.
 
 ### Mapped page context
 
@@ -304,20 +327,43 @@ maps exactly back onto the units it was generated from, and the mapping is
 built at ingestion by string matching — no embeddings, no similarity, no model.
 
 Each blank-line paragraph, and each table row on its own, is a candidate
-segment. A segment is indexed when every substantive character in it is
-accounted for by an anchor: a narrative block's text, a table cell as printed,
-or an image's own path. Markdown punctuation between anchors is fine; a clause
-no unit accounts for is not, and drops the whole segment. A table header row
-anchors to nothing and is never indexed. A stored segment is `citable = false`,
-`quality = none`, derives no facts, is never returned as a neighbour, and
-carries the `unit_key`s of its sources rather than any geometry of its own.
+segment. Where a pipe table declares a header with a `|---|` separator, only
+the rows below it are candidates: a column label is not a reading, and "2024"
+as a header must not stand in for "2024" as a value. Tables that declare no
+separator keep every row, because older runs emit them that way.
 
-It is read only after direct evidence has failed. If the deterministic
-comparison or the adjudicator reaches `supported`, `contradicted`, or `mixed`
-from original evidence, no Markdown is consulted at all. On `insufficient`, the
-mapped segments already in the candidate pool are resolved to their original
-units, those units join the pool, and the arithmetic runs again over the wider
-set before the adjudicator is asked a second time.
+A segment maps in one of two ways, tried in that order.
+
+**Literal anchors.** Every substantive character is accounted for by an anchor:
+a narrative block's text, a table cell as printed, or an image's own path.
+Markdown punctuation between anchors is fine; a clause no unit accounts for is
+not, and drops the whole segment. An anchor two citable units both print is
+ambiguous and drops the segment too — a citation chosen between two equal
+candidates is a guess, not provenance.
+
+**Cell by cell**, for a pipe row only, and only after literal anchoring failed.
+The refinement rebuilds a table out of a chart it read, so no unit's text is the
+row and the anchors never line up. Each non-empty cell — stripped of `**`, `__`,
+backticks and `<br>` — must be a substring of exactly one citable unit *on the
+same page*. A cell matching nothing, or two units, rejects the whole row. It is
+a much stricter rule than literal anchoring because a cell is short enough to
+turn up somewhere it did not come from.
+
+Either way a stored segment is `citable = false`, `quality = none`, derives no
+facts, is never returned as a neighbour, and carries the `unit_key`s of its
+sources in reading order rather than any geometry of its own.
+
+It is read only after direct evidence has failed. Direct retrieval ranks
+citable rows only — generated Markdown is not in that pool at all, so it can
+neither outrank the evidence it repeats nor spend one of the caller's results.
+If the deterministic comparison or the adjudicator reaches `supported`,
+`contradicted`, or `mixed`, no Markdown is retrieved at all, and the audit trace
+holds no `page_markdown` candidate to show for it. On `insufficient` — including
+when direct retrieval returned nothing — a second, Markdown-only retrieval runs.
+Its rows are not context-expanded: a segment reaches its sources through the
+keys it was written with, not through page neighbours. Those sources join the
+pool and the arithmetic runs again over the wider set before the adjudicator is
+asked a second time.
 
 The value is the case direct retrieval structurally cannot serve: one sentence
 Docling split across two boxes exists in neither block, so neither can be
@@ -331,7 +377,14 @@ beside a subset of what it describes. A group that will not fit under
 `MAX_PASSAGES`, or that contains a visual whose crop was rejected, is dropped
 whole. The cap counts context blocks; nothing else about citations changes.
 
-There is no in-place upgrade. `FINGERPRINT_VERSION` is `2`, so an index built
+Each of those outcomes is named in the trace, on the segment's own candidate
+row: `markdown group used as page context`, `markdown group rejected: visual
+crop`, `markdown group rejected: passage cap`, `markdown group rejected: missing
+source`, `markdown group rejected: empty mapping`, or `markdown group not used:
+deterministic fallback decided claim`. "It did not appear in the prompt" is one
+observation with several causes, and the trace says which.
+
+There is no in-place upgrade. `FINGERPRINT_VERSION` is `3`, so an index built
 before this rebuilds on the next `ingest` of the same output root — no
 re-extraction and no schema change, but the documents do have to be re-indexed
 before the fallback is available to them.
@@ -417,6 +470,12 @@ The completed 494-page run indexes to 21,988 evidence units (5,901 narrative,
 Geometry precision across those units: 14,323 cell, 5,901 block, 602 crop, 493
 page, 472 row-fallback, 197 table-fallback. The 472 row fallbacks are exactly
 the table cells the extractor emitted without their own bounding box.
+
+These counts were measured at `FINGERPRINT_VERSION` 2. The narrative, table and
+fact figures are unaffected by the current rules, but the visual, page-Markdown,
+crop and page numbers will be lower under them: only typed, unhedged charts
+become visual units now, and a segment whose anchors are ambiguous is no longer
+indexed. Re-run `tests/acceptance_danone.py` to restate them.
 
 Scanning every table fact in the document against the three reference claims
 yields 2 matches and 0 conflicts for the 40.2% claim, 0 and 2 for the 90%
