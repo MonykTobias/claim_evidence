@@ -1,16 +1,27 @@
--- claim_evidence schema.
+-- The one current claim_evidence schema.
 --
--- Re-runnable: every object is created IF NOT EXISTS so `db init` is safe on a
--- populated database. `EMBED_DIM` is substituted with the configured embedding
--- dimension before execution.
+-- There is exactly one schema asset and no migration history. Development data
+-- is disposable and rebuildable: a database that does not match this file is
+-- reset and re-indexed, never upgraded in place. That is why there are no
+-- ALTER/backfill sections here -- an in-place upgrade path is deferred until a
+-- schema is declared stable (DG-01), and pretending to have one is how a
+-- half-migrated database ends up serving confident wrong citations.
+--
+-- Re-runnable against a database this same file created: every object is
+-- CREATE ... IF NOT EXISTS, so a repeated `db init` is a no-op. `EMBED_DIM` is
+-- substituted with the configured embedding dimension before execution.
 
 CREATE EXTENSION IF NOT EXISTS vector;
 
--- Lets health() report whether an existing database has the current shape.
+-- What installed this database, and when. `db init` compares the recorded
+-- version and schema-file digest against the package's own before it will
+-- treat an existing database as current.
 CREATE TABLE IF NOT EXISTS schema_meta (
-    id         integer     PRIMARY KEY DEFAULT 1 CHECK (id = 1),
-    version    integer     NOT NULL,
-    applied_at timestamptz NOT NULL DEFAULT now()
+    id                integer     PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+    version           integer     NOT NULL,
+    schema_sql_sha256 text        NOT NULL,
+    initialized_at    timestamptz NOT NULL DEFAULT now(),
+    applied_at        timestamptz NOT NULL DEFAULT now()
 );
 
 CREATE TABLE IF NOT EXISTS document (
@@ -18,15 +29,18 @@ CREATE TABLE IF NOT EXISTS document (
     name         text        NOT NULL,
     sha256       text,
     source_uri   text,
-    created_at   timestamptz NOT NULL DEFAULT now(),
-    -- NULLS NOT DISTINCT matters: ingesting without a source PDF leaves sha256
-    -- NULL, and the default NULL-is-distinct rule would make every re-ingest a
-    -- brand new document instead of matching the existing one.
-    UNIQUE NULLS NOT DISTINCT (name, sha256)
+    -- Internal identity only, never a public API field: sha256 of a
+    -- namespace-tagged basis -- the PDF hash, else the logical source URI, else
+    -- the canonical output root -- so equal text in different namespaces cannot
+    -- collide, and two output roots sharing a basename stay two documents.
+    identity_key text        NOT NULL,
+    created_at   timestamptz NOT NULL DEFAULT now()
 );
 
--- A version is only visible to queries once it reaches 'ready'. An interrupted
--- build stays 'building' forever and is simply never joined against.
+CREATE UNIQUE INDEX IF NOT EXISTS document_identity_idx ON document (identity_key);
+
+-- A version is queryable only in a queryable status. An interrupted build is
+-- reconciled to 'interrupted' on restart and is simply never joined against.
 CREATE TABLE IF NOT EXISTS document_version (
     id            bigserial PRIMARY KEY,
     document_id   bigint      NOT NULL REFERENCES document(id) ON DELETE CASCADE,
@@ -34,20 +48,42 @@ CREATE TABLE IF NOT EXISTS document_version (
     embed_model   text        NOT NULL,
     embed_dim     integer     NOT NULL,
     status        text        NOT NULL DEFAULT 'building'
-                  CHECK (status IN ('building', 'ready', 'inactive')),
+                  CHECK (status IN ('building', 'ready', 'degraded', 'failed',
+                                    'inactive', 'interrupted')),
     output_root   text        NOT NULL,
     source_pdf    text,
     -- A forced rebuild re-indexes an unchanged source, so identity is
     -- (document, fingerprint, attempt): the new 'building' row coexists with
-    -- the old 'ready' one, which keeps serving queries until the swap.
+    -- the old ready one, which keeps serving queries until the swap.
     attempt       integer     NOT NULL DEFAULT 1,
     created_at    timestamptz NOT NULL DEFAULT now(),
     ready_at      timestamptz,
+    failed_at     timestamptz,
+    failure_code  text,
+    failure_phase text,
+    last_progress_at timestamptz NOT NULL DEFAULT now(),
+    -- Narrative fact enrichment is optional; these say how much of it landed,
+    -- so 'degraded' is a measured state rather than a label.
+    fact_candidates_total     integer NOT NULL DEFAULT 0,
+    fact_candidates_succeeded integer NOT NULL DEFAULT 0,
     UNIQUE (document_id, fingerprint, attempt)
 );
 
 CREATE INDEX IF NOT EXISTS document_version_ready_idx
     ON document_version (document_id, status);
+CREATE INDEX IF NOT EXISTS document_version_progress_idx
+    ON document_version (status, last_progress_at);
+
+-- One failed narrative-fact candidate. The evidence key and a safe reason code
+-- only: the passage itself and the model's error text stay out of the database
+-- so a retry can be targeted without storing what went wrong verbatim.
+CREATE TABLE IF NOT EXISTS fact_candidate_failure (
+    version_id  bigint      NOT NULL REFERENCES document_version(id) ON DELETE CASCADE,
+    unit_key    text        NOT NULL,
+    reason_code text        NOT NULL,
+    recorded_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (version_id, unit_key)
+);
 
 CREATE TABLE IF NOT EXISTS page (
     id                  bigserial PRIMARY KEY,
@@ -72,9 +108,16 @@ CREATE TABLE IF NOT EXISTS evidence_unit (
     normalized_text    text    NOT NULL,
     heading_path       jsonb   NOT NULL DEFAULT '[]'::jsonb,
     table_context      jsonb   NOT NULL DEFAULT '{}'::jsonb,
+    -- Root-relative, contained, and checked against the extraction root before
+    -- the version can activate.
     artifact_path      text    NOT NULL,
     geometry_precision text    NOT NULL,
     truncated_source   boolean NOT NULL DEFAULT false,
+    -- Where this unit sits on its page and what it belongs to. Context
+    -- expansion reads these instead of evidence ids, which record when a row
+    -- was inserted rather than what the page actually says.
+    source_order       integer NOT NULL,
+    context_key        text,
     embedding          vector(EMBED_DIM),
     text_search        tsvector GENERATED ALWAYS AS
                        (to_tsvector('english', normalized_text)) STORED,
@@ -92,6 +135,10 @@ CREATE INDEX IF NOT EXISTS evidence_unit_embedding_idx
 CREATE INDEX IF NOT EXISTS evidence_unit_version_idx ON evidence_unit (version_id);
 CREATE INDEX IF NOT EXISTS evidence_unit_page_idx    ON evidence_unit (page_id);
 CREATE INDEX IF NOT EXISTS evidence_unit_kind_idx    ON evidence_unit (version_id, kind);
+CREATE INDEX IF NOT EXISTS evidence_unit_source_order_idx
+    ON evidence_unit (page_id, source_order);
+CREATE INDEX IF NOT EXISTS evidence_unit_context_idx
+    ON evidence_unit (page_id, context_key);
 
 CREATE TABLE IF NOT EXISTS evidence_region (
     id            bigserial PRIMARY KEY,
@@ -119,10 +166,10 @@ CREATE TABLE IF NOT EXISTS entity (
 );
 
 CREATE TABLE IF NOT EXISTS entity_alias (
-    id              bigserial PRIMARY KEY,
-    entity_id       bigint NOT NULL REFERENCES entity(id) ON DELETE CASCADE,
-    alias           text   NOT NULL,
-    normalized_alias text  NOT NULL,
+    id               bigserial PRIMARY KEY,
+    entity_id        bigint NOT NULL REFERENCES entity(id) ON DELETE CASCADE,
+    alias            text   NOT NULL,
+    normalized_alias text   NOT NULL,
     UNIQUE (entity_id, normalized_alias)
 );
 
@@ -168,6 +215,12 @@ CREATE TABLE IF NOT EXISTS audit_run (
     id                 bigserial PRIMARY KEY,
     claim              text        NOT NULL,
     parsed_claim       jsonb       NOT NULL DEFAULT '{}'::jsonb,
+    status             text        NOT NULL DEFAULT 'running'
+                       CHECK (status IN ('running', 'completed', 'failed', 'interrupted')),
+    -- The corpus this audit searched, recorded when it opened. Not derived from
+    -- citations: an insufficient verdict cites nothing and still searched
+    -- something.
+    requested_document_ids jsonb   NOT NULL DEFAULT '[]'::jsonb,
     verdict            text,
     rationale          text,
     evidence_quality   text,
@@ -176,8 +229,21 @@ CREATE TABLE IF NOT EXISTS audit_run (
     chat_model         text,
     embed_model        text,
     error              text,
-    created_at         timestamptz NOT NULL DEFAULT now()
+    -- Which rule fired and how each qualifier compared, the public phase
+    -- durations, and the exact versions searched. Operational metadata only:
+    -- no prompt, no model reply, no hidden reasoning, no local path.
+    decision_explanation jsonb     NOT NULL DEFAULT '{}'::jsonb,
+    timings              jsonb     NOT NULL DEFAULT '{}'::jsonb,
+    index_references     jsonb     NOT NULL DEFAULT '[]'::jsonb,
+    created_at         timestamptz NOT NULL DEFAULT now(),
+    completed_at       timestamptz,
+    failed_at          timestamptz,
+    failure_code       text,
+    failure_phase      text,
+    retryable          boolean
 );
+
+CREATE INDEX IF NOT EXISTS audit_run_status_idx ON audit_run (status, created_at);
 
 CREATE TABLE IF NOT EXISTS audit_candidate (
     id             bigserial PRIMARY KEY,
@@ -203,29 +269,16 @@ CREATE TABLE IF NOT EXISTS audit_candidate (
 
 CREATE INDEX IF NOT EXISTS audit_candidate_audit_idx ON audit_candidate (audit_id);
 
-
--- In-place upgrade for databases created before these columns existed. The
--- CREATE TABLE statements above are authoritative for a fresh database; these
--- keep `db init` idempotent on an existing one instead of demanding a re-index.
-ALTER TABLE document_version ADD COLUMN IF NOT EXISTS attempt integer NOT NULL DEFAULT 1;
-ALTER TABLE audit_candidate  ADD COLUMN IF NOT EXISTS lexical_score double precision;
-ALTER TABLE audit_candidate  ADD COLUMN IF NOT EXISTS vector_score double precision;
-ALTER TABLE audit_candidate  ADD COLUMN IF NOT EXISTS graph_score double precision;
-ALTER TABLE audit_candidate  ADD COLUMN IF NOT EXISTS combined_rank integer;
-ALTER TABLE audit_candidate  ADD COLUMN IF NOT EXISTS expanded_from bigint;
-ALTER TABLE audit_candidate  ADD COLUMN IF NOT EXISTS visual_status text NOT NULL DEFAULT 'not_applicable';
-ALTER TABLE audit_candidate  ADD COLUMN IF NOT EXISTS reason text;
-ALTER TABLE audit_candidate  DROP COLUMN IF EXISTS note;
-
-DO $$
-BEGIN
-    ALTER TABLE document_version DROP CONSTRAINT document_version_document_id_fingerprint_key;
-EXCEPTION WHEN undefined_object THEN
-    NULL;
-END $$;
-
-CREATE UNIQUE INDEX IF NOT EXISTS document_version_identity_idx
-    ON document_version (document_id, fingerprint, attempt);
-
-INSERT INTO schema_meta (id, version) VALUES (1, 2)
-ON CONFLICT (id) DO UPDATE SET version = EXCLUDED.version, applied_at = now();
+-- One re-verified visual crop. The visible text the model reported and a safe
+-- result/reason code -- never its reasoning, and never the prompt.
+CREATE TABLE IF NOT EXISTS visual_verification (
+    id           bigserial PRIMARY KEY,
+    audit_id     bigint  NOT NULL REFERENCES audit_run(id) ON DELETE CASCADE,
+    evidence_id  bigint  NOT NULL REFERENCES evidence_unit(id) ON DELETE CASCADE,
+    result       text    NOT NULL
+                 CHECK (result IN ('support', 'conflict', 'illegible', 'unrelated')),
+    reason_code  text    NOT NULL,
+    visible_text text    NOT NULL DEFAULT '',
+    checked_at   timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (audit_id, evidence_id)
+);

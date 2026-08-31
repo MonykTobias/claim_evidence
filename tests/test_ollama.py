@@ -3,23 +3,21 @@
 from __future__ import annotations
 
 import json
-import sys
 from decimal import Decimal
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from fake_ollama import FakeSession, reply  # noqa: E402
+from fake_ollama import FakeSession, reply
 
-from claim_evidence.config import Settings  # noqa: E402
-from claim_evidence.models import (  # noqa: E402
+from claim_evidence.config import DEFAULT_NUM_CTX, Settings
+from claim_evidence.errors import ValidationError
+from claim_evidence.models import (
     Adjudication,
     Fact,
     FactExtraction,
     VisualVerification,
 )
-from claim_evidence.ollama import OllamaClient, OllamaError, gbnf_safe_schema  # noqa: E402
+from claim_evidence.ollama import OllamaClient, OllamaError, gbnf_safe_schema
 
 SETTINGS = Settings(embed_dimensions=8, embed_batch_size=2)
 
@@ -131,7 +129,7 @@ def test_displayed_values_coerce_to_decimal() -> None:
 
 def test_vision_sends_the_image_and_vision_model() -> None:
     session = FakeSession(
-        chat_replies=[reply({"supports_claim": True, "visible_text": "40.2%"})]
+        chat_replies=[reply({"result": "support", "visible_text": "40.2%", "reason_code": "value_and_metric_visible"})]
     )
     settings = Settings(embed_dimensions=8, vision_model="vision-model")
     result = OllamaClient(settings, session).vision(
@@ -141,6 +139,80 @@ def test_vision_sends_the_image_and_vision_model() -> None:
     payload = session.requests[0][1]
     check(payload["model"] == "vision-model", "vision model used")
     check(len(payload["messages"][-1]["images"]) == 1, "crop attached as base64")
+
+
+def test_structured_requests_bound_the_context_window() -> None:
+    session = FakeSession(chat_replies=[reply({"facts": []})])
+    OllamaClient(SETTINGS, session).structured(FactExtraction, "sys", "passage")
+    options = session.requests[0][1]["options"]
+    check(options["num_ctx"] == DEFAULT_NUM_CTX == 16384, "the default context is 16k")
+    check(options["temperature"] == 0, "and determinism is unchanged")
+
+
+def test_configured_context_reaches_the_request() -> None:
+    session = FakeSession(chat_replies=[reply({"facts": []})])
+    settings = Settings(embed_dimensions=8, num_ctx=4096)
+    OllamaClient(settings, session).structured(FactExtraction, "sys", "passage")
+    check(session.requests[0][1]["options"]["num_ctx"] == 4096, "an override is honoured")
+
+
+def test_vision_uses_the_same_configured_context() -> None:
+    session = FakeSession(
+        chat_replies=[reply({"result": "illegible", "reason_code": "figures_not_legible", "reason": "unreadable"})]
+    )
+    settings = Settings(embed_dimensions=8, vision_model="vision-model", num_ctx=8192)
+    OllamaClient(settings, session).vision(
+        VisualVerification, "sys", "does the crop show 40.2%?", b"\x89PNG"
+    )
+    check(session.requests[0][1]["options"]["num_ctx"] == 8192, "vision shares the setting")
+
+
+def test_embed_requests_carry_no_context_option() -> None:
+    """/api/embed has no chat context; sending one would be noise at best."""
+    session = FakeSession(dimensions=8)
+    OllamaClient(SETTINGS, session).embed(["a"])
+    url, payload = session.requests[0]
+    check(url.endswith("/api/embed"), "the embed endpoint was called")
+    check("options" not in payload, "no options block is sent")
+    check("num_ctx" not in json.dumps(payload), "and no context anywhere in the payload")
+
+
+def test_retry_keeps_the_bounded_context() -> None:
+    session = FakeSession(chat_replies=["not json", reply({"facts": []})])
+    OllamaClient(SETTINGS, session).structured(FactExtraction, "sys", "passage")
+    check(len(session.requests) == 2, "the invalid reply was retried once")
+    check(
+        all(r[1]["options"]["num_ctx"] == DEFAULT_NUM_CTX for r in session.requests),
+        "the retry does not silently widen the context",
+    )
+
+
+def test_invalid_context_configuration_is_rejected() -> None:
+    import os
+
+    for value in (0, -1, True):
+        try:
+            Settings(embed_dimensions=8, num_ctx=value)
+        except ValidationError as exc:
+            check("CLAIM_EVIDENCE_NUM_CTX" in str(exc), f"{value!r} rejected by name")
+            continue
+        raise AssertionError(f"num_ctx={value!r} was accepted")
+
+    original = os.environ.get("CLAIM_EVIDENCE_NUM_CTX")
+    for raw in ("abc", "true", "16k", "1.5"):
+        os.environ["CLAIM_EVIDENCE_NUM_CTX"] = raw
+        try:
+            Settings.from_env()
+        except ValidationError:
+            check(True, f"{raw!r} from the environment is rejected")
+        else:
+            raise AssertionError(f"CLAIM_EVIDENCE_NUM_CTX={raw!r} was accepted")
+    os.environ["CLAIM_EVIDENCE_NUM_CTX"] = "32768"
+    check(Settings.from_env().num_ctx == 32768, "a valid override is parsed")
+    if original is None:
+        del os.environ["CLAIM_EVIDENCE_NUM_CTX"]
+    else:
+        os.environ["CLAIM_EVIDENCE_NUM_CTX"] = original
 
 
 def main() -> int:

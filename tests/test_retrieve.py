@@ -2,29 +2,26 @@
 
 from __future__ import annotations
 
-import sys
 import tempfile
 from decimal import Decimal
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from PIL import Image  # noqa: E402
+from PIL import Image
 
-from claim_evidence.facts import heuristic_claim  # noqa: E402
-from claim_evidence.models import (  # noqa: E402
+from claim_evidence.facts import heuristic_claim
+from claim_evidence.models import (
     GeometryPrecision,
     ParsedClaim,
     Region,
     VisualVerification,
 )
-from claim_evidence.retrieve import (  # noqa: E402
+from claim_evidence.retrieve import (
     exact_tokens,
     fuse,
     lexical_query,
 )
-from claim_evidence.vision import CROP_PADDING, crop_region, verify_visual  # noqa: E402
+from claim_evidence.vision import CROP_PADDING, crop_region, verify_visual
 
 CLAIM = "Danone reduced Scope 1 and 2 energy and industry emissions by 40.2% in 2025 versus 2020."
 
@@ -135,7 +132,18 @@ def test_missing_page_image_verifies_as_unsupported() -> None:
     result = verify_visual(None, Path("does-not-exist.png"), [region], CLAIM)
     check(isinstance(result, VisualVerification), "a missing crop still returns a verdict")
     check(not result.supports_claim, "an unreadable crop never supports a claim")
-    check("crop unavailable" in result.reason, "reason explains the failure")
+    check(
+        result.result.value == "illegible",
+        f"a missing crop is illegible, not merely unsupported ({result.result})",
+    )
+    check(
+        result.reason_code == "crop_unavailable",
+        "the reason is a stable code a caller can branch on",
+    )
+    check(
+        "does-not-exist.png" not in result.reason_code + result.reason,
+        "and it never echoes the server path it tried to open",
+    )
 
 
 def test_claim_without_a_number_has_no_value_tokens() -> None:
@@ -143,6 +151,123 @@ def test_claim_without_a_number_has_no_value_tokens() -> None:
     check(exact_tokens(claim, "emissions fell") == set(), "nothing exact to boost")
     check(claim.value_decimal is None, "no value invented")
     check(Decimal("0") != claim.value_decimal, "value stays absent")
+
+
+def _candidate(evidence_id: int, page: int, source_order: int) -> dict:
+    return {
+        "id": evidence_id,
+        "pdf_page": page,
+        "source_order": source_order,
+        "source_text": "identical text on every candidate",
+        "citable": True,
+    }
+
+
+def test_equal_scores_break_ties_on_source_order_not_row_id() -> None:
+    """Evidence ids record ingestion history, not what the page says."""
+    from claim_evidence.retrieve import fuse
+
+    # Inserted backwards: the first unit on the page has the highest id.
+    rows = [
+        _candidate(evidence_id=900, page=1, source_order=0),
+        _candidate(evidence_id=800, page=1, source_order=1),
+        _candidate(evidence_id=700, page=2, source_order=0),
+    ]
+    fused = fuse({"lexical": rows})
+    # One channel, so every rank differs; give them identical scores instead by
+    # fusing each as rank 1 from its own channel.
+    fused = fuse({
+        "lexical": [rows[0]],
+        "vector": [rows[1]],
+        "graph": [rows[2]],
+    })
+    order = [int(entry["row"]["id"]) for entry in fused]
+    check(
+        order == [900, 800, 700],
+        f"equal-scoring candidates follow page then source order, got {order}",
+    )
+    check(
+        order != sorted(order),
+        "and not the ascending row-id order a naive tiebreak would give",
+    )
+
+
+def test_a_candidate_without_source_order_sorts_last_but_stays() -> None:
+    from claim_evidence.retrieve import fuse
+
+    known = _candidate(evidence_id=10, page=1, source_order=5)
+    unknown = dict(_candidate(evidence_id=11, page=1, source_order=0), source_order=None)
+    fused = fuse({"lexical": [known], "vector": [unknown]})
+    order = [int(entry["row"]["id"]) for entry in fused]
+    check(order == [10, 11], "an unordered candidate sorts last rather than vanishing")
+
+
+# --- what each retrieval pass is allowed to rank ----------------------------
+
+
+def _channel_row(evidence_id: int, kind: str, citable: bool) -> dict:
+    return {
+        "id": evidence_id,
+        "kind": kind,
+        "citable": citable,
+        "pdf_page": 1,
+        "source_order": evidence_id,
+        "source_text": "home deliveries rose 48% in fy24",
+    }
+
+
+def _patched_channels(monkeypatched_rows: list[dict]):
+    """Every channel returns the same rows, so only the filter can differ."""
+    import claim_evidence.retrieve as retrieve_module
+
+    original = (
+        retrieve_module.graph_search,
+        retrieve_module.lexical_search,
+        retrieve_module.vector_search,
+    )
+    retrieve_module.graph_search = lambda *a, **k: list(monkeypatched_rows)
+    retrieve_module.lexical_search = lambda *a, **k: list(monkeypatched_rows)
+    retrieve_module.vector_search = lambda *a, **k: list(monkeypatched_rows)
+    return retrieve_module, original
+
+
+def _restore(module, original) -> None:
+    module.graph_search, module.lexical_search, module.vector_search = original
+
+
+def test_direct_retrieval_ranks_only_citable_rows() -> None:
+    """A Markdown row must not spend one of the caller's answers."""
+    from claim_evidence.models import EvidenceKind
+    from claim_evidence.retrieve import retrieve
+
+    rows = [
+        # Ranked first by every channel, and still not a candidate.
+        _channel_row(1, str(EvidenceKind.PAGE_MARKDOWN), citable=False),
+        _channel_row(2, str(EvidenceKind.NARRATIVE), citable=True),
+    ]
+    module, original = _patched_channels(rows)
+    try:
+        claim = heuristic_claim(CLAIM)
+        direct, channels = retrieve(None, [0.1] * 8, claim, CLAIM, limit=1)
+        markdown, _ = retrieve(
+            None, [0.1] * 8, claim, CLAIM, limit=1,
+            allowed_kinds=(EvidenceKind.PAGE_MARKDOWN,),
+        )
+    finally:
+        _restore(module, original)
+
+    check(
+        [int(c["row"]["id"]) for c in direct] == [2],
+        "the citable row is the one candidate the limit buys",
+    )
+    check(
+        all(not any(r["id"] == 1 for r in rows) for rows in channels.values()),
+        "and the Markdown row never reached fusion in any channel",
+    )
+    check(
+        [int(c["row"]["id"]) for c in markdown] == [1],
+        "the Markdown pass returns that row and nothing else",
+    )
 
 
 def main() -> int:

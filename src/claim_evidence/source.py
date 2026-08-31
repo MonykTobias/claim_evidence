@@ -13,7 +13,15 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, Sequence
+
+from document_extract.contracts import (
+    OPTIONAL_PAGE_ROLES,
+    PAGE_ARTIFACT_ROLES,
+    ROOT_ARTIFACT_ROLES,
+    ContractError,
+    validate_run,
+)
 
 from .errors import ValidationError
 from .models import (
@@ -32,15 +40,19 @@ from .normalize import (
     union_bbox,
 )
 
-MANIFEST_NAME = "manifest.json"
-BLOCKS_NAME = "blocks.jsonl"
-REQUIRED_PAGE_ARTIFACTS = (
-    "docling_final.md",
-    "layout_prompt_map.json",
-    "page.png",
-    "table_candidates.json",
-    "page_state.json",
+RUN_NAME = ROOT_ARTIFACT_ROLES["run"]
+MANIFEST_NAME = ROOT_ARTIFACT_ROLES["manifest"]
+BLOCKS_NAME = ROOT_ARTIFACT_ROLES["blocks"]
+# Taken from the extraction contract rather than restated here: the producer
+# declares which roles exist and what each is called, and a second copy of that
+# list in the consumer is exactly how the two drift apart.
+REQUIRED_PAGE_ARTIFACTS = tuple(
+    name for role, name in PAGE_ARTIFACT_ROLES.items() if role not in OPTIONAL_PAGE_ROLES
 )
+# Everything a page's evidence, geometry, or visual verification depends on.
+# An optional artifact is absorbed as "absent" rather than skipped, so a page
+# that gains or loses one still changes the fingerprint.
+FINGERPRINTED_ARTIFACTS = tuple(PAGE_ARTIFACT_ROLES.values())
 # Block text is capped at 500 characters in older runs; `text_full` is the
 # uncapped field and is preferred whenever the producing run emitted it.
 LEGACY_TEXT_CAP = 500
@@ -61,6 +73,10 @@ class PageSource:
     page_dir: Path
     width: float
     height: float
+    # The manifest's page directory relative to the output root, as posix. This
+    # is what gets stored and re-joined later; the absolute `page_dir` is only
+    # used to read artifacts during ingestion.
+    rel: str = ""
 
     def artifact(self, name: str) -> Path:
         return self.page_dir / name
@@ -75,8 +91,37 @@ class OutputReader:
         self.skipped: list[str] = []
         self._manifest: list[dict[str, Any]] | None = None
         self._pages: list[PageSource] | None = None
+        self._run: dict[str, Any] | None = None
 
     # --- validation ---------------------------------------------------------
+
+    @property
+    def run(self) -> dict[str, Any]:
+        """The extraction's own statement of what it produced.
+
+        Required, and required to be the current contract version. There is no
+        reader for output written before the contract existed: an old root's
+        artifacts may be laid out differently, and guessing is how an index
+        ends up citing the wrong page with complete confidence. The answer is
+        always to re-extract, and the message says so.
+        """
+        if self._run is None:
+            path = self.root / RUN_NAME
+            if not path.is_file():
+                raise OutputValidationError(
+                    f"{RUN_NAME} is missing from the output root: this extraction "
+                    f"predates the current run contract and cannot be indexed. "
+                    f"Re-extract the document."
+                )
+            try:
+                self._run = validate_run(json.loads(path.read_text(encoding="utf-8")))
+            except json.JSONDecodeError:
+                raise OutputValidationError(f"{RUN_NAME} is not valid JSON") from None
+            except ContractError as exc:
+                # The contract's own message names the offending key or version
+                # and never echoes a value, so it is safe to pass through.
+                raise OutputValidationError(f"{RUN_NAME} is not usable: {exc}") from None
+        return self._run
 
     @property
     def manifest(self) -> list[dict[str, Any]]:
@@ -98,8 +143,10 @@ class OutputReader:
         seen: dict[int, dict[str, Any]] = {}
         for entry in self.manifest:
             page = entry.get("page")
-            if not isinstance(page, int):
+            if not isinstance(page, int) or isinstance(page, bool):
                 raise OutputValidationError(f"manifest entry without a page: {entry!r}")
+            if page < 1:
+                raise OutputValidationError(f"manifest page {page} is not a 1-based page")
             if page in seen:
                 raise OutputValidationError(f"duplicate manifest entry for page {page}")
             if entry.get("status") != "completed":
@@ -115,26 +162,46 @@ class OutputReader:
         pages: list[PageSource] = []
         for page in sorted(seen):
             entry = seen[page]
-            page_dir = self.root / str(entry.get("page_dir") or f"page_{page:04d}")
+            page_dir = self._contained_dir(page, entry.get("page_dir"))
             if not page_dir.is_dir():
-                raise OutputValidationError(f"missing page directory {page_dir}")
+                raise OutputValidationError(f"page {page} has no page directory")
             for name in REQUIRED_PAGE_ARTIFACTS:
                 if not (page_dir / name).is_file():
                     raise OutputValidationError(f"page {page} is missing {name}")
             width, height = self._page_size(page_dir)
-            pages.append(PageSource(page, page_dir, width, height))
-
-        total = self._total_pages(pages[0].page_dir)
-        expected = set(range(1, total + 1))
-        missing = sorted(expected - seen.keys())
-        if missing:
-            raise OutputValidationError(
-                f"manifest covers {len(seen)} pages but {total} were extracted; "
-                f"missing {missing[:10]}"
+            pages.append(
+                PageSource(
+                    page,
+                    page_dir,
+                    width,
+                    height,
+                    page_dir.relative_to(self.root).as_posix(),
+                )
             )
+
+        # The run contract states which pages were selected. The manifest must
+        # cover exactly that range: a partial extraction is legitimate, but an
+        # extraction that silently lost pages out of the middle of its own
+        # selection is an index with invisible holes in it.
+        selection = self.run["selection"]
+        expected = set(range(selection["start_page"], selection["end_page"] + 1))
+        missing = sorted(expected - seen.keys())
         extra = sorted(seen.keys() - expected)
-        if extra:
-            raise OutputValidationError(f"manifest lists pages beyond 1..{total}: {extra}")
+        if missing or extra:
+            raise OutputValidationError(
+                f"manifest covers {len(seen)} pages but the run selected "
+                f"{selection['page_count']} "
+                f"({selection['start_page']}..{selection['end_page']}); "
+                f"missing {missing[:10]}, unexpected {extra[:10]}"
+            )
+        # Page checkpoints carry the same count; a disagreement means the
+        # directory mixes two runs.
+        counts = {self._total_pages(p.page_dir) for p in pages}
+        if counts != {selection["page_count"]}:
+            raise OutputValidationError(
+                f"page checkpoints disagree with the run selection: "
+                f"{sorted(counts)} against {selection['page_count']}"
+            )
 
         stale = sorted(
             p.name
@@ -150,6 +217,24 @@ class OutputReader:
 
         self._pages = pages
         return pages
+
+    def _contained_dir(self, page: int, raw: Any) -> Path:
+        """Resolve a manifest page directory, refusing anything outside the root.
+
+        Runs before any artifact is touched, so an absolute path, a ``..``
+        traversal, or a symlink pointing elsewhere never reaches a file read.
+        The message names the page only: echoing the escaped target back to the
+        caller would hand them the filesystem probe they were attempting.
+        """
+        relative = Path(str(raw or f"page_{page:04d}"))
+        if relative.is_absolute() or relative.anchor:
+            raise OutputValidationError(f"page {page} has an absolute page_dir")
+        resolved = (self.root / relative).resolve()
+        if self.root not in resolved.parents:
+            raise OutputValidationError(
+                f"page {page} has a page_dir outside the output root"
+            )
+        return resolved
 
     @staticmethod
     def _page_size(page_dir: Path) -> tuple[float, float]:
@@ -171,25 +256,43 @@ class OutputReader:
 
     # --- identity -----------------------------------------------------------
 
-    def fingerprint(self, source_pdf: str | Path | None = None) -> str:
-        """Content identity of this extraction.
+    def artifact_digests(self) -> dict[str, str]:
+        """SHA-256 of every artifact the run contract declares evidence-bearing.
 
-        A source PDF is the strongest identity; without one, hash the manifest,
-        the block sidecar, and the shape of every page's evidence artifacts.
+        Keyed by role and page so the map says *what* changed, not only that
+        something did. Hashing content rather than size is the whole point: a
+        re-run that improves a table reconstruction or redraws a page image
+        without changing its length would otherwise be indistinguishable from
+        no change at all, and the better extraction would silently never be
+        indexed.
+
+        ``page_image`` counts. It is what visual re-verification crops from, so
+        a changed page image changes what a verdict can rest on.
+
+        Only manifest-listed pages contribute, so a stale directory the
+        manifest has dropped cannot move the fingerprint. A declared-optional
+        artifact that is absent is recorded as ``"absent"`` rather than
+        skipped, so a page that gains or loses one is a different build.
         """
-        digest = hashlib.sha256()
-        if source_pdf is not None:
-            digest.update(sha256_file(Path(source_pdf)).encode())
-            return digest.hexdigest()
-        digest.update(sha256_file(self.root / MANIFEST_NAME).encode())
-        blocks = self.root / BLOCKS_NAME
-        if blocks.is_file():
-            digest.update(sha256_file(blocks).encode())
+        roles = self.run["evidence_bearing_roles"]
+        root_roles = self.run["artifacts"]["root"]
+        page_roles = self.run["artifacts"]["page"]
+
+        digests: dict[str, str] = {}
+        for role in roles:
+            if role in root_roles:
+                digests[role] = _digest_of(self.root / root_roles[role])
         for page in self.validate():
-            for name in REQUIRED_PAGE_ARTIFACTS:
-                artifact = page.artifact(name)
-                digest.update(f"{page.page}/{name}/{artifact.stat().st_size}".encode())
-        return digest.hexdigest()
+            for role in roles:
+                if role in page_roles:
+                    digests[f"{role}@{page.page}"] = _digest_of(
+                        page.artifact(page_roles[role])
+                    )
+        return digests
+
+    def extraction_fingerprint(self) -> str:
+        """One value over every declared evidence-bearing artifact's content."""
+        return canonical_digest(self.artifact_digests())
 
     # --- artifacts ----------------------------------------------------------
 
@@ -231,11 +334,37 @@ class OutputReader:
 
 
 def sha256_file(path: Path) -> str:
+    """The file's actual SHA-256, streamed. Verifiable with any standard tool."""
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(1 << 20), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def canonical_json(payload: Any) -> bytes:
+    """The one canonical encoding: sorted keys, compact, UTF-8, not escaped.
+
+    Two runs that agree on the facts must produce identical bytes, or a
+    fingerprint is a record of formatting rather than of content.
+    """
+    return json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+
+
+def canonical_digest(payload: Any) -> str:
+    return hashlib.sha256(canonical_json(payload)).hexdigest()
+
+
+def _digest_of(path: Path) -> str:
+    """Content digest, or ``"absent"`` for a declared-optional artifact.
+
+    An absent artifact is recorded rather than skipped: a page that gains or
+    loses its image summaries is a different build, and a skipped entry would
+    make those two builds identical.
+    """
+    return sha256_file(path) if path.is_file() else "absent"
 
 
 def _load_json(path: Path, default: Any) -> Any:
@@ -280,13 +409,19 @@ def narrative_units(page: PageSource, blocks: list[dict[str, Any]]) -> list[Evid
         units.append(
             EvidenceUnit(
                 unit_key=f"p{page.page:04d}:narrative:{block['block_id']}",
+                context_key=f"p{page.page:04d}:block:{block['block_id']}",
                 page=page.page,
                 kind=EvidenceKind.NARRATIVE,
                 text=text,
                 normalized_text=normalize_for_match(" > ".join(heading_path + [text])),
                 quality=EvidenceQuality.DIRECT_TEXT,
                 heading_path=heading_path,
-                artifact_path=f"{page.page_dir.name}/{BLOCKS_NAME}",
+                # Root-relative, because that is where the file is. Narrative
+                # blocks come from one document-wide `blocks.jsonl` at the
+                # output root, not from a per-page copy: pointing at
+                # `page_0001/blocks.jsonl` named a file that has never existed,
+                # so every narrative citation resolved to nothing.
+                artifact_path=BLOCKS_NAME,
                 regions=[region],
                 geometry_precision=GeometryPrecision.BLOCK,
                 truncated_source=truncated,
@@ -361,7 +496,7 @@ def table_units(
         (c for c, h in enumerate(headers) if normalize_for_match(" ".join(h)) == "unit"),
         None,
     )
-    artifact = f"{page.page_dir.name}/table_candidates.json"
+    artifact = f"{page.rel}/table_candidates.json"
     units: list[EvidenceUnit] = []
 
     for r in range(header_rows, len(rows)):
@@ -382,9 +517,14 @@ def table_units(
         row_fallback, row_precision = _fallback_regions(
             row_union, table_region, role=RegionRole.SUPPORTING_CONTEXT
         )
+        # One key per table row. Its value cells share it, which is what makes
+        # "expand this cell to its descriptor, header and unit" a lookup rather
+        # than a guess about which rows happen to sit near it.
+        row_context = f"p{page.page:04d}:table:{candidate_id}:row:{r}"
         units.append(
             EvidenceUnit(
                 unit_key=f"p{page.page:04d}:table_row:{candidate_id}:r{r}",
+                context_key=row_context,
                 page=page.page,
                 kind=EvidenceKind.TABLE_ROW,
                 text=row_text,
@@ -437,6 +577,7 @@ def table_units(
             units.append(
                 EvidenceUnit(
                     unit_key=f"p{page.page:04d}:table_value:{candidate_id}:r{r}:c{c}",
+                    context_key=row_context,
                     page=page.page,
                     kind=EvidenceKind.TABLE_VALUE,
                     text=text,
@@ -514,20 +655,64 @@ def _rows_from_markdown(markdown: str) -> list[list[str]]:
     return rows
 
 
+# A chart prints its own numbers, so a crop of one can be re-read and checked
+# against a claim. A photo, an infographic, a diagram, a map, or a rendered
+# symbol cannot: the model writes a description of it, and a description is not
+# a figure the audit can verify. Only a record the producer typed as a chart at
+# both stages is admitted, and `classification` is deliberately not consulted --
+# it is the legacy field, written before triage existed, and trusting it would
+# re-admit every untyped record this rule exists to keep out.
+CHART_TYPE = "chart"
+# A summary that hedges its own numbers cannot ground anything. These are the
+# words the summariser uses when it could not read a value, and a unit built
+# from one would carry an approximation into retrieval as if it were a reading.
+_UNCERTAIN_SUMMARY = re.compile(
+    r"\b(approximate|estimated|guess|unclear|illegible|not readable)\b",
+    re.IGNORECASE,
+)
+
+
+def _admissible_chart(summary: dict[str, Any]) -> bool:
+    """Whether this image record may become verifiable visual evidence."""
+    if summary.get("triage_type") != CHART_TYPE or summary.get("summary_type") != CHART_TYPE:
+        return False
+    if summary.get("summary_redundant"):
+        return False
+    if summary.get("summary_warnings"):
+        return False
+    text = clean_text(summary.get("summary") or "")
+    return bool(text) and not _UNCERTAIN_SUMMARY.search(text)
+
+
 def visual_units(
     page: PageSource,
     summaries: list[dict[str, Any]],
     heading_path: list[str],
 ) -> list[EvidenceUnit]:
-    """Chart/infographic regions.
+    """Chart regions a later crop check could confirm or refute.
 
     Summaries are retrieval hints only: the unit is stored at coarse precision
-    and cannot support a verdict until the audit re-checks the crop.
+    and cannot support a verdict until the audit re-checks the crop. So the bar
+    for indexing one at all is that re-checking it could *settle* something --
+    which is why only typed, unhedged chart records get in, and why a record
+    whose geometry will not convert is dropped on its own rather than taking the
+    page's other evidence with it.
     """
     units: list[EvidenceUnit] = []
     for summary in summaries:
         bbox = summary.get("norm_rect") or summary.get("bbox")
-        if not bbox:
+        if not bbox or not _admissible_chart(summary):
+            continue
+        try:
+            region = region_from(
+                bbox,
+                page.width,
+                page.height,
+                role=RegionRole.VISUAL_REGION,
+                precision=GeometryPrecision.CROP,
+            )
+        except (KeyError, TypeError, ValueError):
+            # One unusable rectangle is one missing chart, not a failed page.
             continue
         text = clean_text(
             " ".join(
@@ -545,6 +730,7 @@ def visual_units(
         units.append(
             EvidenceUnit(
                 unit_key=f"p{page.page:04d}:visual:{index}",
+                context_key=f"p{page.page:04d}:visual:{index}",
                 page=page.page,
                 kind=EvidenceKind.VISUAL,
                 text=text or f"visual region {index} on page {page.page}",
@@ -552,44 +738,263 @@ def visual_units(
                 quality=EvidenceQuality.COARSE_REGION,
                 heading_path=heading_path,
                 table_context={"rel_path": summary.get("rel_path") or ""},
-                artifact_path=f"{page.page_dir.name}/image_summaries.jsonl",
-                regions=[
-                    region_from(
-                        bbox,
-                        page.width,
-                        page.height,
-                        role=RegionRole.VISUAL_REGION,
-                        precision=GeometryPrecision.CROP,
-                    )
-                ],
+                artifact_path=f"{page.rel}/image_summaries.jsonl",
+                regions=[region],
                 geometry_precision=GeometryPrecision.CROP,
             )
         )
     return units
 
 
-def markdown_unit(page: PageSource, markdown: str) -> EvidenceUnit | None:
-    text = clean_text(markdown)
-    if not text:
-        return None
-    return EvidenceUnit(
-        unit_key=f"p{page.page:04d}:page_markdown",
-        page=page.page,
-        kind=EvidenceKind.PAGE_MARKDOWN,
-        text=text,
-        normalized_text=normalize_for_match(text),
-        citable=False,
-        quality=EvidenceQuality.NONE,
-        artifact_path=f"{page.page_dir.name}/docling_final.md",
-        regions=[
-            Region(
-                bbox=(0.0, 0.0, 1.0, 1.0),
-                role=RegionRole.SUPPORTING_CONTEXT,
-                precision=GeometryPrecision.PAGE,
-            )
-        ],
-        geometry_precision=GeometryPrecision.PAGE,
+# --- generated Markdown, mapped back to what produced it ---------------------
+
+# Two characters is the shortest anchor worth trusting. A single character
+# matches somewhere in almost any segment, and an anchor that could have landed
+# anywhere is not provenance.
+MIN_ANCHOR_CHARS = 2
+# Markdown structure and punctuation carry no assertion of their own. Whatever
+# survives removing the anchors *and* these is text no original unit accounts
+# for -- the refinement wrote it -- and it disqualifies the whole segment.
+_MARKDOWN_SYNTAX = re.compile(r"[#*_|>`\[\]()!:\-+~\\/.,;\s]+")
+
+
+def _anchor_texts(unit: EvidenceUnit) -> list[str]:
+    """The literal strings this unit would appear as in generated Markdown.
+
+    Deliberately not ``unit.text``. A table unit's text is an assembled
+    sentence ("descriptor | header (unit): value") that no Markdown ever
+    contains, and a visual's is a model-written summary. What actually lands in
+    the file is the cell as printed and the image's own path.
+    """
+    context = unit.table_context or {}
+    if unit.kind is EvidenceKind.NARRATIVE:
+        return [unit.text]
+    if unit.kind is EvidenceKind.TABLE_VALUE:
+        return [str(context.get("value") or "")]
+    if unit.kind is EvidenceKind.TABLE_ROW:
+        # A row is reached through the descriptor and unit cells; its value
+        # cells resolve to their own units.
+        return [str(context.get("descriptor") or ""), str(context.get("unit") or "")]
+    if unit.kind is EvidenceKind.VISUAL:
+        return [str(context.get("rel_path") or "")]
+    return []
+
+
+def _is_separator_row(line: str) -> bool:
+    """Whether a pipe line is the ``|---|---|`` rule under a table's header."""
+    cells = [c.strip() for c in line.strip("|").split("|")]
+    return any(cells) and all(re.fullmatch(r":?-{2,}:?", c) for c in cells if c)
+
+
+def _table_rows(lines: Sequence[str]) -> list[str]:
+    """Pipe lines reduced to the rows that actually assert something.
+
+    A separator row is a table declaring where its header ends. Everything at or
+    above it names columns, and a column name is not a reading: "2024" as a
+    header says which column, while "2024" in a cell may be the value being
+    claimed. Indexing the header would let a segment resolve through a word the
+    page used only as a label.
+
+    Pipe lines with no separator among them are left alone. Older runs emit
+    tables without one, and dropping their first row would silently lose a real
+    reading in the name of a header that was never declared.
+    """
+    kept: list[str] = []
+    run: list[str] = []
+    for line in lines:
+        if line.startswith("|"):
+            run.append(line)
+            continue
+        kept.extend(_after_separator(run))
+        run = []
+        kept.append(line)
+    kept.extend(_after_separator(run))
+    return kept
+
+
+def _after_separator(run: Sequence[str]) -> list[str]:
+    for index, line in enumerate(run):
+        if _is_separator_row(line):
+            return [row for row in run[index + 1 :] if not _is_separator_row(row)]
+    return list(run)
+
+
+def markdown_segments(markdown: str) -> list[str]:
+    """Split generated Markdown into the pieces retrieval can offer as context.
+
+    A table row is its own segment. Its cells resolve to real evidence while
+    the header row above it resolves to nothing, and one segment spanning both
+    would throw away the whole table for the sake of the header.
+    """
+    segments: list[str] = []
+    for chunk in re.split(r"\n\s*\n", markdown):
+        lines = [line.strip() for line in chunk.splitlines() if line.strip()]
+        if not lines:
+            continue
+        if any(line.startswith("|") for line in lines):
+            segments.extend(_table_rows(lines))
+        else:
+            segments.append(" ".join(lines))
+    return segments
+
+
+def literal_anchors(units: Sequence[EvidenceUnit]) -> list[tuple[str, str | None]]:
+    """Each distinct literal, paired with the one unit it identifies.
+
+    A literal two or more citable units share identifies neither of them, so it
+    is carried with a ``None`` key: matching it is not weak provenance, it is a
+    segment whose text could have come from either place, and the placement pass
+    rejects it. Two occurrences of the same unit's own literal are not that --
+    they are one unit printed twice.
+    """
+    by_text: dict[str, set[str]] = {}
+    for unit in units:
+        if not unit.citable:
+            continue
+        for text in _anchor_texts(unit):
+            normalized = normalize_for_match(text)
+            if len(normalized) >= MIN_ANCHOR_CHARS:
+                by_text.setdefault(normalized, set()).add(unit.unit_key)
+    return sorted(
+        (
+            (text, next(iter(keys)) if len(keys) == 1 else None)
+            for text, keys in by_text.items()
+        ),
+        key=lambda anchor: -len(anchor[0]),
     )
+
+
+def anchor_segment(
+    segment: str, anchors: Sequence[tuple[str, str | None]]
+) -> list[str] | None:
+    """Unit keys covering this segment exactly, in reading order, or ``None``.
+
+    Anchors are placed longest-first into non-overlapping spans, and then the
+    residual is tested: if anything but Markdown punctuation survives removing
+    every one of them, some part of this segment was written rather than
+    extracted, and the segment is dropped whole.
+
+    Partial coverage is the case that matters. It is exactly how a rewritten
+    claim would otherwise ride into a prompt attached to evidence that does not
+    say it, which is the one thing generated text must never be able to do. An
+    ambiguous anchor -- one two citable units both print -- fails the segment
+    the same way, because a citation chosen between two candidates is a guess.
+    """
+    haystack = normalize_for_match(segment)
+    placed: list[tuple[int, int, str]] = []
+    for needle, key in anchors:
+        start = 0
+        while (at := haystack.find(needle, start)) != -1:
+            end = at + len(needle)
+            if not any(s < end and at < e for s, e, _ in placed):
+                if key is None:
+                    return None
+                placed.append((at, end, key))
+                break
+            # Occupied by a longer anchor, or by an identical value in another
+            # column; keep looking rather than giving this one up.
+            start = at + 1
+    if not placed:
+        return None
+    placed.sort()
+    residual = haystack
+    for start, end, _ in reversed(placed):
+        residual = residual[:start] + residual[end:]
+    if _MARKDOWN_SYNTAX.sub("", residual):
+        return None
+    return list(dict.fromkeys(key for _, _, key in placed))
+
+
+# Emphasis, code spans and line breaks are how the refinement formats a cell;
+# none of them is part of the value. They come off before matching so a bolded
+# figure resolves to the same unit as a plain one.
+_CELL_FORMATTING = re.compile(r"\*\*|__|`|<br\s*/?>", re.IGNORECASE)
+
+
+def row_cell_sources(
+    segment: str, units: Sequence[EvidenceUnit]
+) -> list[str] | None:
+    """Unit keys for a repaired table row, or ``None``.
+
+    The case this exists for: the refinement rebuilds a table out of a chart it
+    read, so the row is real content but no single unit's text is the row -- the
+    literal anchors never line up and the segment is lost. Matching cell by cell
+    recovers it, at the price of a much stricter rule, because a cell is short
+    enough to appear in places it did not come from.
+
+    So every non-empty cell must be a substring of exactly one citable unit on
+    this page, and one cell that matches nothing, or matches two units, rejects
+    the whole row. Half a mapped row is not half a provenance: it is a row whose
+    remaining cells came from somewhere unaccounted for.
+    """
+    if not segment.startswith("|"):
+        return None
+    cells = [
+        normalized
+        for cell in segment.strip("|").split("|")
+        if (normalized := normalize_for_match(_CELL_FORMATTING.sub(" ", cell)))
+    ]
+    if not cells:
+        return None
+    texts = [
+        (unit.unit_key, normalize_for_match(unit.text)) for unit in units if unit.citable
+    ]
+    keys: list[str] = []
+    for cell in cells:
+        matched = {key for key, text in texts if cell in text}
+        if len(matched) != 1:
+            return None
+        keys.append(matched.pop())
+    return list(dict.fromkeys(keys))
+
+
+def markdown_units(
+    page: PageSource, markdown: str, units: Sequence[EvidenceUnit]
+) -> list[EvidenceUnit]:
+    """One non-citable context unit per Markdown segment that resolves exactly.
+
+    The final Markdown is generated: it is refined, repaired, and reordered,
+    and a sentence in it may be one the page never printed. So it earns a place
+    in the index only by mapping, exactly, onto the units it was generated
+    from, and it carries their keys rather than any geometry of its own. A
+    segment that maps to nothing is not indexed at all -- it cannot be
+    retrieved, so it cannot reach a prompt, so it cannot move a verdict.
+
+    ``sources`` holds unit keys, not evidence ids. Keys are what survives a
+    re-index; ids record which attempt inserted a row.
+    """
+    anchors = literal_anchors(units)
+
+    mapped: list[EvidenceUnit] = []
+    for index, segment in enumerate(markdown_segments(markdown)):
+        # Literal anchoring first: it accounts for the segment's whole text,
+        # which is the stronger claim. Cell matching only sees the cells.
+        keys = anchor_segment(segment, anchors) or row_cell_sources(segment, units)
+        text = clean_text(segment)
+        if not keys or not text:
+            continue
+        mapped.append(
+            EvidenceUnit(
+                unit_key=f"p{page.page:04d}:page_markdown:{index:04d}",
+                page=page.page,
+                kind=EvidenceKind.PAGE_MARKDOWN,
+                text=text,
+                normalized_text=normalize_for_match(text),
+                citable=False,
+                quality=EvidenceQuality.NONE,
+                table_context={"sources": keys},
+                artifact_path=f"{page.rel}/docling_final.md",
+                regions=[
+                    Region(
+                        bbox=(0.0, 0.0, 1.0, 1.0),
+                        role=RegionRole.SUPPORTING_CONTEXT,
+                        precision=GeometryPrecision.PAGE,
+                    )
+                ],
+                geometry_precision=GeometryPrecision.PAGE,
+            )
+        )
+    return mapped
 
 
 def page_units(
@@ -597,8 +1002,8 @@ def page_units(
     page: PageSource,
     blocks: list[dict[str, Any]],
 ) -> Iterator[EvidenceUnit]:
-    """Every evidence unit for one page, in artifact-priority order."""
-    yield from narrative_units(page, blocks)
+    """Every evidence unit for one page, in reading order."""
+    units: list[EvidenceUnit] = list(narrative_units(page, blocks))
 
     heading_by_block = {
         str(b["block_id"]).split("-")[-1]: [clean_text(h) for h in b.get("heading_path") or []]
@@ -614,28 +1019,66 @@ def page_units(
             default_heading,
         )
         try:
-            yield from table_units(page, candidate, heading)
+            units.extend(table_units(page, candidate, heading))
         except (KeyError, TypeError, ValueError) as exc:
             reader.warnings.append(
                 f"page {page.page} table {candidate.get('candidate_id')} skipped: {exc}"
             )
-            reader.skipped.append(f"{page.page_dir.name}/table_candidates.json")
+            reader.skipped.append(f"{page.rel}/table_candidates.json")
 
-    yield from visual_units(page, reader.image_summaries(page), default_heading)
+    units.extend(visual_units(page, reader.image_summaries(page), default_heading))
 
-    unit = markdown_unit(page, reader.page_markdown(page))
-    if unit:
-        yield unit
+    # Last, and from the units above: generated Markdown is indexed only where
+    # it maps back onto them.
+    units.extend(markdown_units(page, reader.page_markdown(page), units))
+
+    yield from _in_reading_order(units)
+
+
+def _in_reading_order(units: list[EvidenceUnit]) -> list[EvidenceUnit]:
+    """Number the page's units top to bottom, artifact order breaking ties.
+
+    A deterministic approximation of reading order, not a layout analysis: the
+    top edge of a unit's highest region places it, and the order the artifacts
+    produced it settles anything at the same height. That is enough for "what
+    sits next to this on the page", and it is stable across re-ingestion in a
+    way evidence ids are not.
+
+    Generated page Markdown always sorts last. It covers the whole page, so by
+    position it would rank first and become every candidate's nearest
+    neighbour, which is precisely the thing it must never be.
+    """
+    def position(entry: tuple[int, EvidenceUnit]) -> tuple[float, int]:
+        index, unit = entry
+        if unit.kind is EvidenceKind.PAGE_MARKDOWN:
+            return (2.0, index)
+        top = min((region.bbox[1] for region in unit.regions), default=1.0)
+        return (top, index)
+
+    ordered = sorted(enumerate(units), key=position)
+    return [
+        unit.model_copy(update={"source_order": order})
+        for order, (_, unit) in enumerate(ordered)
+    ]
 
 
 __all__ = [
+    "CHART_TYPE",
+    "FINGERPRINTED_ARTIFACTS",
+    "MIN_ANCHOR_CHARS",
+    "canonical_digest",
+    "canonical_json",
     "NON_CITABLE_KINDS",
     "OutputReader",
     "OutputValidationError",
     "PageSource",
+    "anchor_segment",
     "block_text",
     "flatten_header",
-    "markdown_unit",
+    "literal_anchors",
+    "row_cell_sources",
+    "markdown_segments",
+    "markdown_units",
     "narrative_units",
     "page_units",
     "sha256_file",

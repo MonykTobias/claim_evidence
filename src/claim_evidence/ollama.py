@@ -66,6 +66,33 @@ class OllamaClient:
         except json.JSONDecodeError as exc:
             raise OllamaError(f"{url} returned non-JSON: {exc}") from exc
 
+    # --- model identity -----------------------------------------------------
+
+    def model_identity(self, model: str) -> dict[str, Any]:
+        """What this model *is*, as precisely as the server will say.
+
+        A tag is a moving target: ``qwen3:8b`` can be re-pulled tomorrow and be
+        different weights under the same name. A digest is immutable, so a build
+        fingerprinted against one is genuinely reproducible. When the server
+        offers no digest the answer is ``tag_only`` and says so in the record,
+        rather than implying a reproducibility this cannot have.
+
+        Never raises: an unreachable model server is a problem for the call
+        that needs the model, not for the bookkeeping about it.
+        """
+        identity: dict[str, Any] = {
+            "name": model, "digest": None, "reproducibility": "tag_only"
+        }
+        try:
+            data = self._post("/api/show", {"model": model})
+        except OllamaError:
+            return identity
+        digest = _first_digest(data)
+        if digest:
+            identity["digest"] = digest
+            identity["reproducibility"] = "digest_pinned"
+        return identity
+
     # --- embeddings ---------------------------------------------------------
 
     def embed(self, inputs: Sequence[str]) -> list[list[float]]:
@@ -131,7 +158,11 @@ class OllamaClient:
             "messages": [{"role": "system", "content": system}, message],
             "format": gbnf_safe_schema(schema),
             "stream": False,
-            "options": {"temperature": 0},
+            # Bounded context on purpose: the runner otherwise loads the model
+            # at its 64k default and spends the KV cache on room these prompts
+            # never use. Embeddings are untouched -- /api/embed has no such
+            # option, and passing one would be noise at best.
+            "options": {"temperature": 0, "num_ctx": self.settings.num_ctx},
         }
 
         last_error: Exception | None = None
@@ -165,6 +196,28 @@ class OllamaClient:
         return self.structured(
             schema, system, user, images=[image], model=self.settings.vision_model
         )
+
+
+def _first_digest(data: Any) -> str | None:
+    """The model's own digest from an ``/api/show`` reply, if it has one.
+
+    Ollama has moved this field between releases, so the known spellings are
+    tried in order rather than one being assumed. A value that is not a plain
+    hex digest is ignored: a half-understood field is not a pin.
+    """
+    if not isinstance(data, dict):
+        return None
+    candidates = [
+        data.get("digest"),
+        (data.get("details") or {}).get("digest") if isinstance(data.get("details"), dict) else None,
+        (data.get("model_info") or {}).get("digest") if isinstance(data.get("model_info"), dict) else None,
+    ]
+    for value in candidates:
+        if isinstance(value, str):
+            text = value.split(":")[-1].strip().lower()
+            if len(text) >= 32 and all(c in "0123456789abcdef" for c in text):
+                return text
+    return None
 
 
 __all__ = ["OllamaClient", "OllamaError", "gbnf_safe_schema"]

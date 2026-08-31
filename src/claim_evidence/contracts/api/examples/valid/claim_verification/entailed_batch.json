@@ -1,0 +1,17 @@
+{
+  "source_text": "In FY24 we cut emissions by 20.5% and water use by 10%.",
+  "claims": [
+    {
+      "text": "In FY24 we cut water use by 10%",
+      "source_tokens": [
+        {"token": "water", "start": 38, "end": 43}
+      ],
+      "grounding": "token_grounded",
+      "reason_code": null
+    }
+  ],
+  "entailment": [
+    {"claim_index": 0, "outcome": "entailed", "reason_code": "directly_asserted"}
+  ],
+  "ok": true
+}

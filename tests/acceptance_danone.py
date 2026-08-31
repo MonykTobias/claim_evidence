@@ -14,17 +14,15 @@ version because the fingerprint is unchanged.
 from __future__ import annotations
 
 import os
-import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-import psycopg  # noqa: E402
-import requests  # noqa: E402
+import psycopg
+import requests
 
-from claim_evidence import ClaimEvidence, Settings  # noqa: E402
-from claim_evidence.models import EvidenceQuality, Verdict  # noqa: E402
+from claim_evidence import ClaimEvidence, Settings
+from claim_evidence.models import EvidenceQuality, Verdict
 
 OUTPUT_ROOT = Path(
     os.environ.get(
@@ -40,6 +38,9 @@ SOURCE_PDF = Path(
 )
 EXPECTED_PAGE = 359
 
+# The reporting entity is stated explicitly: version 1 never infers it from a
+# filename.
+ENTITY = "Danone S.A."
 SUPPORTED = (
     "Danone reduced Scope 1 and 2 energy and industry emissions by 40.2% in 2025 versus 2020."
 )
@@ -99,6 +100,7 @@ def main() -> int:
             # The acceptance claims are table-backed; narrative extraction is
             # one LLM call per claim-like block and is exercised separately.
             extract_narrative_facts=False,
+            reporting_entity=ENTITY,
         )
         print(
             f"ingested {report.pages} pages, {report.evidence_units} units, "
@@ -109,7 +111,7 @@ def main() -> int:
         check(report.pages == 494, "all 494 pages indexed")
 
         print("\n-- 1. supported")
-        supported = client.audit_claim(SUPPORTED)
+        supported = client.audit_claim(SUPPORTED, scope="all", reporting_entity=ENTITY)
         print(f"      {supported.verdict}: {supported.rationale}")
         report_citations(supported)
         check(supported.verdict is Verdict.SUPPORTED, "exact 40.2% claim is supported")
@@ -136,7 +138,7 @@ def main() -> int:
         )
 
         print("\n-- 2. contradicted")
-        contradicted = client.audit_claim(CONTRADICTED)
+        contradicted = client.audit_claim(CONTRADICTED, scope="all", reporting_entity=ENTITY)
         print(f"      {contradicted.verdict}: {contradicted.rationale}")
         report_citations(contradicted)
         check(contradicted.verdict is Verdict.CONTRADICTED, "the 90% claim is contradicted")
@@ -146,7 +148,7 @@ def main() -> int:
         )
 
         print("\n-- 3. insufficient")
-        insufficient = client.audit_claim(INSUFFICIENT)
+        insufficient = client.audit_claim(INSUFFICIENT, scope="all", reporting_entity=ENTITY)
         print(f"      {insufficient.verdict}: {insufficient.rationale}")
         report_citations(insufficient)
         check(

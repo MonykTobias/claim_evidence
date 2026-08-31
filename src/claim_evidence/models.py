@@ -15,6 +15,25 @@ from typing import Any, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from .errors import ValidationError
+
+
+class PublicModel(BaseModel):
+    """Base for every type that crosses the package boundary.
+
+    ``extra="forbid"`` is the contract rule, not a style choice: a caller that
+    sends a key this package does not know about has misunderstood the request,
+    and quietly dropping it means answering a question nobody asked. The same
+    strictness catches a producer and a consumer drifting apart while both
+    still report success.
+
+    LLM response models deliberately do *not* inherit this: a chatty model
+    adding a field is handled by the quote gate and the evidence-id allowlist,
+    not by refusing to parse the reply at all.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
 
 def _coerce_displayed_value(value: Any) -> Any:
     """Read a displayed value string into a Decimal.
@@ -102,12 +121,24 @@ class Verdict(StrEnum):
 
 
 class VersionStatus(StrEnum):
+    """Where one build got to.
+
+    ``degraded`` is queryable: evidence, provenance, and embeddings are all
+    complete and only optional narrative fact enrichment is missing, which
+    makes for a smaller index rather than a wrong one. ``interrupted`` is what
+    a build that was still running when its process died becomes -- it is not
+    ``failed``, because nobody observed it fail.
+    """
+
     BUILDING = "building"
     READY = "ready"
+    DEGRADED = "degraded"
+    FAILED = "failed"
     INACTIVE = "inactive"
+    INTERRUPTED = "interrupted"
 
 
-class Region(BaseModel):
+class Region(PublicModel):
     """One highlightable rectangle on a page.
 
     ``bbox`` is always ``[left, top, right, bottom]`` normalized to 0-1 with a
@@ -127,7 +158,7 @@ class Region(BaseModel):
     _coerce_role = field_validator("role", mode="before")(_coerce_role)
 
 
-class Citation(BaseModel):
+class Citation(PublicModel):
     evidence_id: int
     document_id: int
     document_name: str
@@ -145,7 +176,7 @@ class Citation(BaseModel):
     geometry_precision: GeometryPrecision = GeometryPrecision.BLOCK
 
 
-class EvidenceMatch(BaseModel):
+class EvidenceMatch(PublicModel):
     citation: Citation
     text: str
     lexical_rank: int | None = None
@@ -154,7 +185,79 @@ class EvidenceMatch(BaseModel):
     combined_score: float = 0.0
 
 
-class ClaimResult(BaseModel):
+QualifierName = Literal[
+    "subject", "metric", "scope", "unit",
+    "reporting_period", "baseline_period", "geography",
+]
+
+
+class QualifierComparison(PublicModel):
+    """How one material qualifier of the claim lined up with one stored fact.
+
+    ``match`` means the package's own comparison established comparability --
+    never that a value was merely parsed. A qualifier the source omits is
+    ``missing``, and ``mismatch`` requires both sides present and disagreeing.
+    """
+
+    qualifier: QualifierName
+    claim_value: str | None = None
+    source_value: str | None = None
+    status: Literal["match", "mismatch", "missing"]
+    reason: str | None = None
+
+
+class NumericComparison(PublicModel):
+    """The arithmetic, in the terms the page and the claim each stated it."""
+
+    claim_value: str | None = None
+    claim_operator: str | None = None
+    claim_direction: str | None = None
+    source_value: str | None = None
+    source_operator: str | None = None
+    source_unit: str | None = None
+    outcome: Literal["match", "conflict", "incomparable", "not_applicable"]
+    reason: str | None = None
+
+
+class EvidenceComparison(PublicModel):
+    """One claim-versus-fact comparison, bound to the evidence it came from."""
+
+    evidence_id: int
+    fact_id: int | None = None
+    pdf_page: int | None = None
+    qualifiers: list[QualifierComparison] = Field(default_factory=list)
+    numeric: NumericComparison
+
+
+class DecisionExplanation(PublicModel):
+    """Why this verdict, in operational terms.
+
+    ``verdict_rule`` is a stable machine-readable name for the rule that fired,
+    not model reasoning: the user-facing prose stays in ``rationale``. Nothing
+    here is a prompt, a raw model reply, or hidden chain-of-thought.
+    """
+
+    decided_by: Literal[
+        "deterministic_comparison", "semantic_adjudication", "no_evidence"
+    ]
+    verdict_rule: str
+    evidence_comparisons: list[EvidenceComparison] = Field(default_factory=list)
+
+
+class IndexReference(PublicModel):
+    """Exactly which ready version answered one audit.
+
+    Pinned before retrieval, so a trace read back later says what was searched
+    rather than what happens to be ready now.
+    """
+
+    document_id: int
+    document_version_id: int
+    embedding_model: str
+    embedding_dimensions: int
+
+
+class ClaimResult(PublicModel):
     claim: str
     verdict: Verdict
     rationale: str
@@ -162,9 +265,191 @@ class ClaimResult(BaseModel):
     citations: list[Citation] = Field(default_factory=list)
     missing_qualifiers: list[str] = Field(default_factory=list)
     audit_id: int | None = None
+    decision_explanation: DecisionExplanation | None = None
+    # Elapsed seconds per public phase group; a phase that did not run is null
+    # rather than zero.
+    timings: dict[str, float | None] = Field(default_factory=dict)
+    index_references: list[IndexReference] = Field(default_factory=list)
 
 
-class IngestReport(BaseModel):
+class AuditRequest(PublicModel):
+    """One audit request, with its corpus stated rather than inferred.
+
+    Scope is explicit on purpose. An omitted, null, or empty selection used to
+    mean "search everything", which turns a frontend bug — a document list that
+    had not loaded yet — into a silently much larger query whose answer looks
+    perfectly normal. There is no value that means "whatever you think best".
+    """
+
+    claim: str
+    scope: Literal["all"] | list[int]
+    limit: int = 20
+
+    @model_validator(mode="before")
+    @classmethod
+    def _explicit_scope(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        if "scope" not in data or data["scope"] is None:
+            raise ValidationError(
+                "scope is required: pass 'all' or a non-empty list of document ids"
+            )
+        scope = data["scope"]
+        if isinstance(scope, str):
+            if scope != "all":
+                raise ValidationError("scope must be 'all' or a list of document ids")
+            return data
+        if isinstance(scope, (list, tuple)):
+            if not scope:
+                raise ValidationError(
+                    "scope is an empty list; pass 'all' to search every document"
+                )
+            for value in scope:
+                # bool is an int in Python; True is not document 1.
+                if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                    raise ValidationError("scope must contain positive document ids")
+            return data
+        raise ValidationError("scope must be 'all' or a list of document ids")
+
+    @field_validator("claim")
+    @classmethod
+    def _non_empty_claim(cls, value: str) -> str:
+        text = value.strip()
+        if not text:
+            raise ValidationError("claim is required")
+        if len(text) > 10_000:
+            raise ValidationError("claim must be at most 10000 characters")
+        return text
+
+    @field_validator("limit")
+    @classmethod
+    def _bounded_limit(cls, value: int) -> int:
+        if isinstance(value, bool) or not 1 <= value <= 50:
+            raise ValidationError("limit must be between 1 and 50")
+        return value
+
+    @property
+    def document_ids(self) -> list[int] | None:
+        """The selection as retrieval wants it: ``None`` means every document."""
+        return None if self.scope == "all" else sorted(set(self.scope))
+
+
+class SourceToken(PublicModel):
+    """One token of a proposed claim, at its position in the original text.
+
+    Offsets are into the source exactly as it was submitted, so a caller
+    highlights the real characters rather than a normalized copy of them.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    token: str
+    start: int
+    end: int
+
+
+class GroundedClaim(PublicModel):
+    """One proposed atomic claim, and the deterministic proof it came from the
+    post -- or the category under which that proof failed.
+
+    ``token_grounded`` is a statement about provenance only. It says every
+    meaningful word was in the source in this order; it does not say the claim
+    still means what the post meant, which is a separate check.
+    """
+
+    text: str
+    source_tokens: list[SourceToken] = Field(default_factory=list)
+    grounding: Literal["token_grounded", "not_grounded"]
+    reason_code: str | None = None
+
+
+class ClaimDecomposition(PublicModel):
+    """What one post decomposed into, failures included.
+
+    A proposal that failed grounding is reported rather than dropped: silently
+    removing it hides that the splitter tried to introduce something.
+    """
+
+    source_text: str
+    claims: list[GroundedClaim] = Field(default_factory=list)
+
+
+class EntailmentCheck(BaseModel):
+    """Whether the original post directly asserts one final subclaim.
+
+    Not a verdict about the world and not evidence-based: the verifier sees the
+    post and the subclaim only, and answers whether one says the other.
+    """
+
+    claim_index: int
+    outcome: Literal["entailed", "ambiguous", "not_entailed", "contradicted"]
+    reason_code: str = ""
+
+
+class EntailmentBatch(BaseModel):
+    """The verifier's reply for a whole batch, in one call.
+
+    Required, not defaulted, for the reason ``Fact.quote`` is: a defaulted list
+    turns a reply that answered nothing into an empty, *valid* answer, and an
+    empty answer here would read as "no claim was contested".
+    """
+
+    checks: list[EntailmentCheck]
+
+
+class ClaimVerification(PublicModel):
+    """Both gates for one batch of final subclaims, and whether they passed.
+
+    ``ok`` is decided here so a caller cannot arrive at a second, more generous
+    definition of "may be audited". It is false whenever any claim failed
+    grounding or is anything other than ``entailed``.
+    """
+
+    source_text: str
+    claims: list[GroundedClaim] = Field(default_factory=list)
+    entailment: list[EntailmentCheck] = Field(default_factory=list)
+    ok: bool = False
+
+
+class ProposedClaim(BaseModel):
+    """One assertion the splitter proposes. Text only -- offsets and grounding
+    are calculated here, never accepted from a model."""
+
+    text: str
+
+
+class ClaimSplit(BaseModel):
+    """LLM claim-splitter response payload.
+
+    ``claims`` is required so a reply that answered something else entirely is
+    a schema failure -- and therefore a retry and then a hard error -- rather
+    than an empty list indistinguishable from "this post asserts nothing".
+    """
+
+    claims: list[ProposedClaim]
+
+
+class PublicError(PublicModel):
+    """The one error shape every public surface returns.
+
+    A stable code the caller branches on and a sentence written for a person.
+    Never a driver message, a model reply, a prompt, a stack trace, or a path:
+    those are local debug-log data and reach nobody through this type.
+    """
+
+    error_code: Literal[
+        "validation_error",
+        "unsupported_claim",
+        "not_found",
+        "index_not_ready",
+        "dependency_unavailable",
+        "internal_error",
+    ]
+    message: str
+    retryable: bool = False
+
+
+class IngestReport(PublicModel):
     document_id: int
     version_id: int
     status: VersionStatus
@@ -175,9 +460,22 @@ class IngestReport(BaseModel):
     visual_evidence_units: int = 0
     embedded_units: int = 0
     facts: int = 0
+    # How much of the optional narrative enrichment landed. `degraded` is these
+    # two numbers disagreeing, not a judgement call, and the failed keys are
+    # what a targeted retry re-processes.
+    fact_candidates_total: int = 0
+    fact_candidates_succeeded: int = 0
+    failed_fact_candidates: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
     skipped_artifacts: list[str] = Field(default_factory=list)
     rejected_facts: list[str] = Field(default_factory=list)
+
+    @property
+    def fact_coverage(self) -> float | None:
+        """Fraction of requested candidates that produced facts, or None."""
+        if not self.fact_candidates_total:
+            return None
+        return round(self.fact_candidates_succeeded / self.fact_candidates_total, 4)
 
 
 def phase_percent(completed: int | None, total: int | None) -> float | None:
@@ -193,7 +491,7 @@ def phase_percent(completed: int | None, total: int | None) -> float | None:
     return round(min(100.0, max(0.0, 100.0 * completed / total)), 2)
 
 
-class ProgressEvent(BaseModel):
+class ProgressEvent(PublicModel):
     """One phase update from a running ingestion or audit.
 
     Carries counts and identifiers only. Never a prompt, a model response,
@@ -228,13 +526,13 @@ class ProgressEvent(BaseModel):
 # --- Frontend-support types -------------------------------------------------
 
 
-class ModelHealth(BaseModel):
+class ModelHealth(PublicModel):
     role: Literal["embed", "chat", "vision"]
     name: str
     available: bool
 
 
-class HealthReport(BaseModel):
+class HealthReport(PublicModel):
     """System diagnostics. Carries no credentials, connection strings, raw
     driver exceptions, or prompts -- only categories and safe sentences."""
 
@@ -244,14 +542,28 @@ class HealthReport(BaseModel):
     pgvector_version: str | None = None
     ollama_reachable: bool = False
     models: list[ModelHealth] = Field(default_factory=list)
+    schema_embedding_dimensions: int | None = None
+    configured_embedding_dimensions: int | None = None
     documents_ready: int = 0
-    # A build that failed or was interrupted stays 'building'; there is no
-    # separate failed state, because nothing is alive to write one.
+    # Queryable, with some optional narrative fact coverage missing. Counted
+    # separately from `ready` so "usable" and "complete" stay distinguishable.
+    documents_degraded: int = 0
+    # Recently active builds only. A build whose process died cannot write its
+    # own failure, so it is classified by silence instead: still 'building'
+    # with no progress for longer than the stale threshold is 'interrupted',
+    # as is anything startup reconciliation has already marked so.
     documents_building: int = 0
+    documents_failed: int = 0
+    documents_interrupted: int = 0
     documents_inactive: int = 0
+    audits_interrupted: int = 0
+    # The queryable index: rows belonging to a ready version, which is exactly
+    # what retrieval can reach. Historical rows from failed, superseded and
+    # half-built versions are counted separately.
     evidence_units: int = 0
     embeddings: int = 0
     facts: int = 0
+    stored_evidence_units: int = 0
     problems: list[str] = Field(default_factory=list)
 
     @property
@@ -259,7 +571,7 @@ class HealthReport(BaseModel):
         return self.database_reachable and self.schema_current and not self.problems
 
 
-class DocumentSummary(BaseModel):
+class DocumentSummary(PublicModel):
     document_id: int
     document_version_id: int
     name: str
@@ -279,13 +591,13 @@ class DocumentSummary(BaseModel):
     source_pdf: str | None = None
 
 
-class RemovalReport(BaseModel):
+class RemovalReport(PublicModel):
     document_id: int
     name: str
     deleted: dict[str, int] = Field(default_factory=dict)
 
 
-class TraceCandidate(BaseModel):
+class TraceCandidate(PublicModel):
     evidence_id: int
     pdf_page: int
     source_kind: EvidenceKind
@@ -306,7 +618,7 @@ class TraceCandidate(BaseModel):
     reason: str | None = None
 
 
-class AuditTrace(BaseModel):
+class AuditTrace(PublicModel):
     """Operational retrieval metadata for one audit.
 
     How candidates were found and ranked -- not model reasoning. Only the
@@ -316,8 +628,17 @@ class AuditTrace(BaseModel):
 
     audit_id: int
     claim: str
+    # The corpus that was searched, recorded when the audit opened. Not derived
+    # from citations: an insufficient verdict cites nothing and still searched
+    # something, and a document removed afterwards must not erase the record.
     document_ids: list[int] = Field(default_factory=list)
+    status: Literal["running", "completed", "failed"] = "completed"
     created_at: datetime | None = None
+    completed_at: datetime | None = None
+    failed_at: datetime | None = None
+    failure_code: str | None = None
+    failure_phase: str | None = None
+    retryable: bool | None = None
     parsed_claim: dict[str, Any] = Field(default_factory=dict)
     verdict: Verdict | None = None
     rationale: str | None = None
@@ -325,6 +646,9 @@ class AuditTrace(BaseModel):
     missing_qualifiers: list[str] = Field(default_factory=list)
     citation_ids: list[int] = Field(default_factory=list)
     candidates: list[TraceCandidate] = Field(default_factory=list)
+    decision_explanation: DecisionExplanation | None = None
+    timings: dict[str, float | None] = Field(default_factory=dict)
+    index_references: list[IndexReference] = Field(default_factory=list)
     error: str | None = None
 
     @property
@@ -340,7 +664,7 @@ class AuditTrace(BaseModel):
         return [c for c in self.candidates if c.vector_rank is not None]
 
 
-class EvidenceDetail(BaseModel):
+class EvidenceDetail(PublicModel):
     """Everything needed to render a cited region over its page image.
 
     The package renders nothing itself: it publishes one authoritative
@@ -388,6 +712,11 @@ class EvidenceUnit(BaseModel):
     regions: list[Region] = Field(default_factory=list)
     geometry_precision: GeometryPrecision = GeometryPrecision.BLOCK
     truncated_source: bool = False
+    # Where this unit sits on its page, and what it belongs to. Context
+    # expansion reads these instead of evidence ids, which record when a row
+    # was inserted rather than what the page actually says.
+    source_order: int | None = None
+    context_key: str | None = None
 
 
 class Fact(BaseModel):
@@ -470,12 +799,41 @@ class FactExtraction(BaseModel):
     facts: list[Fact] = Field(default_factory=list)
 
 
-class VisualVerification(BaseModel):
-    """Vision model response for one evidence crop."""
+class VisualResult(StrEnum):
+    """What one re-verified crop turned out to be (PD-09).
 
-    supports_claim: bool
+    ``conflict`` is deliberately not "does not support": a crop showing a
+    different figure is evidence *against* the claim, and folding it in with an
+    unreadable one loses that.
+    """
+
+    SUPPORT = "support"
+    CONFLICT = "conflict"
+    ILLEGIBLE = "illegible"
+    UNRELATED = "unrelated"
+
+
+class VisualVerification(BaseModel):
+    """Vision model response for one evidence crop.
+
+    ``visible_text`` is what the model reports it can read, and is checked
+    against the claim before a support or conflict is allowed to stand.
+    ``reason`` is the model's own prose: kept for the local debug log, never
+    persisted and never published -- ``reason_code`` is what a caller sees.
+    """
+
+    result: VisualResult
     visible_text: str = ""
+    reason_code: str = ""
     reason: str = ""
+
+    @property
+    def supports_claim(self) -> bool:
+        return self.result is VisualResult.SUPPORT
+
+    @property
+    def conflicts_with_claim(self) -> bool:
+        return self.result is VisualResult.CONFLICT
 
 
 class Adjudication(BaseModel):
@@ -489,10 +847,16 @@ class Adjudication(BaseModel):
 
 __all__ = [
     "Adjudication",
+    "AuditRequest",
     "AuditTrace",
     "Citation",
+    "ClaimDecomposition",
     "ClaimResult",
+    "ClaimSplit",
+    "ClaimVerification",
     "DocumentSummary",
+    "EntailmentBatch",
+    "EntailmentCheck",
     "EvidenceDetail",
     "EvidenceKind",
     "EvidenceMatch",
@@ -501,17 +865,23 @@ __all__ = [
     "Fact",
     "FactExtraction",
     "GeometryPrecision",
+    "GroundedClaim",
     "HealthReport",
     "IngestReport",
     "ModelHealth",
     "ParsedClaim",
     "ProgressEvent",
+    "ProposedClaim",
+    "PublicError",
+    "PublicModel",
     "phase_percent",
     "Region",
     "RegionRole",
     "RemovalReport",
+    "SourceToken",
     "TraceCandidate",
     "Verdict",
+    "VisualResult",
     "VersionStatus",
     "VisualVerification",
 ]

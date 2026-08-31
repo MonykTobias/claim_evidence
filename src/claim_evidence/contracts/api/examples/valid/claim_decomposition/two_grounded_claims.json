@@ -1,0 +1,36 @@
+{
+  "source_text": "In FY24 we cut emissions by 20.5% and water use by 10%.",
+  "claims": [
+    {
+      "text": "In FY24 we cut emissions by 20.5%",
+      "source_tokens": [
+        {"token": "In", "start": 0, "end": 2},
+        {"token": "FY24", "start": 3, "end": 7},
+        {"token": "we", "start": 8, "end": 10},
+        {"token": "cut", "start": 11, "end": 14},
+        {"token": "emissions", "start": 15, "end": 24},
+        {"token": "by", "start": 25, "end": 27},
+        {"token": "20.5", "start": 28, "end": 32},
+        {"token": "%", "start": 32, "end": 33}
+      ],
+      "grounding": "token_grounded",
+      "reason_code": null
+    },
+    {
+      "text": "In FY24 we cut water use by 10%",
+      "source_tokens": [
+        {"token": "In", "start": 0, "end": 2},
+        {"token": "FY24", "start": 3, "end": 7},
+        {"token": "we", "start": 8, "end": 10},
+        {"token": "cut", "start": 11, "end": 14},
+        {"token": "water", "start": 38, "end": 43},
+        {"token": "use", "start": 44, "end": 47},
+        {"token": "by", "start": 48, "end": 50},
+        {"token": "10", "start": 51, "end": 53},
+        {"token": "%", "start": 53, "end": 54}
+      ],
+      "grounding": "token_grounded",
+      "reason_code": null
+    }
+  ]
+}

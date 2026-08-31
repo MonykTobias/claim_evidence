@@ -24,16 +24,19 @@ from .db import (
     index_counts,
     regions_for,
     schema_state,
+    vector_dimension,
 )
 from .errors import IndexNotReadyError, NotFoundError, ValidationError
 from .models import (
     AuditTrace,
+    DecisionExplanation,
     DocumentSummary,
     EvidenceDetail,
     EvidenceKind,
     EvidenceQuality,
     GeometryPrecision,
     HealthReport,
+    IndexReference,
     ModelHealth,
     Region,
     RegionRole,
@@ -80,13 +83,31 @@ def health(
                 report.problems.append(
                     f"schema version {version} is older than {SCHEMA_VERSION}; run db init"
                 )
-            counts = index_counts(conn)
+            report.configured_embedding_dimensions = settings.embed_dimensions
+            declared = vector_dimension(conn)
+            report.schema_embedding_dimensions = declared
+            if declared is not None and declared != settings.embed_dimensions:
+                # Reachable, initialized, and unusable: every embedding written
+                # from here would be the wrong width, so this is a readiness
+                # failure rather than a warning.
+                report.schema_current = False
+                report.problems.append(
+                    f"database vector dimension {declared} does not match configured "
+                    f"dimension {settings.embed_dimensions}; use a fresh database or "
+                    f"an explicit full reindex migration"
+                )
+            counts = index_counts(conn, settings.build_stale_minutes)
             report.documents_ready = counts["ready"]
+            report.documents_degraded = counts["degraded"]
             report.documents_building = counts["building"]
+            report.documents_failed = counts["failed"]
+            report.documents_interrupted = counts["interrupted"]
             report.documents_inactive = counts["inactive"]
+            report.audits_interrupted = counts["interrupted_audits"]
             report.evidence_units = counts["evidence"]
             report.embeddings = counts["embeddings"]
             report.facts = counts["facts"]
+            report.stored_evidence_units = counts["stored_evidence"]
         except psycopg.Error:
             conn.rollback()
             # The driver message can carry the host and user; report the class.
@@ -169,11 +190,31 @@ def get_audit_trace(conn: psycopg.Connection, audit_id: int | str) -> AuditTrace
         raise NotFoundError(f"no audit with id {identifier}")
 
     citations = run.get("citations") or []
+    references = [IndexReference(**r) for r in run.get("index_references") or []]
+    explanation = run.get("decision_explanation") or {}
     return AuditTrace(
         audit_id=identifier,
         claim=run["claim"],
-        document_ids=sorted({int(c["document_id"]) for c in citations if "document_id" in c}),
+        # The corpus recorded when the audit opened, which is the only account
+        # that survives an insufficient verdict, a failure, or a document being
+        # removed afterwards. Citations are a subset of it, never its source.
+        document_ids=sorted(
+            {int(i) for i in run.get("requested_document_ids") or []}
+            | {r.document_id for r in references}
+            | {int(c["document_id"]) for c in citations if "document_id" in c}
+        ),
+        status=run.get("status") or "completed",
         created_at=run.get("created_at"),
+        completed_at=run.get("completed_at"),
+        failed_at=run.get("failed_at"),
+        failure_code=run.get("failure_code"),
+        failure_phase=run.get("failure_phase"),
+        retryable=run.get("retryable"),
+        decision_explanation=(
+            DecisionExplanation(**explanation) if explanation.get("decided_by") else None
+        ),
+        timings=run.get("timings") or {},
+        index_references=references,
         parsed_claim=run.get("parsed_claim") or {},
         verdict=run.get("verdict"),
         rationale=run.get("rationale"),
@@ -201,6 +242,9 @@ def get_audit_trace(conn: psycopg.Connection, audit_id: int | str) -> AuditTrace
             )
             for row in audit_candidates(conn, identifier)
         ],
+        # Legacy column, kept only so rows written before the failure
+        # lifecycle existed still read. New failures use failure_code/phase,
+        # which are vetted values rather than whatever was raised.
         error=run.get("error"),
     )
 
@@ -268,12 +312,6 @@ def _existing(path: Path) -> str | None:
         return None
 
 
-def require_ready(conn: psycopg.Connection) -> None:
-    """Fail with a typed error rather than returning a confidently empty result."""
-    if not index_counts(conn)["ready"]:
-        raise IndexNotReadyError("no ready document version; ingest a document first")
-
-
 __all__ = [
     "as_id",
     "get_audit_trace",
@@ -281,6 +319,5 @@ __all__ = [
     "get_evidence",
     "health",
     "list_documents",
-    "require_ready",
     "to_summary",
 ]

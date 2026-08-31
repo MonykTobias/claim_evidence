@@ -5,17 +5,15 @@ Needs the Compose PostgreSQL; skips cleanly without it. Ollama is faked.
 
 from __future__ import annotations
 
-import sys
 import tempfile
 from pathlib import Path
 from typing import Any
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import psycopg  # noqa: E402
-from fixtures import block, kpi_table, write_output_root  # noqa: E402
-from test_integration import (  # noqa: E402
+import psycopg
+from fixtures import block, kpi_table, write_output_root
+from test_integration import (
+    ENTITY,
     SUPPORTED,
     build_root,
     default_session,
@@ -23,8 +21,9 @@ from test_integration import (  # noqa: E402
     reset_database,
 )
 
-from claim_evidence.models import ProgressEvent  # noqa: E402
-from claim_evidence.progress import (  # noqa: E402
+from claim_evidence.ingest import VERIFY_STEPS
+from claim_evidence.models import ProgressEvent
+from claim_evidence.progress import (
     DEPENDENCY_ERROR_MESSAGE,
     ERROR_CODES,
     INTERNAL_ERROR_MESSAGE,
@@ -103,9 +102,9 @@ def assert_well_formed(events: list[ProgressEvent], operation: str) -> None:
 def check_ingest_without_a_callback_is_unchanged(tmp: Path) -> None:
     root = build_root(tmp / "nocb")
     with make_client(default_session()) as client:
-        report = client.ingest_document(root, source_uri="urn:nocb")
+        report = client.ingest_document(root, source_uri="urn:nocb", reporting_entity=ENTITY)
         check(report.evidence_units > 0, "ingestion works with no callback")
-        result = client.audit_claim(SUPPORTED)
+        result = client.audit_claim(SUPPORTED, scope="all", reporting_entity=ENTITY)
         check(result.verdict is not None, "audit works with no callback")
 
 
@@ -113,7 +112,7 @@ def check_ingest_phases_and_totals(tmp: Path) -> None:
     root = build_root(tmp / "phases")
     events: list[ProgressEvent] = []
     with make_client(default_session()) as client:
-        report = client.ingest_document(root, source_uri="urn:phases", progress=events.append)
+        report = client.ingest_document(root, source_uri="urn:phases", progress=events.append, reporting_entity=ENTITY)
 
     assert_well_formed(events, "ingest")
     order = phase_order(events)
@@ -135,7 +134,10 @@ def check_ingest_phases_and_totals(tmp: Path) -> None:
     )
 
     steps = [e for e in events if e.phase == "building_indexes"]
-    check(steps[-1].total == 4, "index checks report their real step count")
+    check(
+        steps[-1].total == len(VERIFY_STEPS),
+        "index checks report their real step count",
+    )
 
 
 def check_ingest_completion_matches_the_report(tmp: Path) -> None:
@@ -144,7 +146,7 @@ def check_ingest_completion_matches_the_report(tmp: Path) -> None:
     with make_client(default_session()) as client:
         report = client.ingest_document(
             root, source_uri="urn:summary", progress=events.append
-        )
+        , reporting_entity=ENTITY)
 
     details = events[-1].details
     check(details["document_version_id"] == report.version_id, "version id reported")
@@ -166,11 +168,11 @@ def check_ingest_completion_matches_the_report(tmp: Path) -> None:
 def check_idempotent_ingest_reports_no_op(tmp: Path) -> None:
     root = build_root(tmp / "noop")
     with make_client(default_session()) as client:
-        first = client.ingest_document(root, source_uri="urn:noop")
+        first = client.ingest_document(root, source_uri="urn:noop", reporting_entity=ENTITY)
         events: list[ProgressEvent] = []
         second = client.ingest_document(
             root, source_uri="urn:noop", progress=events.append
-        )
+        , reporting_entity=ENTITY)
 
     check(second.reused_existing, "the second run is a no-op")
     order = phase_order(events)
@@ -195,6 +197,7 @@ def check_zero_candidates_do_not_divide_by_zero(tmp: Path) -> None:
             source_uri="urn:zerofacts",
             extract_narrative_facts=False,
             progress=events.append,
+            reporting_entity=ENTITY,
         )
     facts = [e for e in events if e.phase == "extracting_facts"]
     check(bool(facts), "the fact phase still reports")
@@ -214,7 +217,7 @@ def check_warnings_are_emitted_once(tmp: Path) -> None:
     with make_client(default_session()) as client:
         report = client.ingest_document(
             root, source_uri="urn:warned", progress=events.append
-        )
+        , reporting_entity=ENTITY)
     warnings = [e for e in events if e.status == "warning"]
     check(bool(warnings), "a recoverable fallback is surfaced as a warning event")
     check(
@@ -252,7 +255,7 @@ def check_resumed_build_reports_the_version_total(tmp: Path) -> None:
         )
         client.ollama.settings = client.settings
         try:
-            client.ingest_document(root, source_uri="urn:resumed")
+            client.ingest_document(root, source_uri="urn:resumed", reporting_entity=ENTITY)
         except Exception:
             pass
         else:
@@ -273,7 +276,7 @@ def check_resumed_build_reports_the_version_total(tmp: Path) -> None:
     with make_client(default_session()) as client:
         report = client.ingest_document(
             root, source_uri="urn:resumed", progress=events.append
-        )
+        , reporting_entity=ENTITY)
         total = client.conn.execute(
             "SELECT count(embedding) AS n FROM evidence_unit WHERE version_id = %s",
             (report.version_id,),
@@ -296,10 +299,10 @@ def check_callback_exception_does_not_fail_the_build(tmp: Path) -> None:
         raise RuntimeError("the UI fell over")
 
     with make_client(default_session()) as client:
-        report = client.ingest_document(root, source_uri="urn:badcb", progress=explode)
+        report = client.ingest_document(root, source_uri="urn:badcb", progress=explode, reporting_entity=ENTITY)
         check(report.evidence_units > 0, "ingestion completed despite a broken callback")
         check(len(seen) == 1, "the callback is dropped after it first raises")
-        result = client.audit_claim(SUPPORTED, progress=explode)
+        result = client.audit_claim(SUPPORTED, progress=explode, scope="all", reporting_entity=ENTITY)
         check(result.verdict is not None, "audit completed despite a broken callback")
 
 
@@ -310,8 +313,8 @@ def check_audit_phases_and_counts(tmp: Path) -> None:
     root = build_root(tmp / "auditphases")
     events: list[ProgressEvent] = []
     with make_client(default_session()) as client:
-        client.ingest_document(root, source_uri="urn:auditphases")
-        result = client.audit_claim(SUPPORTED, progress=events.append)
+        client.ingest_document(root, source_uri="urn:auditphases", reporting_entity=ENTITY)
+        result = client.audit_claim(SUPPORTED, progress=events.append, scope="all", reporting_entity=ENTITY)
         trace = client.get_audit_trace(result.audit_id)
 
     assert_well_formed(events, "audit")
@@ -358,8 +361,8 @@ def check_visual_counts(tmp: Path) -> None:
     plain = build_root(tmp / "novisual")
     events: list[ProgressEvent] = []
     with make_client(default_session()) as client:
-        client.ingest_document(plain, source_uri="urn:novisual")
-        client.audit_claim(SUPPORTED, progress=events.append)
+        client.ingest_document(plain, source_uri="urn:novisual", reporting_entity=ENTITY)
+        client.audit_claim(SUPPORTED, progress=events.append, scope="all", reporting_entity=ENTITY)
     visual = [e for e in events if e.phase == "verifying_visuals"]
     check(bool(visual), "the visual phase reports even with nothing to check")
     check(visual[-1].total == 0, "zero visual candidates report a zero total")
@@ -369,7 +372,11 @@ def check_visual_counts(tmp: Path) -> None:
 
     charts = build_root(tmp / "withvisual", with_visual=True)
     accepting = default_session(
-        VisualVerification=lambda _: {"supports_claim": True, "visible_text": "40.2%"},
+        VisualVerification=lambda _: {
+            "result": "support",
+            "visible_text": "40.2%",
+            "reason_code": "value_and_metric_visible",
+        },
         Adjudication=lambda _: {
             "verdict": "insufficient",
             "rationale": "not comparable",
@@ -379,8 +386,12 @@ def check_visual_counts(tmp: Path) -> None:
     )
     events = []
     with make_client(accepting) as client:
-        client.ingest_document(charts, source_uri="urn:withvisual")
-        client.audit_claim("The chart shows emissions falling.", progress=events.append)
+        client.ingest_document(charts, source_uri="urn:withvisual", reporting_entity=ENTITY)
+        client.audit_claim("The chart shows emissions falling by 40.2% in 2025 versus 2020.",
+            progress=events.append,
+            scope="all",
+            reporting_entity=ENTITY,
+        )
     details = events[-1].details
     check(
         details["visually_verified_count"] <= details["visual_candidate_count"],
@@ -393,12 +404,14 @@ def check_empty_channel_reports_zero(tmp: Path) -> None:
     root = build_root(tmp / "emptychannel")
     events: list[ProgressEvent] = []
     with make_client(default_session()) as client:
-        client.ingest_document(root, source_uri="urn:emptychannel")
+        client.ingest_document(root, source_uri="urn:emptychannel", reporting_entity=ENTITY)
         # A period no fact in the fixture carries, so the graph channel runs
         # and legitimately returns nothing.
         client.audit_claim(
             "Danone reduced Scope 1 and 2 emissions by 12% in 1974 versus 1968.",
             progress=events.append,
+            scope="all",
+            reporting_entity=ENTITY,
         )
 
     graph = [e for e in events if e.phase == "retrieving_graph"]
@@ -423,12 +436,12 @@ def check_vector_channel_is_omitted_when_it_cannot_run(tmp: Path) -> None:
             return super().post(url, json=json, timeout=timeout)
 
     with make_client(default_session()) as client:
-        client.ingest_document(root, source_uri="urn:novector")
+        client.ingest_document(root, source_uri="urn:novector", reporting_entity=ENTITY)
 
     session = NoEmbedSession(dimensions=8)
     session.chat_router = default_session().chat_router
     with make_client(session) as client:
-        client.audit_claim(SUPPORTED, progress=events.append)
+        client.audit_claim(SUPPORTED, progress=events.append, scope="all", reporting_entity=ENTITY)
 
     details = events[-1].details
     check(
@@ -493,7 +506,7 @@ def check_dependency_failure_is_retryable(tmp: Path) -> None:
     session.chat_router = default_session().chat_router
     with make_client(session) as client:
         try:
-            client.ingest_document(root, source_uri="urn:depfail", progress=events.append)
+            client.ingest_document(root, source_uri="urn:depfail", progress=events.append, reporting_entity=ENTITY)
         except Exception as exc:
             check(type(exc).__name__ == "OllamaError", "the original error is re-raised")
         else:
@@ -513,7 +526,7 @@ def check_validation_failure_is_not_retryable(tmp: Path) -> None:
     events: list[ProgressEvent] = []
     with make_client(default_session()) as client:
         try:
-            client.ingest_document(tmp / "does-not-exist", progress=events.append)
+            client.ingest_document(tmp / "does-not-exist", progress=events.append, reporting_entity=ENTITY)
         except Exception:
             pass
         else:
@@ -530,7 +543,7 @@ def check_failed_ingest_leaves_the_previous_version_ready(tmp: Path) -> None:
     root = build_root(tmp / "failkeep")
     events: list[ProgressEvent] = []
     with make_client(default_session()) as client:
-        good = client.ingest_document(root, source_uri="urn:failkeep")
+        good = client.ingest_document(root, source_uri="urn:failkeep", reporting_entity=ENTITY)
 
         import claim_evidence.ingest as ingest_module
 
@@ -541,7 +554,7 @@ def check_failed_ingest_leaves_the_previous_version_ready(tmp: Path) -> None:
         try:
             client.ingest_document(
                 root, source_uri="urn:failkeep", force=True, progress=events.append
-            )
+            , reporting_entity=ENTITY)
         except ingest_module.IngestionError:
             pass
         finally:
@@ -551,6 +564,10 @@ def check_failed_ingest_leaves_the_previous_version_ready(tmp: Path) -> None:
             "SELECT status FROM document_version WHERE id = %s", (good.version_id,)
         ).fetchone()["status"]
         check(status == "ready", "the previous version is still ready")
+        check(
+            bool(client.search_evidence(SUPPORTED, document_ids=[good.document_id])),
+            "and is still queryable",
+        )
 
     failed = [e for e in events if e.status == "failed"]
     check(len(failed) == 1, "a failed event was emitted")
@@ -569,8 +586,8 @@ def check_serialization_is_stable_and_safe(tmp: Path) -> None:
     root = build_root(tmp / "serial")
     events: list[ProgressEvent] = []
     with make_client(default_session()) as client:
-        client.ingest_document(root, source_uri="urn:serial", progress=events.append)
-        client.audit_claim(SUPPORTED, progress=events.append)
+        client.ingest_document(root, source_uri="urn:serial", progress=events.append, reporting_entity=ENTITY)
+        client.audit_claim(SUPPORTED, progress=events.append, scope="all", reporting_entity=ENTITY)
 
     import json
 

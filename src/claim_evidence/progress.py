@@ -15,7 +15,6 @@ from collections.abc import Callable
 from typing import Any
 
 from .errors import (
-    ClaimEvidenceError,
     DependencyUnavailableError,
     IndexNotReadyError,
     NotFoundError,
@@ -40,10 +39,11 @@ DEPENDENCY_ERROR_MESSAGE = "A required service was unavailable."
 def classify_error(exc: BaseException) -> tuple[str, bool, str]:
     """Map an exception to ``(error_code, retryable, safe_message)``.
 
-    Only the package's own typed errors are quoted back to the caller; their
-    messages are written for public consumption. Anything else -- a driver
-    error, a model response body, an unexpected bug -- is reported by category,
-    because those messages carry hosts, credentials, prompts, and source text.
+    Only the four concrete public error types are quoted back to the caller;
+    their messages are written for public consumption. Everything else -- a
+    driver error, a model response body, an internal error of ours that wraps
+    one, an unexpected bug -- is reported by category, because those messages
+    carry hosts, credentials, prompts, and source text.
     """
     from .ollama import OllamaError
 
@@ -59,8 +59,9 @@ def classify_error(exc: BaseException) -> tuple[str, bool, str]:
         return "index_not_ready", True, str(exc)
     if isinstance(exc, DependencyUnavailableError):
         return "dependency_unavailable", True, str(exc)
-    if isinstance(exc, ClaimEvidenceError):
-        return "internal_error", True, str(exc)
+    # Other ClaimEvidenceError subclasses -- AuditError, IngestionError -- are
+    # ours but their text is not vetted: they wrap driver and model failures
+    # verbatim to make a server log useful. Category only.
     return "internal_error", True, INTERNAL_ERROR_MESSAGE
 
 
@@ -86,6 +87,8 @@ class ProgressReporter:
         self.started = time.monotonic()
         self.broken = False
         self.phase = ""
+        self._phase_started = self.started
+        self._durations: dict[str, float] = {}
 
     @property
     def active(self) -> bool:
@@ -94,6 +97,27 @@ class ProgressReporter:
     @property
     def elapsed_seconds(self) -> float:
         return round(time.monotonic() - self.started, 3)
+
+    def durations(self) -> dict[str, float]:
+        """Seconds spent per phase so far, including the one still running.
+
+        Measured whether or not a callback was supplied, because timings are
+        part of the result rather than a side effect of instrumenting the UI.
+        A phase that never ran is absent, not zero.
+        """
+        elapsed = dict(self._durations)
+        if self.phase:
+            elapsed[self.phase] = round(
+                elapsed.get(self.phase, 0.0) + (time.monotonic() - self._phase_started), 3
+            )
+        return elapsed
+
+    def _close_phase(self, phase: str) -> None:
+        now = time.monotonic()
+        self._durations[phase] = round(
+            self._durations.get(phase, 0.0) + (now - self._phase_started), 3
+        )
+        self._phase_started = now
 
     def emit(
         self,
@@ -107,7 +131,14 @@ class ProgressReporter:
         details: dict[str, Any] | None = None,
     ) -> None:
         """The single emit path. Never raises."""
-        self.phase = phase
+        if phase != self.phase:
+            if self.phase:
+                self._close_phase(self.phase)
+            else:
+                self._phase_started = time.monotonic()
+            self.phase = phase
+        elif status == "completed":
+            self._close_phase(phase)
         if not self.active:
             return
         event = ProgressEvent(
@@ -190,7 +221,36 @@ class ProgressReporter:
         )
 
 
+# Detailed phases grouped into the durations a caller is shown. One mapping,
+# so a renamed phase does not silently drop out of the reported timings.
+AUDIT_TIMING_GROUPS: dict[str, tuple[str, ...]] = {
+    "parsing": ("parsing_claim",),
+    "retrieval": ("retrieving_graph", "retrieving_full_text", "retrieving_vectors"),
+    "fusion_context": ("fusing_candidates", "expanding_context"),
+    "visual_verification": ("verifying_visuals",),
+    "verdict": ("deciding_verdict",),
+    "persistence": ("persisting_trace",),
+}
+
+
+def audit_timings(reporter: ProgressReporter) -> dict[str, float | None]:
+    """Public timing groups for one audit.
+
+    A group whose phases never ran is ``None``, not ``0.0``: an audit that
+    skipped visual verification did no zero-second work, it did none.
+    """
+    elapsed = reporter.durations()
+    timings: dict[str, float | None] = {}
+    for name, phases in AUDIT_TIMING_GROUPS.items():
+        measured = [elapsed[phase] for phase in phases if phase in elapsed]
+        timings[name] = round(sum(measured), 3) if measured else None
+    timings["total"] = reporter.elapsed_seconds
+    return timings
+
+
 __all__ = [
+    "AUDIT_TIMING_GROUPS",
+    "audit_timings",
     "DEPENDENCY_ERROR_MESSAGE",
     "ERROR_CODES",
     "INTERNAL_ERROR_MESSAGE",

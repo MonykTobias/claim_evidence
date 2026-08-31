@@ -2,22 +2,27 @@
 
 from __future__ import annotations
 
-import sys
 import tempfile
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from fixtures import block, kpi_table, markdown_only_table, write_output_root  # noqa: E402
+from fixtures import (
+    block,
+    image_summary,
+    kpi_table,
+    markdown_only_table,
+    write_output_root,
+)
 
-from claim_evidence.models import EvidenceKind, GeometryPrecision  # noqa: E402
-from claim_evidence.source import (  # noqa: E402
+from claim_evidence.models import EvidenceKind, GeometryPrecision
+from claim_evidence.source import (
     OutputReader,
     OutputValidationError,
     block_text,
     flatten_header,
+    markdown_segments,
     page_units,
+    sha256_file,
 )
 
 REAL_ROOT = Path(
@@ -74,6 +79,112 @@ def test_page_gap_rejected() -> None:
         expect_error(OutputReader(root).validate, "missing", "page coverage gap")
 
 
+def test_selected_middle_range_validates() -> None:
+    """H-1: pages 10..12 of a 494-page PDF, extracted on their own."""
+    with tempfile.TemporaryDirectory() as temp:
+        root = write_output_root(Path(temp) / "run", page_numbers=[10, 11, 12])
+        pages = OutputReader(root).validate()
+        check([p.page for p in pages] == [10, 11, 12], "original pdf pages preserved")
+
+
+def test_single_selected_page_validates() -> None:
+    with tempfile.TemporaryDirectory() as temp:
+        root = write_output_root(Path(temp) / "run", page_numbers=[359])
+        pages = OutputReader(root).validate()
+        check([p.page for p in pages] == [359], "a single page keeps its pdf number")
+
+
+def test_gap_inside_a_selected_range_rejected() -> None:
+    with tempfile.TemporaryDirectory() as temp:
+        # 10 and 12 with total_pages=2: contiguous from 10 would be 10..11.
+        root = write_output_root(Path(temp) / "run", page_numbers=[10, 12])
+        expect_error(OutputReader(root).validate, "missing", "gap inside the range")
+
+
+def test_incomplete_selected_range_rejected() -> None:
+    with tempfile.TemporaryDirectory() as temp:
+        root = write_output_root(
+            Path(temp) / "run", page_numbers=[10, 11, 12], total_pages=4
+        )
+        expect_error(OutputReader(root).validate, "missing", "range stops short")
+
+
+def test_inconsistent_checkpoints_rejected() -> None:
+    with tempfile.TemporaryDirectory() as temp:
+        root = write_output_root(
+            Path(temp) / "run", page_numbers=[10, 11], page_totals={11: 5}
+        )
+        expect_error(OutputReader(root).validate, "disagree", "checkpoints disagree")
+
+
+def test_nonpositive_page_rejected() -> None:
+    with tempfile.TemporaryDirectory() as temp:
+        root = write_output_root(Path(temp) / "run", page_numbers=[0, 1])
+        expect_error(OutputReader(root).validate, "1-based", "page 0 rejected")
+
+
+def test_traversal_page_dir_rejected() -> None:
+    """H-2: a fully-stocked directory outside the root is still off limits."""
+    with tempfile.TemporaryDirectory() as temp:
+        base = Path(temp)
+        write_output_root(base / "outside", pages=1)
+        root = write_output_root(base / "run", pages=1, page_dirs={1: "../outside/page_0001"})
+        reader = OutputReader(root)
+        try:
+            reader.validate()
+        except OutputValidationError as exc:
+            check("outside the output root" in str(exc), f"traversal rejected ({exc})")
+            check(
+                str((base / "outside").resolve()) not in str(exc),
+                "the escaped absolute path is not echoed back",
+            )
+            return
+        raise AssertionError("traversal page_dir was accepted")
+
+
+def test_absolute_page_dir_rejected() -> None:
+    with tempfile.TemporaryDirectory() as temp:
+        base = Path(temp)
+        outside = write_output_root(base / "outside", pages=1)
+        root = write_output_root(
+            base / "run", pages=1, page_dirs={1: str((outside / "page_0001").resolve())}
+        )
+        expect_error(
+            OutputReader(root).validate, "absolute page_dir", "absolute page_dir"
+        )
+
+
+def test_symlinked_page_dir_rejected() -> None:
+    """Skips only the symlink case when this account cannot create links."""
+    with tempfile.TemporaryDirectory() as temp:
+        base = Path(temp)
+        write_output_root(base / "outside", pages=1)
+        root = write_output_root(base / "run", pages=1, page_dirs={1: "linked"})
+        try:
+            (root / "linked").symlink_to(base / "outside" / "page_0001", True)
+        except (OSError, NotImplementedError):
+            print("[skip] symlink creation not permitted here")
+            return
+        expect_error(
+            OutputReader(root).validate, "outside the output root", "symlink escape"
+        )
+
+
+def test_nested_page_dir_still_validates() -> None:
+    with tempfile.TemporaryDirectory() as temp:
+        root = write_output_root(Path(temp) / "run", pages=1)
+        (root / "pages").mkdir()
+        (root / "page_0001").rename(root / "pages" / "page_0001")
+        (root / "manifest.json").write_text(
+            (root / "manifest.json").read_text(encoding="utf-8").replace(
+                '"page_0001"', '"pages/page_0001"'
+            ),
+            encoding="utf-8",
+        )
+        pages = OutputReader(root).validate()
+        check(pages[0].rel == "pages/page_0001", "nested page dir kept as a relative path")
+
+
 def test_missing_artifact_rejected() -> None:
     with tempfile.TemporaryDirectory() as temp:
         root = write_output_root(
@@ -92,19 +203,85 @@ def test_stale_page_directory_ignored() -> None:
         check("page_0009" in reader.skipped, "stale directory reported as skipped")
 
 
-def test_fingerprint_is_stable_and_content_bound() -> None:
+def test_extraction_fingerprint_is_stable_and_content_bound() -> None:
     with tempfile.TemporaryDirectory() as temp:
         root = write_output_root(Path(temp) / "run", pages=2)
-        first = OutputReader(root).fingerprint()
-        check(first == OutputReader(root).fingerprint(), "fingerprint is stable")
+        first = OutputReader(root).extraction_fingerprint()
+        check(first == OutputReader(root).extraction_fingerprint(), "fingerprint is stable")
         (root / "blocks.jsonl").write_text('{"page": 1}', encoding="utf-8")
-        check(OutputReader(root).fingerprint() != first, "content change moves it")
+        check(
+            OutputReader(root).extraction_fingerprint() != first,
+            "a content change moves it",
+        )
 
+
+def test_same_size_artifact_change_moves_the_fingerprint() -> None:
+    """M-3: hashing sizes made an improved re-extraction look like no change."""
+    with tempfile.TemporaryDirectory() as temp:
+        root = write_output_root(Path(temp) / "run", pages=1, tables={1: [kpi_table()]})
+        before = OutputReader(root).extraction_fingerprint()
+
+        tables = root / "page_0001" / "table_candidates.json"
+        original = tables.read_text(encoding="utf-8")
+        tables.write_text(original.replace("(40.2) %", "(40.3) %"), encoding="utf-8")
+        check(
+            len(tables.read_text(encoding="utf-8")) == len(original),
+            "the rewritten table is exactly the same length",
+        )
+        check(
+            OutputReader(root).extraction_fingerprint() != before,
+            "a same-size table change still moves the fingerprint",
+        )
+
+
+def test_page_image_change_moves_the_fingerprint() -> None:
+    """The crop visual re-verification reads is part of the evidence."""
+    from PIL import Image
+
+    with tempfile.TemporaryDirectory() as temp:
+        root = write_output_root(Path(temp) / "run", pages=1)
+        before = OutputReader(root).extraction_fingerprint()
+        Image.new("RGB", (600, 800), "black").save(root / "page_0001" / "page.png")
+        check(
+            OutputReader(root).extraction_fingerprint() != before,
+            "a redrawn page image moves the fingerprint",
+        )
+
+
+def test_stale_directory_does_not_move_the_fingerprint() -> None:
+    with tempfile.TemporaryDirectory() as temp:
+        root = write_output_root(Path(temp) / "run", pages=2)
+        before = OutputReader(root).extraction_fingerprint()
+        stale = root / "page_0009"
+        stale.mkdir()
+        (stale / "docling_final.md").write_text("orphaned", encoding="utf-8")
+        check(
+            OutputReader(root).extraction_fingerprint() == before,
+            "a directory the manifest does not list is not part of the identity",
+        )
+
+
+def test_source_sha256_is_the_real_pdf_digest() -> None:
+    import hashlib
+
+    with tempfile.TemporaryDirectory() as temp:
         pdf = Path(temp) / "doc.pdf"
-        pdf.write_bytes(b"%PDF-1.7 fixture")
-        by_pdf = OutputReader(root).fingerprint(pdf)
-        check(by_pdf != first, "a source PDF is a different identity")
-        check(by_pdf == OutputReader(root).fingerprint(pdf), "pdf fingerprint stable")
+        payload = b"%PDF-1.7 fixture bytes"
+        pdf.write_bytes(payload)
+        check(
+            sha256_file(pdf) == hashlib.sha256(payload).hexdigest(),
+            "sha256_file is the digest any standard tool reports",
+        )
+        root = write_output_root(Path(temp) / "run", pages=1)
+        digests = OutputReader(root).artifact_digests()
+        check(
+            all(len(d) == 64 or d == "absent" for d in digests.values()),
+            "every declared artifact contributes a content digest or a stated absence",
+        )
+        check(
+            "page_image@1" in digests and "manifest" in digests,
+            "root and per-page artifacts are both hashed by role",
+        )
 
 
 def test_text_full_preferred_over_capped_text() -> None:
@@ -193,17 +370,327 @@ def test_markdown_only_table_is_table_precision() -> None:
     )
 
 
-def test_page_markdown_is_not_citable() -> None:
+def _mapped_units(markdown: str, **kwargs) -> list:
+    """Units for a one-page root whose generated Markdown is ``markdown``."""
+    with tempfile.TemporaryDirectory() as temp:
+        root = write_output_root(
+            Path(temp) / "run", pages=1, markdown={1: markdown}, **kwargs
+        )
+        reader = OutputReader(root)
+        page = reader.validate()[0]
+        return list(page_units(reader, page, reader.blocks_by_page().get(1, [])))
+
+
+def _markdown(units: list) -> list:
+    return [u for u in units if u.kind is EvidenceKind.PAGE_MARKDOWN]
+
+
+def test_unmapped_page_markdown_is_not_indexed() -> None:
+    """The default fixture Markdown says something no block on the page does."""
     units = _units_for_table(kpi_table())
-    markdown = next(u for u in units if u.kind is EvidenceKind.PAGE_MARKDOWN)
+    check(not _markdown(units), "Markdown that resolves to nothing is not indexed")
+
+
+def test_page_markdown_is_not_citable() -> None:
+    units = _mapped_units(
+        "Nature indicators\n", blocks=[block(1, 1, "Nature indicators")]
+    )
+    markdown = next(iter(_markdown(units)))
     check(not markdown.citable, "generated page markdown is never citable")
     check(markdown.geometry_precision is GeometryPrecision.PAGE, "page-level geometry")
+    check(
+        markdown.table_context["sources"] == ["p0001:narrative:p0001-b0001"],
+        f"it carries the unit it came from ({markdown.table_context['sources']})",
+    )
+
+
+def test_markdown_joins_two_blocks_into_one_segment() -> None:
+    """The case direct retrieval structurally cannot serve.
+
+    Docling split one sentence across two boxes, so neither block contains the
+    sentence and neither can be retrieved by it. The refinement put it back
+    together, and the segment resolves to both.
+    """
+    units = _mapped_units(
+        "Emissions fell by 40.2% against the 2020 baseline.\n",
+        blocks=[
+            block(1, 1, "Emissions fell by 40.2%"),
+            block(1, 2, "against the 2020 baseline."),
+        ],
+    )
+    segment = next(iter(_markdown(units)))
+    check(
+        segment.table_context["sources"]
+        == ["p0001:narrative:p0001-b0001", "p0001:narrative:p0001-b0002"],
+        f"both blocks, in reading order ({segment.table_context['sources']})",
+    )
+
+
+def test_rewritten_markdown_resolves_to_nothing() -> None:
+    """Half a sentence anchored is not provenance for the other half."""
+    units = _mapped_units(
+        "Emissions fell by 40.2%, the best result of any competitor.\n",
+        blocks=[block(1, 1, "Emissions fell by 40.2%")],
+    )
+    check(not _markdown(units), "a segment with unaccounted text is dropped whole")
+
+
+def test_markdown_table_row_maps_to_its_cells() -> None:
+    units = _mapped_units(
+        "| Key Performance Indicators (KPIs) | Unit | 2024 | 2025 |\n"
+        "|---|---|---|---|\n"
+        "| Scope 1 & 2 energy and industry emissions (market-based) vs. 2020 "
+        "| Percentage of variation | (34.5) % | (40.2) % |\n",
+        blocks=[block(1, 1, "Nature indicators")],
+        tables={1: [kpi_table()]},
+    )
+    segments = _markdown(units)
+    check(len(segments) == 1, f"the header row maps to nothing ({len(segments)})")
+    check(
+        segments[0].table_context["sources"]
+        == [
+            "p0001:table_row:tc001:r2",
+            "p0001:table_value:tc001:r2:c2",
+            "p0001:table_value:tc001:r2:c3",
+        ],
+        f"row and both values ({segments[0].table_context['sources']})",
+    )
+
+
+def test_markdown_image_reference_maps_to_its_visual() -> None:
+    units = _mapped_units(
+        "![](images/picture_p0001_i000.png)\n",
+        blocks=[block(1, 1, "Nature indicators")],
+        images={1: [image_summary(1, 0, "A chart of emissions by year.")]},
+    )
+    segment = next(iter(_markdown(units)))
+    check(
+        segment.table_context["sources"] == ["p0001:visual:0"],
+        f"the image path resolves to its visual unit ({segment.table_context['sources']})",
+    )
+
+
+# --- only a typed, unhedged chart becomes visual evidence -------------------
+
+# What the producer writes when it read the chart and could not name it. The
+# "(none)" fields are absences, not hedges, and must not be read as ones.
+CHART_SUMMARY = (
+    "Title: (none) Axis labels: (none) Home deliveries increased 48% in FY24 "
+    "versus FY16."
+)
+
+
+def _visuals(units: list) -> list:
+    return [u for u in units if u.kind is EvidenceKind.VISUAL]
+
+
+def _units_on(page_number: int, **kwargs) -> list:
+    """Units for one page of a root built from ``kwargs``."""
+    with tempfile.TemporaryDirectory() as temp:
+        root = write_output_root(Path(temp) / "run", **kwargs)
+        reader = OutputReader(root)
+        page = next(p for p in reader.validate() if p.page == page_number)
+        return list(
+            page_units(reader, page, reader.blocks_by_page().get(page_number, []))
+        )
+
+
+def _one_chart(summary: str, **summary_kwargs) -> list:
+    return _units_on(
+        1, pages=1, images={1: [image_summary(1, 0, summary, **summary_kwargs)]}
+    )
+
+
+def test_a_typed_chart_without_a_title_is_admitted() -> None:
+    check(len(_visuals(_one_chart(CHART_SUMMARY))) == 1, "an untitled chart is a chart")
+
+
+def test_a_hedged_chart_summary_is_rejected() -> None:
+    """A summary that will not commit to its own numbers cannot ground one."""
+    for hedge in (
+        "The values are approximate.",
+        "The values are estimated.",
+        "This is a guess at the trend.",
+        "The axis labels are unclear.",
+        "The figures are illegible.",
+        "The bottom row is not readable.",
+    ):
+        units = _one_chart(f"Home deliveries increased 48% in FY24. {hedge}")
+        check(not _visuals(units), f"rejected: {hedge}")
+
+
+def test_only_a_record_typed_chart_at_both_stages_is_admitted() -> None:
+    for other in ("infographic", "photo", "diagram", "map", "table", "symbol"):
+        units = _one_chart(
+            CHART_SUMMARY, triage_type=other, summary_type=other
+        )
+        check(not _visuals(units), f"a {other} is not re-verifiable evidence")
+    check(
+        not _visuals(_one_chart(CHART_SUMMARY, summary_type="photo")),
+        "triage and summary must agree",
+    )
+    check(
+        not _visuals(_one_chart(CHART_SUMMARY, triage_type="photo")),
+        "in both directions",
+    )
+
+
+def test_a_legacy_classification_only_record_is_rejected() -> None:
+    """``classification`` predates triage; trusting it re-admits everything."""
+    units = _one_chart(CHART_SUMMARY, triage_type=None, summary_type=None)
+    check(not _visuals(units), "an untyped record is not admitted on classification")
+
+
+def test_a_redundant_or_flagged_summary_is_rejected() -> None:
+    check(
+        not _visuals(_one_chart(CHART_SUMMARY, summary_redundant=True)),
+        "a summary that only repeats the page adds no evidence",
+    )
+    check(
+        not _visuals(_one_chart(CHART_SUMMARY, summary_warnings=["low_confidence"])),
+        "a summary the producer itself flagged is not evidence",
+    )
+
+
+def test_an_empty_summary_is_rejected() -> None:
+    check(not _visuals(_one_chart("   ")), "a chart nobody read says nothing")
+
+
+def test_malformed_crop_geometry_drops_only_its_own_record() -> None:
+    units = _units_on(
+        1,
+        pages=1,
+        blocks=[block(1, 1, "A paragraph.")],
+        images={
+            1: [
+                image_summary(1, 0, CHART_SUMMARY, norm_rect=["x", 0.1, 0.2, 0.3]),
+                image_summary(1, 1, "Returns fell 12% in FY24."),
+            ]
+        },
+    )
+    keys = [u.unit_key for u in _visuals(units)]
+    check(keys == ["p0001:visual:1"], f"only the usable chart is indexed ({keys})")
+    check(
+        any(u.kind is EvidenceKind.NARRATIVE for u in units),
+        "and the page keeps the rest of its evidence",
+    )
+
+
+# --- a repaired table row, mapped cell by cell ------------------------------
+
+
+def test_a_table_header_and_its_separator_are_not_segments() -> None:
+    segments = markdown_segments(
+        "| Metric | Change |\n|---|---|\n| Home deliveries | 48% |\n"
+    )
+    check(
+        segments == ["| Home deliveries | 48% |"],
+        f"only the data row asserts anything ({segments})",
+    )
+
+
+def test_pipe_lines_without_a_separator_keep_every_row() -> None:
+    """Older runs emit tables that never declare where the header ends."""
+    segments = markdown_segments("| Metric | Change |\n| Home deliveries | 48% |\n")
+    check(len(segments) == 2, f"both rows are still offered ({segments})")
+
+
+def _chart_row_units(row: str, images: list, page: int = 1, **kwargs) -> list:
+    return _units_on(
+        page,
+        blocks=[],
+        images={page: images},
+        markdown={page: f"| Metric | Change |\n|---|---|\n{row}\n"},
+        **kwargs,
+    )
+
+
+def test_a_repaired_row_maps_to_the_chart_it_was_read_from() -> None:
+    """No unit's text is the row, so only cell-by-cell matching recovers it."""
+    units = _chart_row_units(
+        "| Home deliveries | 48% |", [image_summary(1, 0, CHART_SUMMARY)], pages=1
+    )
+    segment = next(iter(_markdown(units)))
+    check(
+        segment.table_context["sources"] == ["p0001:visual:0"],
+        f"the row names the chart ({segment.table_context['sources']})",
+    )
+    check(not segment.citable, "and is still not citable itself")
+    check(str(segment.quality) == "none", f"with no quality of its own ({segment.quality})")
+    check(
+        segment.artifact_path.endswith("docling_final.md"),
+        "provenance is the generated file it came from",
+    )
+
+
+def test_a_cell_the_chart_never_states_rejects_the_whole_row() -> None:
+    units = _chart_row_units(
+        "| Home deliveries | -8% |", [image_summary(1, 0, CHART_SUMMARY)], pages=1
+    )
+    check(not _markdown(units), "a row with an unaccounted cell is not indexed at all")
+
+
+def test_a_value_two_units_share_rejects_the_whole_row() -> None:
+    units = _chart_row_units(
+        "| Home deliveries | 48% |",
+        [
+            image_summary(1, 0, CHART_SUMMARY),
+            image_summary(1, 1, "Returns also moved 48% in FY24."),
+        ],
+        pages=1,
+    )
+    check(not _markdown(units), "a cell that could have come from either is not provenance")
+
+
+def test_a_value_only_on_another_page_cannot_map_a_row() -> None:
+    units = _units_on(
+        1,
+        pages=2,
+        blocks=[],
+        # Page 1 names the metric; only page 2 states the figure.
+        images={
+            1: [image_summary(1, 0, "Home deliveries by channel, FY16 to FY24.")],
+            2: [image_summary(2, 0, CHART_SUMMARY)],
+        },
+        markdown={1: "| Metric | Change |\n|---|---|\n| Home deliveries | 48% |\n"},
+    )
+    check(not _markdown(units), "the fallback never reaches off its own page")
+
+
+def test_mapped_row_keys_follow_the_cells_left_to_right() -> None:
+    units = _chart_row_units(
+        "| 71% | 48% |",
+        [
+            image_summary(1, 0, "Home deliveries reached 48% in FY24."),
+            image_summary(1, 1, "Renewable share reached 71% in FY24."),
+        ],
+        pages=1,
+    )
+    segment = next(iter(_markdown(units)))
+    check(
+        segment.table_context["sources"] == ["p0001:visual:1", "p0001:visual:0"],
+        f"reading order, not index order ({segment.table_context['sources']})",
+    )
+
+
+def test_a_literal_two_blocks_share_rejects_the_segment() -> None:
+    """A citation chosen between two equal candidates is a guess, not provenance."""
+    units = _mapped_units(
+        "Emissions fell.\n",
+        blocks=[block(1, 1, "Emissions fell."), block(1, 2, "Emissions fell.")],
+    )
+    check(not _markdown(units), "a sentence both blocks print maps to neither")
 
 
 def test_real_danone_page_359() -> None:
-    """Skips cleanly when the completed run is not on this machine."""
-    if not (REAL_ROOT / "manifest.json").is_file():
-        print("[skip] danone output root not present")
+    """Skips cleanly when a current-contract run is not on this machine.
+
+    ``run.json`` is the marker, not ``manifest.json``: an output root written
+    before the run contract existed is deliberately not indexable, so its
+    presence is not evidence that this check can run.
+    """
+    if not (REAL_ROOT / "run.json").is_file():
+        print("[skip] no current-contract danone output root present")
         return
     reader = OutputReader(REAL_ROOT)
     page = next(p for p in reader.validate() if p.page == 359)
@@ -221,6 +708,95 @@ def test_real_danone_page_359() -> None:
     check(
         "Scope 1 & 2" in target.table_context["descriptor"],
         "descriptor is the scope 1 & 2 emissions row",
+    )
+
+
+def test_artifact_paths_are_root_relative_and_resolve() -> None:
+    """Every citable unit must name a file that is actually there."""
+    with tempfile.TemporaryDirectory() as temp:
+        root = write_output_root(
+            Path(temp) / "run",
+            pages=1,
+            blocks=[block(1, 1, "Emissions fell against the 2020 baseline.")],
+            tables={1: [kpi_table()]},
+            images={1: [image_summary(1, 1, "Emissions chart")]},
+        )
+        reader = OutputReader(root)
+        page = reader.validate()[0]
+        units = list(page_units(reader, page, reader.blocks_by_page().get(1, [])))
+        citable = [u for u in units if u.citable]
+        check(len(citable) > 3, f"{len(citable)} citable units to check")
+        for unit in citable:
+            relative = Path(unit.artifact_path)
+            check(
+                not relative.is_absolute() and ".." not in relative.parts,
+                f"{unit.unit_key} names a contained relative artifact",
+            )
+            check(
+                (root / relative).is_file(),
+                f"{unit.unit_key} artifact resolves: {unit.artifact_path}",
+            )
+
+
+def test_narrative_provenance_points_at_the_root_blocks_file() -> None:
+    """Regression: narrative citations named a per-page blocks.jsonl that never existed."""
+    with tempfile.TemporaryDirectory() as temp:
+        root = write_output_root(
+            Path(temp) / "run",
+            pages=1,
+            blocks=[block(1, 1, "Danone reduced emissions by 40.2%.")],
+        )
+        reader = OutputReader(root)
+        page = reader.validate()[0]
+        units = list(page_units(reader, page, reader.blocks_by_page().get(1, [])))
+        narrative = next(u for u in units if u.kind is EvidenceKind.NARRATIVE)
+        check(
+            narrative.artifact_path == "blocks.jsonl",
+            f"narrative provenance is the root blocks file ({narrative.artifact_path})",
+        )
+        check((root / narrative.artifact_path).is_file(), "and that file exists")
+
+
+def test_every_unit_carries_a_source_order_and_tables_carry_a_context_key() -> None:
+    with tempfile.TemporaryDirectory() as temp:
+        root = write_output_root(
+            Path(temp) / "run",
+            pages=1,
+            blocks=[block(1, 1, "A paragraph."), block(1, 2, "Another paragraph.")],
+            tables={1: [kpi_table()]},
+            images={1: [image_summary(1, 1, "A chart")]},
+        )
+        reader = OutputReader(root)
+        page = reader.validate()[0]
+        units = list(page_units(reader, page, reader.blocks_by_page().get(1, [])))
+        orders = [u.source_order for u in units]
+        check(orders == list(range(len(units))), "source order is dense and 0-based")
+        check(len(set(orders)) == len(orders), "and unique within the page")
+        for unit in units:
+            if unit.kind in (EvidenceKind.TABLE_ROW, EvidenceKind.TABLE_VALUE):
+                check(
+                    bool(unit.context_key),
+                    f"{unit.unit_key} carries the context key its row is found by",
+                )
+        rows = [u for u in units if u.kind is EvidenceKind.TABLE_ROW]
+        values = [u for u in units if u.kind is EvidenceKind.TABLE_VALUE]
+        check(
+            {v.context_key for v in values} <= {r.context_key for r in rows},
+            "every value cell shares its row's context key",
+        )
+
+
+def test_page_markdown_sorts_last_in_source_order() -> None:
+    """It covers the whole page, so by position it would be every unit's neighbour."""
+    units = _mapped_units(
+        "A paragraph.\n",
+        blocks=[block(1, 1, "A paragraph.")],
+        tables={1: [kpi_table()]},
+    )
+    markdown = next(iter(_markdown(units)))
+    check(
+        markdown.source_order == max(u.source_order for u in units),
+        "generated page markdown is last in source order",
     )
 
 
