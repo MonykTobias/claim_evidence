@@ -17,6 +17,30 @@ This is the **canonical RAG/knowledge-graph backend**. The sibling
 `document_knowledge` directory is a non-runtime scaffold and must not be
 installed or imported.
 
+## Architecture
+
+```text
+PDF
+ │
+ ▼
+Document Extraction
+ │
+ ▼
+Evidence Units
+ ├── Structured Facts / Knowledge Graph
+ ├── PostgreSQL Full-Text Search
+ └── pgvector Semantic Search
+              │
+              ▼
+       Hybrid Retrieval
+              │
+              ▼
+     Evidence Verification
+              │
+              ▼
+ Supported / Contradicted
+ Mixed / Insufficient
+```
 ## Install
 
 Python 3.12. One environment holds all three prototype packages; install them
